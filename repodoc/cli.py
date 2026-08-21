@@ -1,0 +1,452 @@
+import os
+from datetime import datetime
+from typing import Optional
+
+import click
+import logging
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from repodoc.config import Config
+from repodoc.graph import DependencyGraphBuilder
+from repodoc.graph.cluster import cluster_modules
+from repodoc.agent.generate import run_pipeline
+from repodoc.utils import file_manager
+
+
+def make_config(
+    repo_path: str,
+    output_dir: str = "output",
+    llm_concept_extraction: bool = False,
+    llm_concept_max_components: int = 100,
+    cluster_strategy: str = "llm",
+    doc_strategy: str = "agent",
+) -> Config:
+    return Config(
+        repo_path=repo_path,
+        output_dir=output_dir,
+        llm_base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
+        llm_api_key=os.getenv("LLM_API_KEY", "sk-1234"),
+        main_model=os.getenv("MAIN_MODEL", "deepseek-chat"),
+        cluster_model=os.getenv("CLUSTER_MODEL")
+        or os.getenv("MAIN_MODEL", "deepseek-chat"),
+        llm_concept_extraction=llm_concept_extraction,
+        llm_concept_max_components=llm_concept_max_components,
+        cluster_strategy=cluster_strategy,
+        doc_strategy=doc_strategy,
+    )
+
+
+def get_project_name(repo_path: str) -> str:
+    """Extract safe project name from repo path."""
+    repo_name = os.path.basename(os.path.normpath(repo_path))
+    return "".join(c if c.isalnum() else "_" for c in repo_name)
+
+
+@click.group()
+@click.version_option(version="0.1.0")
+def cli():
+    """RepoDoc: Automated documentation via Repository Knowledge Graph."""
+    pass
+
+
+@cli.command(short_help="Analyze repository dependencies")
+@click.argument("repo_path", default=".")
+@click.option("-o", "--output-dir", default="output", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--cluster-strategy",
+    type=click.Choice(["llm", "heuristic"], case_sensitive=False),
+    default="llm",
+    help="Clustering strategy (ablation): llm | heuristic (default: llm)",
+)
+def analyze(repo_path: str, output_dir: str, verbose: bool, cluster_strategy: str):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    config = make_config(repo_path, output_dir)
+    builder = DependencyGraphBuilder(config)
+    try:
+        components, leaf_nodes = builder.build_dependency_graph()
+        click.echo(f"Components: {len(components)}")
+        click.echo(f"Leaf nodes: {len(leaf_nodes)}")
+        click.echo(f"Dependency graph saved: {config.dependency_graph_dir}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command(short_help="Cluster components into hierarchical modules")
+@click.argument("repo_path", default=".")
+@click.option("-o", "--output-dir", default="output", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--cluster-strategy",
+    type=click.Choice(["llm", "heuristic"], case_sensitive=False),
+    default="llm",
+    help="Clustering strategy (ablation): llm | heuristic (default: llm)",
+)
+def cluster(repo_path: str, output_dir: str, verbose: bool, cluster_strategy: str):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    config = make_config(repo_path, output_dir, cluster_strategy=cluster_strategy)
+    project_name = get_project_name(repo_path)
+    data_dir = os.path.join(output_dir, "data")
+    builder = DependencyGraphBuilder(config)
+    try:
+        components, leaf_nodes = builder.build_dependency_graph()
+        click.echo(f"Components: {len(components)}")
+        click.echo(f"Leaf nodes: {len(leaf_nodes)}")
+        file_manager.ensure_directory(data_dir)
+        module_tree = cluster_modules(leaf_nodes, components, config)
+        first_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+        file_manager.save_json(module_tree, first_path)
+        file_manager.save_json(module_tree, tree_path)
+        click.echo(f"Clustering done: {len(module_tree)} top-level module(s)")
+        click.echo(f"Saved: {first_path}, {tree_path}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command(short_help="Generate documentation using AI agents")
+@click.argument("repo_path", default=".")
+@click.option("-o", "--output-dir", default="output", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--llm-concept-extraction",
+    is_flag=True,
+    help="Enable LLM-enhanced concept extraction (higher quality but more token usage)",
+)
+@click.option(
+    "--llm-concept-max-components",
+    default=100,
+    help="Max components to process with LLM for concept extraction (default: 100)",
+)
+@click.option(
+    "--cluster-strategy",
+    type=click.Choice(["llm", "heuristic"], case_sensitive=False),
+    default="llm",
+    help="Clustering strategy (ablation): llm | heuristic (default: llm)",
+)
+@click.option(
+    "--doc-strategy",
+    type=click.Choice(["agent", "direct"], case_sensitive=False),
+    default="agent",
+    help="Doc generation strategy (ablation): agent | direct (default: agent)",
+)
+def docs(
+    repo_path: str,
+    output_dir: str,
+    verbose: bool,
+    llm_concept_extraction: bool,
+    llm_concept_max_components: int,
+    cluster_strategy: str,
+    doc_strategy: str,
+):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    config = make_config(
+        repo_path,
+        output_dir,
+        llm_concept_extraction=llm_concept_extraction,
+        llm_concept_max_components=llm_concept_max_components,
+        cluster_strategy=cluster_strategy,
+        doc_strategy=doc_strategy,
+    )
+    project_name = get_project_name(repo_path)
+    data_dir = os.path.join(output_dir, "data")
+    try:
+        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+        if not os.path.exists(tree_path):
+            click.echo("module_tree.json not found. Running clustering first...")
+            click.echo("=" * 40)
+            click.echo("Phase 1: Analyzing dependencies...")
+            builder = DependencyGraphBuilder(config)
+            components, leaf_nodes = builder.build_dependency_graph()
+            click.echo(f"  Components: {len(components)}")
+            click.echo(f"  Leaf nodes: {len(leaf_nodes)}")
+
+            click.echo("=" * 40)
+            click.echo("Phase 2: Clustering modules...")
+            file_manager.ensure_directory(data_dir)
+            module_tree = cluster_modules(leaf_nodes, components, config)
+            file_manager.save_json(module_tree, tree_path)
+            click.echo(f"  Modules: {len(module_tree)}")
+            click.echo("=" * 40)
+
+        results = run_pipeline(config, generate_docs=True)
+        click.echo(f"Documentation generated: {results['docs_directory']}")
+        click.echo(f"Total components: {results['total_components']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.command(short_help="Run all phases: analyze -> cluster -> docs")
+@click.argument("repo_path", default=".")
+@click.option("-o", "--output-dir", default="output", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--llm-concept-extraction",
+    is_flag=True,
+    help="Enable LLM-enhanced concept extraction (higher quality but more token usage)",
+)
+@click.option(
+    "--llm-concept-max-components",
+    default=100,
+    help="Max components to process with LLM for concept extraction (default: 100)",
+)
+@click.option(
+    "--cluster-strategy",
+    type=click.Choice(["llm", "heuristic"], case_sensitive=False),
+    default="llm",
+    help="Clustering strategy (ablation): llm | heuristic (default: llm)",
+)
+@click.option(
+    "--doc-strategy",
+    type=click.Choice(["agent", "direct"], case_sensitive=False),
+    default="agent",
+    help="Doc generation strategy (ablation): agent | direct (default: agent)",
+)
+def generate(
+    repo_path: str,
+    output_dir: str,
+    verbose: bool,
+    llm_concept_extraction: bool,
+    llm_concept_max_components: int,
+    cluster_strategy: str,
+    doc_strategy: str,
+):
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+    config = make_config(
+        repo_path,
+        output_dir,
+        llm_concept_extraction=llm_concept_extraction,
+        llm_concept_max_components=llm_concept_max_components,
+        cluster_strategy=cluster_strategy,
+        doc_strategy=doc_strategy,
+    )
+    project_name = get_project_name(repo_path)
+    data_dir = os.path.join(output_dir, "data")
+    try:
+        click.echo("=" * 40)
+        click.echo("Phase 1: Analyzing dependencies...")
+        builder = DependencyGraphBuilder(config)
+        components, leaf_nodes = builder.build_dependency_graph()
+        click.echo(f"  Components: {len(components)}")
+        click.echo(f"  Leaf nodes: {len(leaf_nodes)}")
+
+        click.echo("=" * 40)
+        click.echo("Phase 2: Clustering modules...")
+        file_manager.ensure_directory(data_dir)
+        module_tree = cluster_modules(leaf_nodes, components, config)
+        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+        file_manager.save_json(module_tree, tree_path)
+        click.echo(f"  Modules: {len(module_tree)}")
+
+        click.echo("=" * 40)
+        click.echo("Phase 3: Generating documentation...")
+        results = run_pipeline(config, generate_docs=True)
+
+        click.echo("=" * 40)
+        click.echo(f"Done! Documentation: {results['docs_directory']}")
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
+
+
+@cli.group()
+def config():
+    """Manage RepoDoc configuration."""
+    pass
+
+
+@config.command("show")
+def config_show():
+    """Show current configuration."""
+    click.echo("Current RepoDoc Configuration:")
+    click.echo("-" * 40)
+
+    config_data = {
+        "LLM Base URL": os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
+        "LLM API Key": (
+            "***" + os.getenv("LLM_API_KEY", "")[-4:]
+            if os.getenv("LLM_API_KEY")
+            else "not set"
+        ),
+        "Main Model": os.getenv("MAIN_MODEL", "deepseek-chat"),
+        "Cluster Model": os.getenv(
+            "CLUSTER_MODEL", os.getenv("MAIN_MODEL", "deepseek-chat")
+        ),
+    }
+
+    for key, value in config_data.items():
+        click.echo(f"  {key}: {value}")
+
+
+VALID_CONFIG_KEYS = ["LLM_BASE_URL", "LLM_API_KEY", "MAIN_MODEL", "CLUSTER_MODEL"]
+
+
+@config.command("set", short_help="Set a config value in .env")
+@click.argument("key")
+@click.argument("value")
+def config_set(key: str, value: str):
+    """Set a configuration value in the project .env file.
+
+    Valid keys:
+
+    \b
+      LLM_BASE_URL (LLM API base URL)
+      LLM_API_KEY (API key)
+      MAIN_MODEL (model for documentation)
+      CLUSTER_MODEL (model for clustering, defaults to MAIN_MODEL)
+
+    Examples:
+
+    \b
+      repodoc config set MAIN_MODEL deepseek-chat
+      repodoc config set LLM_BASE_URL http://localhost:4000/
+      repodoc config set LLM_API_KEY sk-your-api-key
+    """
+    key_upper = key.upper()
+    if key_upper not in VALID_CONFIG_KEYS:
+        click.echo(f"Error: Invalid key '{key}'. Valid keys are:")
+        for k in VALID_CONFIG_KEYS:
+            click.echo(f"  - {k}")
+        raise click.Abort()
+
+    env_path = Path(".env")
+    env_vars = {}
+
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and "=" in line:
+                    k, v = line.split("=", 1)
+                    env_vars[k] = v
+
+    env_vars[key_upper] = value
+
+    with open(env_path, "w") as f:
+        for k, v in env_vars.items():
+            f.write(f"{k}={v}\n")
+
+    click.echo(f"Set {key_upper}={value} in .env")
+
+
+@config.command("validate")
+def config_validate():
+    """Validate configuration."""
+    click.echo("Validating configuration...")
+
+    errors = []
+    warnings = []
+
+    if not os.getenv("LLM_API_KEY"):
+        errors.append("LLM_API_KEY is not set")
+
+    if not os.getenv("LLM_BASE_URL"):
+        warnings.append("LLM_BASE_URL not set, using default")
+
+    if errors:
+        click.echo("Errors:", err=True)
+        for e in errors:
+            click.echo(f"  - {e}", err=True)
+    else:
+        click.echo("Configuration is valid!")
+
+    if warnings:
+        click.echo("Warnings:")
+        for w in warnings:
+            click.echo(f"  - {w}")
+
+
+@cli.command()
+@click.argument("repo_path", default=".")
+@click.argument("changed_files", nargs=-1, required=False)
+@click.option("-o", "--output-dir", default="output", help="Output directory")
+@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--base-commit",
+    default=None,
+    help="Base commit to compare against (auto-detect from metadata if not provided)",
+)
+@click.option(
+    "--analyze-changes/--no-analyze-changes",
+    default=True,
+    help="Analyze changes to filter unimportant ones (default: enabled)",
+)
+@click.option(
+    "--include-tests",
+    is_flag=True,
+    help="Include test files in analysis (default: exclude test files)",
+)
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Skip confirmation prompt and automatically proceed",
+)
+
+
+def update(
+    repo_path: str,
+    changed_files: tuple,
+    output_dir: str,
+    verbose: bool,
+    base_commit: str,
+    analyze_changes: bool,
+    include_tests: bool,
+    yes: bool,
+):
+    """Update documentation incrementally for changed files.
+
+    REPO_PATH: Path to the repository (default: current directory)
+    CHANGED_FILES: List of changed files (optional, auto-detects via git if not provided)
+
+    Example:
+        repodoc update /path/to/flask src/flask/app.py src/flask/ctx.py
+        repodoc update /path/to/flask --base-commit HEAD~1
+        repodoc update /path/to/flask --analyze-changes
+    """
+    import asyncio
+
+    from repodoc.agent.update import run_update
+
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    config = make_config(repo_path, output_dir)
+
+    async def _run():
+        return await run_update(
+            config,
+            changed_files=changed_files,
+            base_commit=base_commit,
+            analyze_changes=analyze_changes,
+            include_tests=include_tests,
+            confirm=None if yes else (lambda msg: click.confirm(msg)),
+        )
+
+    result = asyncio.run(_run())
+    if result.get("status") == "error":
+        raise click.Abort()
+
+
+if __name__ == "__main__":
+    cli()
