@@ -65,6 +65,9 @@ DEFAULT_IGNORE_PATTERNS = {
     ".docusaurus", "*.min.js", "*.min.css", "*.map",
     ".terraform", "*.tfstate*", "digest.txt", "*.ini",
     "tests", "test", "Tests", "Test", "Examples",
+    # Non-product code dirs: doc examples and dev tooling (fastapi-style
+    # repos ship hundreds of tutorial files in docs_src/, scripts/)
+    "docs_src", "docs", "scripts",
 }
 
 # File extensions considered code (subset of EXTENSION_MAP keys)
