@@ -52,44 +52,28 @@ def cli():
     pass
 
 
-@cli.command(short_help="Analyze repository dependencies")
+@cli.command(short_help="Build knowledge graph: dependency graph + module tree")
 @click.argument("repo_path", default=".")
 @click.option("-o", "--output-dir", default="output", help="Output directory")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--no-cluster",
+    is_flag=True,
+    help="Skip module clustering (dependency graph only, saves LLM tokens)",
+)
 @click.option(
     "--cluster-strategy",
     type=click.Choice(["llm", "heuristic"], case_sensitive=False),
     default="llm",
     help="Clustering strategy (ablation): llm | heuristic (default: llm)",
 )
-def analyze(repo_path: str, output_dir: str, verbose: bool, cluster_strategy: str):
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
-    )
-    config = make_config(repo_path, output_dir)
-    builder = DependencyGraphBuilder(config)
-    try:
-        components, leaf_nodes = builder.build_dependency_graph()
-        click.echo(f"Components: {len(components)}")
-        click.echo(f"Leaf nodes: {len(leaf_nodes)}")
-        click.echo(f"Dependency graph saved: {config.dependency_graph_dir}")
-    except Exception as e:
-        click.echo(f"Error: {e}", err=True)
-        raise click.Abort()
-
-
-@cli.command(short_help="Cluster components into hierarchical modules")
-@click.argument("repo_path", default=".")
-@click.option("-o", "--output-dir", default="output", help="Output directory")
-@click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
-@click.option(
-    "--cluster-strategy",
-    type=click.Choice(["llm", "heuristic"], case_sensitive=False),
-    default="llm",
-    help="Clustering strategy (ablation): llm | heuristic (default: llm)",
-)
-def cluster(repo_path: str, output_dir: str, verbose: bool, cluster_strategy: str):
+def analyze(
+    repo_path: str,
+    output_dir: str,
+    verbose: bool,
+    no_cluster: bool,
+    cluster_strategy: str,
+):
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
@@ -102,14 +86,16 @@ def cluster(repo_path: str, output_dir: str, verbose: bool, cluster_strategy: st
         components, leaf_nodes = builder.build_dependency_graph()
         click.echo(f"Components: {len(components)}")
         click.echo(f"Leaf nodes: {len(leaf_nodes)}")
-        file_manager.ensure_directory(data_dir)
-        module_tree = cluster_modules(leaf_nodes, components, config)
-        first_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
-        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
-        file_manager.save_json(module_tree, first_path)
-        file_manager.save_json(module_tree, tree_path)
-        click.echo(f"Clustering done: {len(module_tree)} top-level module(s)")
-        click.echo(f"Saved: {first_path}, {tree_path}")
+        click.echo(f"Dependency graph saved: {config.dependency_graph_dir}")
+
+        if not no_cluster:
+            file_manager.ensure_directory(data_dir)
+            module_tree = cluster_modules(leaf_nodes, components, config)
+            tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+            file_manager.save_json(module_tree, tree_path)
+            click.echo(
+                f"Module tree saved: {tree_path} ({len(module_tree)} top-level module(s))"
+            )
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         raise click.Abort()
