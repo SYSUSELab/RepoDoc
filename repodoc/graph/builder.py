@@ -234,10 +234,19 @@ def _get_leaf_nodes(
         for n in concise:
             if not isinstance(n, str) or not n.strip():
                 continue
-            if any(k in n.lower() for k in ERROR_KEYWORDS):
-                continue
-            if n in components and components[n].component_type in valid:
-                keep.append(n)
+            if n in components:
+                # Error keywords match the component name only (not the dotted
+                # path — "fastapi.exceptions.X" would otherwise be miskilled),
+                # and only filter functions: public exception classes like
+                # HTTPException deserve documentation.
+                name_part = n.split(".")[-1]
+                if (
+                    components[n].component_type == "function"
+                    and any(k in name_part.lower() for k in ERROR_KEYWORDS)
+                ):
+                    continue
+                if components[n].component_type in valid:
+                    keep.append(n)
         return keep
 
     out = concise_node(leaf_nodes)
@@ -372,11 +381,18 @@ class DependencyGraphBuilder:
         for ln in leaf_nodes:
             if not isinstance(ln, str) or not ln.strip():
                 continue
-            if any(k in ln.lower() for k in ERROR_KEYWORDS):
-                continue
-            if ln in components and components[ln].component_type in valid_types:
-                keep_leaf_nodes.append(ln)
-            elif ln not in components:
+            if ln in components:
+                # Error keywords filter functions only, matched on the
+                # component name (see concise_node above)
+                name_part = ln.split(".")[-1]
+                if (
+                    components[ln].component_type == "function"
+                    and any(k in name_part.lower() for k in ERROR_KEYWORDS)
+                ):
+                    continue
+                if components[ln].component_type in valid_types:
+                    keep_leaf_nodes.append(ln)
+            else:
                 logger.warning("Leaf node %s not found in components", ln)
 
         return components, keep_leaf_nodes
