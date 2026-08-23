@@ -6,6 +6,19 @@ import os
 # Token limit for clustering: skip LLM cluster when content is under this (CodeWiki default)
 MAX_TOKEN_PER_MODULE = 36_369
 
+# The OpenAI SDK always appends "/chat/completions" to base_url, so a
+# configured URL that already ends with it must be stripped (otherwise the
+# request hits ".../chat/completions/chat/completions" -> 404).
+_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+
+
+def _strip_chat_completions_suffix(url: str) -> str:
+    """Return the base URL without a trailing '/chat/completions' (no-op otherwise)."""
+    stripped = url.rstrip("/")
+    if stripped.endswith(_CHAT_COMPLETIONS_SUFFIX):
+        return stripped[: -len(_CHAT_COMPLETIONS_SUFFIX)]
+    return url
+
 
 @dataclass
 class Config:
@@ -29,6 +42,7 @@ class Config:
     doc_strategy: str = "agent"  # "agent" | "direct"
 
     def __post_init__(self) -> None:
+        self.llm_base_url = _strip_chat_completions_suffix(self.llm_base_url)
         if self.cluster_model is None:
             self.cluster_model = self.main_model
         if self.dependency_graph_dir is None:
