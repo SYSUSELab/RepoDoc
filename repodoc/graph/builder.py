@@ -215,10 +215,14 @@ def _build_graph_from_components(components: Dict[str, Node]) -> Dict[str, Set[s
 def _get_valid_component_types(components: Dict[str, Node]) -> Set[str]:
     """Component types eligible as leaf nodes. Classes always qualify;
     functions only when the repo is function-heavy (a single class would
-    otherwise hide all function docs — typical for JS/Go/Rust repos)."""
+    otherwise hide all function docs — typical for JS/Go/Rust/C repos).
+
+    struct is NOT counted as a class: in C it is a data declaration, not a
+    type with behavior — libevent's 1439 functions vs 763 struct/class would
+    otherwise lose all function docs (1439 < 763*2)."""
     type_counts = Counter(c.component_type for c in components.values())
     valid = {"class", "interface", "struct"}
-    classes = sum(type_counts[t] for t in valid)
+    classes = type_counts.get("class", 0) + type_counts.get("interface", 0)
     funcs = type_counts.get("function", 0)
     if not classes or funcs > classes * 2:
         valid.add("function")

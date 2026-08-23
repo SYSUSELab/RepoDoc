@@ -38,7 +38,8 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
                 tree = ast.parse(self.content)
             self.visit(tree)
         except SyntaxError as e:
-            logger.warning("Could not parse %s: %s", self.file_path, e)
+            # e.g. Python 2 files (print statements) in otherwise py3 repos
+            logger.debug("Could not parse %s: %s", self.file_path, e)
         except Exception as e:
             logger.error("Error analyzing %s: %s", self.file_path, e, exc_info=True)
 
