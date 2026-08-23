@@ -8,6 +8,7 @@ Two strategies (config.cluster_strategy):
 import json
 import logging
 import os
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
@@ -20,17 +21,29 @@ from repodoc.utils import count_tokens
 logger = logging.getLogger(__name__)
 
 # Maximum components per batch: large batches produce huge JSON outputs that
-# approach max_tokens and return empty responses (150-item and 70-item
-# batches both failed on DeepSeek; 30-50 items succeed reliably).
-MAX_COMPONENTS_PER_BATCH = 50
+# approach max_tokens and return empty responses (150/70-item batches failed
+# on DeepSeek, but short-id repos like libevent are fine at 100 on the
+# opencode gateway; 50 was the conservative default that made big repos
+# slow). Keep MAX_CONCURRENT_LLM_CALLS low when batches get large.
+MAX_COMPONENTS_PER_BATCH = 100
 # Modules with more components than this get clustered into sub-modules
 # (recursion). Independent of the batch size: a 41-component module should
-# still be split even though it fits in one batch. ≤12-component modules
-# (SKIP_CLUSTER_MAX_LEAVES) are never split.
-MIN_COMPONENTS_FOR_RECURSION = 20
-# Max concurrent LLM calls for batch clustering (avoid rate limits)
+# still be split even though it fits in one batch. ≤SKIP_CLUSTER_MAX_LEAVES
+# modules are never split. 40 skips LLM calls for small-ish modules, which
+# cuts recursive LLM call count roughly in half on big repos.
+MIN_COMPONENTS_FOR_RECURSION = 40
+# Max concurrent LLM calls for batch clustering. The batch thread pools nest
+# through recursion (a worker thread recursing into a >50-component module
+# opens a NEW pool), so plain worker counts explode: libevent's 15 top-level
+# batches + recursive 9/8/5/4-worker pools hit the API with dozens of
+# concurrent requests and ~87% of batches returned empty responses. A single
+# process-wide semaphore caps ALL LLM calls (top-level and recursive).
 MAX_BATCH_WORKERS = 16
-# Only skip clustering when content is small AND we have few leaves (avoid one big module for medium projects)
+MAX_CONCURRENT_LLM_CALLS = 16
+_LLM_CALL_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+# Only skip clustering when content is small AND we have few leaves (avoid one big module for medium projects).
+# Keep low: at 25, atcher (18 leaves) skipped LLM clustering entirely and
+# lost its config/core/services module split.
 SKIP_CLUSTER_MAX_LEAVES = 12
 
 
@@ -123,12 +136,19 @@ def _format_cluster_prompt(
 
     def _format_tree(tree: dict[str, Any], indent: int = 0) -> None:
         for key, value in tree.items():
+            if not isinstance(value, dict):
+                continue  # defense: malformed module entry
             if key == module_name:
                 lines.append(f"{'  ' * indent}{key} (current module)")
             else:
                 lines.append(f"{'  ' * indent}{key}")
             comps = value.get("components", [])
-            lines.append(f"{'  ' * (indent + 1)} Core components: {', '.join(comps)}")
+            comp_str = ", ".join(comps)
+            if len(comp_str) > 500:
+                # keep recursive prompts small — the full id list would
+                # otherwise blow past the 60K prompt cap on deep trees
+                comp_str = f"{comp_str[:500]}... (+{len(comps)} total)"
+            lines.append(f"{'  ' * (indent + 1)} Core components: {comp_str}")
             children = value.get("children")
             if isinstance(children, dict) and children:
                 lines.append(f"{'  ' * (indent + 1)} Children:")
@@ -199,7 +219,7 @@ def _parse_llm_response(response: str) -> Dict[str, Any]:
     try:
         tree = json.loads(content)
         if isinstance(tree, dict):
-            return tree
+            return _sanitize_module_tree(tree)
     except json.JSONDecodeError:
         pass
 
@@ -208,7 +228,7 @@ def _parse_llm_response(response: str) -> Dict[str, Any]:
         decoder = json.JSONDecoder()
         tree, _ = decoder.raw_decode(content.lstrip())
         if isinstance(tree, dict):
-            return tree
+            return _sanitize_module_tree(tree)
     except json.JSONDecodeError:
         pass
 
@@ -225,11 +245,21 @@ def _parse_llm_response(response: str) -> Dict[str, Any]:
         try:
             tree = json.loads(inner)
             if isinstance(tree, dict):
-                return tree
+                return _sanitize_module_tree(tree)
         except json.JSONDecodeError:
             pass
 
     raise ValueError("Could not parse JSON from LLM response")
+
+
+def _sanitize_module_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop non-dict module entries. LLMs occasionally emit malformed shapes
+    ({"module_name": "string"} or {"error": "..."}) that crash downstream
+    .get() calls; only keep {name: {path/components/children}} modules."""
+    for name in [k for k, v in tree.items() if not isinstance(v, dict)]:
+        logger.warning("Dropping non-dict module value for '%s'", name)
+        del tree[name]
+    return tree
 
 
 def _call_llm_with_retry(
@@ -237,7 +267,23 @@ def _call_llm_with_retry(
     config: Config,
     max_retries: int = 2,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Call LLM with retry on parse failure, using lower temperature."""
+    """Call LLM with retry on parse failure, using lower temperature.
+
+    The process-wide semaphore serializes ALL clustering LLM calls (batch
+    pools and recursive single calls alike) — nested thread pools would
+    otherwise multiply concurrent requests (libevent: dozens concurrent ->
+    ~87% empty responses).
+    """
+    with _LLM_CALL_SEMAPHORE:
+        return _call_llm_with_retry_locked(prompt, config, max_retries)
+
+
+def _call_llm_with_retry_locked(
+    prompt: str,
+    config: Config,
+    max_retries: int = 2,
+) -> Tuple[str, Dict[str, Any]]:
+    """Internal: the retry loop, run under the global LLM semaphore."""
     last_error = None
     last_response = ""
 
@@ -332,6 +378,8 @@ def _normalize_module_tree(
 
     def walk(nodes: Dict[str, Any]) -> None:
         for info in nodes.values():
+            if not isinstance(info, dict):
+                continue  # defense: malformed module entry from the LLM
             refs = info.get("components", [])
             if not isinstance(refs, list):
                 refs = [refs]  # tolerate a single string
@@ -402,6 +450,13 @@ def _anchor_module_paths(
             )
             if rels and not ok:
                 dirs = [os.path.dirname(r) for r in rels]
+                if not any(dirs):
+                    # Root-layout repos (C projects: event.c sits at the repo
+                    # root) have no directories — keep the LLM's semantic
+                    # path ('libevent') instead of flattening to '.'
+                    if not raw:
+                        info["path"] = "."
+                    continue
                 path = _common_dir(dirs)
                 info["path"] = path
                 logger.warning("Anchored module path '%s' -> '%s'", raw, path)
@@ -484,10 +539,18 @@ def _validate_and_backfill(
         node = components.get(ln)
         rel = node.relative_path if node else ""
         parts = [p for p in rel.split("/") if p]
-        module_name = parts[0] if len(parts) > 1 else "_unassigned"
+        if len(parts) > 1:
+            module_name = parts[0]
+            module_path = parts[0]
+        else:
+            # Root-layout repos (C projects): group by file stem so
+            # buffer.c components land in a "buffer" module that merges
+            # with the LLM's same-named module
+            module_name = os.path.splitext(parts[0])[0] if parts else "_unassigned"
+            module_path = "."
         info = tree.setdefault(
             module_name,
-            {"path": parts[0] if len(parts) > 1 else ".", "components": [], "children": {}},
+            {"path": module_path, "components": [], "children": {}},
         )
         if ln not in info["components"]:
             info["components"].append(ln)
@@ -609,18 +672,37 @@ def _cluster_large_set(
             info.pop("path", None)
             value[name] = info
 
-    # Recursively cluster each module's components
+    # Recursively cluster each module's components — in PARALLEL. Serial
+    # recursion made libevent take 1h+ (10+ large modules each waiting for
+    # its own LLM round-trips). The global LLM semaphore still caps total
+    # API concurrency, so parallelizing here is safe.
+    recursive = []
     for module_name, module_info in list(module_tree.items()):
         sub_leaf = module_info.get("components", [])
         valid_sub = [n for n in sub_leaf if n in components]
-
         if len(valid_sub) > MIN_COMPONENTS_FOR_RECURSION:
-            module_info["children"] = cluster_modules(
-                valid_sub, components, config,
-                current_module_tree, module_name, current_module_path + [module_name]
-            )
+            recursive.append((module_name, module_info, valid_sub))
         else:
             module_info["children"] = {}
+
+    if recursive:
+        with ThreadPoolExecutor(
+            max_workers=min(MAX_BATCH_WORKERS, len(recursive))
+        ) as executor:
+            futures = {}
+            for module_name, module_info, valid_sub in recursive:
+                future = executor.submit(
+                    cluster_modules,
+                    valid_sub, components, config,
+                    current_module_tree, module_name, current_module_path + [module_name],
+                )
+                futures[future] = module_info
+            for future in as_completed(futures):
+                try:
+                    futures[future]["children"] = future.result()
+                except Exception as e:
+                    logger.error("Recursive clustering failed: %s", e)
+                    futures[future]["children"] = {}
 
     return module_tree
 
@@ -771,8 +853,10 @@ def _cluster_heuristic(
 ) -> Dict[str, Any]:
     """Group leaf components by the first segment of their relative_path.
 
-    Root-level components go into a "core" module. Produces the same
-    module_tree shape as the LLM path: {name: {path, components, children}}.
+    Root-level components group by file stem (buffer.c -> "buffer") so
+    root-layout C repos get per-file modules instead of one "core" blob.
+    Produces the same module_tree shape as the LLM path:
+    {name: {path, components, children}}.
     """
     modules: Dict[str, Any] = {}
     for ln in leaf_nodes:
@@ -780,9 +864,14 @@ def _cluster_heuristic(
         if not node:
             continue
         parts = (node.relative_path or "").split("/")
-        module_name = parts[0] if len(parts) > 1 and parts[0] else "core"
+        if len(parts) > 1 and parts[0]:
+            module_name, module_path = parts[0], parts[0]
+        else:
+            module_name = os.path.splitext(parts[0])[0] if parts and parts[0] else "core"
+            module_path = "."
         info = modules.setdefault(
-            module_name, {"path": module_name, "components": [], "children": {}}
+            module_name,
+            {"path": module_path, "components": [], "children": {}},
         )
         info["components"].append(ln)
     return modules

@@ -74,6 +74,9 @@ DEFAULT_IGNORE_PATTERNS = {
     "webpack.config.*", "vite.config.*", "rollup.config.*", "gulpfile.*",
     "jest.config.*", "vitest.config.*", "tsconfig.*", "eslint.config.*",
     "sandbox", "playground",
+    # Non-product code: C projects ship samples and packaging helpers
+    # (libevent: sample/ contributed 197 components)
+    "sample", "test-export", "extra", "cmake",
 }
 
 # File extensions considered code (subset of EXTENSION_MAP keys)
