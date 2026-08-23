@@ -68,6 +68,12 @@ DEFAULT_IGNORE_PATTERNS = {
     # Non-product code dirs: doc examples and dev tooling (fastapi-style
     # repos ship hundreds of tutorial files in docs_src/, scripts/)
     "docs_src", "docs", "scripts",
+    # Type declarations and build config files are not implementation code
+    # (a .d.ts parses as .ts and floods the graph with type-only components)
+    "*.d.ts", "*.d.mts", "*.d.cts",
+    "webpack.config.*", "vite.config.*", "rollup.config.*", "gulpfile.*",
+    "jest.config.*", "vitest.config.*", "tsconfig.*", "eslint.config.*",
+    "sandbox", "playground",
 }
 
 # File extensions considered code (subset of EXTENSION_MAP keys)

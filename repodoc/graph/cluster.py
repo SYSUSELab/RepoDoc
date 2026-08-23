@@ -20,9 +20,9 @@ from repodoc.utils import count_tokens
 logger = logging.getLogger(__name__)
 
 # Maximum components per batch: large batches produce huge JSON outputs that
-# approach max_tokens and return empty responses (observed with 150-item
-# batches on DeepSeek json_object mode; 30-70 items succeed reliably).
-MAX_COMPONENTS_PER_BATCH = 70
+# approach max_tokens and return empty responses (150-item and 70-item
+# batches both failed on DeepSeek; 30-50 items succeed reliably).
+MAX_COMPONENTS_PER_BATCH = 50
 # Modules with more components than this get clustered into sub-modules
 # (recursion). Independent of the batch size: a 41-component module should
 # still be split even though it fits in one batch. ≤12-component modules
@@ -277,9 +277,13 @@ def _call_llm_with_retry(
 def _common_dir(dirs: List[str]) -> str:
     """Longest common directory prefix; fall back to the first entry when
     dirs span different top-level roots (commonpath returns '' then, and
-    only raises ValueError on cross-drive paths on Windows)."""
+    only raises ValueError on cross-drive paths on Windows).
+
+    Empty directory parts (root-level files, e.g. index.d.ts) are ignored;
+    if every member is root-level, "." is returned."""
+    dirs = [d for d in dirs if d]
     if not dirs:
-        return ""
+        return "."
     if len(dirs) == 1:
         return dirs[0]
     try:
@@ -425,6 +429,41 @@ def _collect_tree_components(tree: Dict[str, Any]) -> set[str]:
     return out
 
 
+def _dedupe_tree_components(tree: Dict[str, Any]) -> None:
+    """Remove duplicate component listings across the tree.
+
+    Semantics: overlap with a module's OWN ancestors is by design (a parent
+    keeps all members while children subdivide them — must not be removed).
+    Overlap with any OTHER branch (e.g. top-level "utils" vs. a "utils"
+    sub-module of "helpers") is a real duplicate and the later listing is
+    dropped; first occurrence wins, so nothing is ever lost."""
+    global_seen: set[str] = set()
+
+    def walk(nodes: Dict[str, Any], ancestors: set[str]) -> None:
+        # Sibling modules are mutually exclusive too
+        level_seen: set[str] = set()
+        for info in nodes.values():
+            keep = []
+            for x in info.get("components", []):
+                if x in ancestors:
+                    # parent/child subdivision is by design, but sibling
+                    # modules are mutually exclusive even for those members
+                    if x not in level_seen:
+                        level_seen.add(x)
+                        keep.append(x)
+                elif x not in global_seen and x not in level_seen:
+                    global_seen.add(x)
+                    level_seen.add(x)
+                    keep.append(x)
+            info["components"] = keep
+            own = set(info["components"])
+            children = info.get("children")
+            if isinstance(children, dict):
+                walk(children, ancestors | own)
+
+    walk(tree, set())
+
+
 def _validate_and_backfill(
     tree: Dict[str, Any],
     leaf_nodes: List[str],
@@ -433,6 +472,7 @@ def _validate_and_backfill(
     """Ensure every leaf appears in the tree; missing ones are backfilled into
     directory-based modules (mirrors _cluster_heuristic). Only called at the
     outermost level, so leaves are never silently dropped."""
+    _dedupe_tree_components(tree)
     have = _collect_tree_components(tree)
     missing = [ln for ln in leaf_nodes if ln not in have]
     if not missing:
@@ -559,6 +599,15 @@ def _cluster_large_set(
 
     if not current_module_tree:
         current_module_tree.update(module_tree)
+    else:
+        # Recursive call: merge into the nested position (mirrors
+        # _process_clustering_results, which handles the small-set path)
+        value = current_module_tree
+        for key in current_module_path:
+            value = value[key].setdefault("children", {})
+        for name, info in module_tree.items():
+            info.pop("path", None)
+            value[name] = info
 
     # Recursively cluster each module's components
     for module_name, module_info in list(module_tree.items()):

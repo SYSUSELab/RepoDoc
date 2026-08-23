@@ -9,6 +9,7 @@ repository, dispatching files to the language analyzers via the registry.
 import fnmatch
 import logging
 import os
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -147,10 +148,6 @@ def _assemble_components(
 # Leaf node selection (cycle handling + type/name filtering)
 # ---------------------------------------------------------------------------
 
-# Keywords used to filter out error-related leaf nodes
-ERROR_KEYWORDS = ("error", "exception", "failed", "invalid")
-
-
 def _detect_cycles(graph: Dict[str, Set[str]]) -> List[List[str]]:
     """Detect cycles using Tarjan's algorithm (strongly connected components)."""
     index_counter = [0]
@@ -215,38 +212,38 @@ def _build_graph_from_components(components: Dict[str, Node]) -> Dict[str, Set[s
     return graph
 
 
+def _get_valid_component_types(components: Dict[str, Node]) -> Set[str]:
+    """Component types eligible as leaf nodes. Classes always qualify;
+    functions only when the repo is function-heavy (a single class would
+    otherwise hide all function docs — typical for JS/Go/Rust repos)."""
+    type_counts = Counter(c.component_type for c in components.values())
+    valid = {"class", "interface", "struct"}
+    classes = sum(type_counts[t] for t in valid)
+    funcs = type_counts.get("function", 0)
+    if not classes or funcs > classes * 2:
+        valid.add("function")
+    return valid
+
+
 def _get_leaf_nodes(
     graph: Dict[str, Set[str]], components: Dict[str, Node]
 ) -> List[str]:
     """Leaf nodes: no other node depends on them. Filter by valid types."""
     acyclic = _resolve_cycles(graph)
     leaf_nodes = set(acyclic.keys())
+    valid_types = _get_valid_component_types(components)
 
     def concise_node(ln: Set[str]) -> List[str]:
         concise = set()
         for n in ln:
             concise.add(n.replace(".__init__", "") if n.endswith("__init__") else n)
-        available_types = {c.component_type for c in components.values()}
-        valid = {"class", "interface", "struct"}
-        if not available_types.intersection(valid):
-            valid.add("function")
+        valid = valid_types
         keep = []
         for n in concise:
             if not isinstance(n, str) or not n.strip():
                 continue
-            if n in components:
-                # Error keywords match the component name only (not the dotted
-                # path — "fastapi.exceptions.X" would otherwise be miskilled),
-                # and only filter functions: public exception classes like
-                # HTTPException deserve documentation.
-                name_part = n.split(".")[-1]
-                if (
-                    components[n].component_type == "function"
-                    and any(k in name_part.lower() for k in ERROR_KEYWORDS)
-                ):
-                    continue
-                if components[n].component_type in valid:
-                    keep.append(n)
+            if n in components and components[n].component_type in valid:
+                keep.append(n)
         return keep
 
     out = concise_node(leaf_nodes)
@@ -372,27 +369,15 @@ class DependencyGraphBuilder:
         graph = _build_graph_from_components(components)
         leaf_nodes = _get_leaf_nodes(graph, components)
 
-        available_types = {c.component_type for c in components.values()}
-        valid_types = {"class", "interface", "struct"}
-        if not available_types.intersection(valid_types):
-            valid_types.add("function")
+        valid_types = _get_valid_component_types(components)
 
         keep_leaf_nodes = []
         for ln in leaf_nodes:
             if not isinstance(ln, str) or not ln.strip():
                 continue
-            if ln in components:
-                # Error keywords filter functions only, matched on the
-                # component name (see concise_node above)
-                name_part = ln.split(".")[-1]
-                if (
-                    components[ln].component_type == "function"
-                    and any(k in name_part.lower() for k in ERROR_KEYWORDS)
-                ):
-                    continue
-                if components[ln].component_type in valid_types:
-                    keep_leaf_nodes.append(ln)
-            else:
+            if ln in components and components[ln].component_type in valid_types:
+                keep_leaf_nodes.append(ln)
+            elif ln not in components:
                 logger.warning("Leaf node %s not found in components", ln)
 
         return components, keep_leaf_nodes
