@@ -221,7 +221,9 @@ def _get_valid_component_types(components: Dict[str, Node]) -> Set[str]:
     type with behavior — libevent's 1439 functions vs 763 struct/class would
     otherwise lose all function docs (1439 < 763*2)."""
     type_counts = Counter(c.component_type for c in components.values())
-    valid = {"class", "interface", "struct"}
+    # enum/annotation are first-class doc targets in Java; "method" is
+    # deliberately excluded (methods belong to their class's doc)
+    valid = {"class", "interface", "struct", "enum", "annotation"}
     classes = type_counts.get("class", 0) + type_counts.get("interface", 0)
     funcs = type_counts.get("function", 0)
     if not classes or funcs > classes * 2:
@@ -251,7 +253,12 @@ def _get_leaf_nodes(
         return keep
 
     out = concise_node(leaf_nodes)
-    if len(out) >= 400:
+    # Only shrink to true leaves (no dependents) when functions are in play:
+    # function counts can explode on big C/JS repos. Class/interface/enum
+    # counts are naturally bounded (Java projects stay ~400), and shrinking
+    # them is discontinuous — mybatis jumped 357 -> 422 -> 118 when enum/
+    # annotation leaves pushed it over the 400 mark.
+    if "function" in valid_types and len(out) >= 400:
         for node, deps in acyclic.items():
             for dep in deps:
                 leaf_nodes.discard(dep)
