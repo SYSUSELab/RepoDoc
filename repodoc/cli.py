@@ -88,6 +88,15 @@ def analyze(
         click.echo(f"Leaf nodes: {len(leaf_nodes)}")
         click.echo(f"Dependency graph saved: {config.dependency_graph_dir}")
 
+        # Persist the knowledge graph right after analysis: it is the
+        # pipeline's backbone, not a post-doc-generation summary.
+        from repodoc.graph.builder import build_graph_from_analysis
+
+        graph = build_graph_from_analysis(components)
+        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
+        graph.save(kg_path)
+        click.echo(f"Knowledge graph saved: {kg_path}")
+
         if not no_cluster:
             file_manager.ensure_directory(data_dir)
             module_tree = cluster_modules(leaf_nodes, components, config)

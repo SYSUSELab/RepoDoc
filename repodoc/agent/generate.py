@@ -151,7 +151,68 @@ class DocPipeline:
         builder = DependencyGraphBuilder(self.config)
         self.components, self.leaf_nodes = builder.build_dependency_graph()
         self.graph = build_graph_from_analysis(self.components)
+        # Persist immediately: the knowledge graph is the pipeline's backbone,
+        # not a post-doc-generation summary — it must exist on disk right
+        # after analysis (code nodes + calls edges).
+        self._save_graph()
         return self.components, self.leaf_nodes
+
+    def _save_graph(self) -> None:
+        """Persist the knowledge graph to {data}/{project}_knowledge_graph.json."""
+        if not self.graph:
+            return
+        project_name = self.get_project_name()
+        data_dir = self.get_data_dir()
+        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
+        self.graph.save(kg_path)
+
+    def _save_graph_safe(self) -> None:
+        try:
+            self._save_graph()
+        except Exception as e:
+            print(f"Warning: Knowledge graph save failed: {e}")
+
+    def _doc_id_from_path(self, fpath: str) -> str:
+        """Map a generated doc file to its graph DocNode id.
+
+        overview README -> "overview"; anything else -> "doc/{rel_dir}/{stem}"
+        (rel_dir is the doc's directory relative to docs_dir)."""
+        try:
+            rel = os.path.relpath(fpath, self.config.docs_dir)
+        except ValueError:
+            rel = os.path.basename(fpath)
+        rel = rel.replace("\\", "/")
+        if rel == "README.md":
+            return "overview"
+        rel_dir, fname = os.path.split(rel)
+        stem = os.path.splitext(fname)[0]
+        return f"doc/{rel_dir}/{stem}" if rel_dir else f"doc/{stem}"
+
+    def _add_doc_to_graph(self, result, comp_id: str = None) -> None:
+        """Incrementally attach a generated doc to the knowledge graph:
+        add the DocNode now (not by scanning files afterwards) and, for
+        component docs, the precise describes edge to that component."""
+        if not self.graph:
+            return
+        if not getattr(result, "success", False):
+            return  # never attach failed generations
+        output = getattr(result, "output", None)
+        if not output or not output.get("path"):
+            return
+        from repodoc.graph.models import DocNode, REL_DESCRIBES
+
+        fpath = output["path"]
+        doc_id = self._doc_id_from_path(fpath)
+        self.graph.add_doc_node(
+            DocNode(
+                id=doc_id,
+                content=output.get("content", ""),
+                format="markdown",
+                file_path=fpath,
+            )
+        )
+        if comp_id and self.graph.has_node(comp_id):
+            self.graph.add_edge(doc_id, comp_id, REL_DESCRIBES, 1.0)
 
     def load_module_tree(self):
         project_name = self.get_project_name()
@@ -435,6 +496,8 @@ class DocPipeline:
                 },
             }
         )
+        if result is not None and getattr(result, "success", False):
+            self._add_doc_to_graph(result)
         return result
 
     async def _generate_single_component(
@@ -475,6 +538,9 @@ class DocPipeline:
                 },
             }
         )
+        if result is not None and getattr(result, "success", False):
+            # Precise describes edge at generation time (no filename matching).
+            self._add_doc_to_graph(result, comp_id=node_id)
         return result
 
     async def generate_component_docs(
@@ -568,48 +634,6 @@ class DocPipeline:
         ]
 
 
-    def update_graph_with_docs(self, data_dir: str, docs_dir: str = None):
-        if not self.graph:
-            return
-
-        if docs_dir is None:
-            docs_dir = os.path.join(self.config.output_dir, "docs")
-
-        from repodoc.graph.models import DocNode, REL_DESCRIBES
-
-        overview_path = os.path.join(docs_dir, "README.md")
-        if os.path.exists(overview_path):
-            with open(overview_path) as f:
-                content = f.read()
-            doc_node = DocNode(id="overview", content=content, format="markdown")
-            self.graph.add_doc_node(doc_node)
-
-        for root, _, files in os.walk(docs_dir):
-            for fname in files:
-                if fname.endswith(".md") and not fname.startswith("_"):
-                    fpath = os.path.join(root, fname)
-                    rel_dir = os.path.relpath(os.path.dirname(fpath), docs_dir)
-                    if rel_dir == ".":
-                        continue
-                    with open(fpath) as f:
-                        content = f.read()
-                    doc_id = f"doc/{rel_dir}/{fname[:-3]}"
-                    doc_node = DocNode(
-                        id=doc_id, content=content, format="markdown", file_path=fpath
-                    )
-                    self.graph.add_doc_node(doc_node)
-
-                    for comp_id, node in self.components.items():
-                        if node.name and node.name.lower() in fname.lower().replace(
-                            ".md", ""
-                        ).replace("_", " ").replace("-", " "):
-                            self.graph.add_edge(doc_id, comp_id, REL_DESCRIBES, 1.0)
-                            break
-
-        project_name = self.get_project_name()
-        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
-        self.graph.save(kg_path)
-
     def _collect_generated_files(self, docs_dir: str, data_dir: str) -> list[str]:
         files = []
         for ext in ["*.md", "*.json", "*.mmd"]:
@@ -654,18 +678,22 @@ class DocPipeline:
             docs_dir=docs_dir, module_tree=module_tree
         )
         print(f"Layer 1: {len(component_results)} component docs")
+        self._save_graph_safe()  # graph now carries code + component docs
 
         # Layer 2: module docs, bottom-up (leaf modules first)
         module_results = await self._generate_module_docs_safe()
         print(f"Layer 2: {len(module_results)} module docs")
+        self._save_graph_safe()  # + module docs
 
         # Layer 3: overview README
         overview_result = await self._generate_overview_safe(
             os.path.join(docs_dir, "README.md")
         )
+        if overview_result is not None and getattr(overview_result, "success", False):
+            self._add_doc_to_graph(overview_result)  # overview doc node
         print("Layer 3: overview README")
 
-        self._update_graph_with_docs_safe(data_dir, docs_dir)
+        self._save_graph_safe()
         self._extract_concepts_safe(data_dir)
 
         link_results = validate_and_fix_links(docs_dir)
@@ -686,13 +714,6 @@ class DocPipeline:
             "total_components": len(self.components),
             "docs_directory": docs_dir,
         }
-
-    def _update_graph_with_docs_safe(self, data_dir: str, docs_dir: str) -> None:
-        """Update graph with docs, ignoring errors."""
-        try:
-            self.update_graph_with_docs(data_dir, docs_dir)
-        except Exception as e:
-            print(f"Warning: Graph update failed: {e}")
 
     def _extract_concepts_safe(self, data_dir: str) -> None:
         """Extract concepts into the graph (keyword or LLM-enhanced), ignoring errors."""
