@@ -296,6 +296,72 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
     return graph
 
 
+def attach_module_tree_to_graph(
+    graph: HeterogeneousGraph,
+    module_tree: dict,
+    components: Dict[str, Node],
+) -> HeterogeneousGraph:
+    """Attach the clustering result (module tree) to the knowledge graph.
+
+    Adds a ModuleNode per module (id = module path in the tree), contains
+    edges for module -> component and module -> child module, and depends_on
+    edges for cross-module call aggregation (component calls that cross
+    module boundaries, using each component's deepest module home).
+
+    Returns the graph for chaining. Components/modules missing from the
+    graph are skipped silently (e.g. modules over components the tree
+    excludes from documentation)."""
+    from repodoc.graph.models import REL_CONTAINS, REL_DEPENDS_ON, ModuleNode
+
+    def deepest_module(nodes: dict, path: str, best: dict) -> None:
+        """Map each component id to its DEEPEST owning module path."""
+        for name, info in nodes.items():
+            cur = f"{path}/{name}" if path else name
+            for cid in info.get("components", []):
+                if cid not in best or len(cur) > len(best[cid]):
+                    best[cid] = cur
+            children = info.get("children")
+            if isinstance(children, dict):
+                deepest_module(children, cur, best)
+
+    def add_module_nodes(nodes: dict, parent: str | None) -> None:
+        for name, info in nodes.items():
+            cur = f"{parent}/{name}" if parent else name
+            graph.add_module_node(
+                ModuleNode(
+                    id=cur,
+                    name=name,
+                    path=info.get("path", ""),
+                    parent=parent,
+                )
+            )
+            if parent is not None:
+                graph.add_edge(parent, cur, REL_CONTAINS, 1.0)
+            for cid in info.get("components", []):
+                if graph.has_node(cid):
+                    graph.add_edge(cur, cid, REL_CONTAINS, 1.0)
+            children = info.get("children")
+            if isinstance(children, dict):
+                add_module_nodes(children, cur)
+
+    add_module_nodes(module_tree, None)
+
+    # Cross-module dependency edges: component calls that cross module
+    # boundaries (module A depends on module B).
+    comp_module: dict[str, str] = {}
+    deepest_module(module_tree, "", comp_module)
+    for cid, node in components.items():
+        m = comp_module.get(cid)
+        if m is None or not graph.has_node(m):
+            continue
+        for dep_id in getattr(node, "depends_on", []):
+            dm = comp_module.get(dep_id)
+            if dm and dm != m and graph.has_node(dm):
+                graph.add_edge(m, dm, REL_DEPENDS_ON, 1.0)
+
+    return graph
+
+
 # ---------------------------------------------------------------------------
 # Public builder
 # ---------------------------------------------------------------------------

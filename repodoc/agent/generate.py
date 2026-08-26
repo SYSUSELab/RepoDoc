@@ -151,9 +151,16 @@ class DocPipeline:
         builder = DependencyGraphBuilder(self.config)
         self.components, self.leaf_nodes = builder.build_dependency_graph()
         self.graph = build_graph_from_analysis(self.components)
+        # Attach the clustering blueprint (module tree) when it already
+        # exists, so the graph carries the full architecture from the start.
+        from repodoc.graph.builder import attach_module_tree_to_graph
+
+        attach_module_tree_to_graph(
+            self.graph, self.load_module_tree(), self.components
+        )
         # Persist immediately: the knowledge graph is the pipeline's backbone,
         # not a post-doc-generation summary — it must exist on disk right
-        # after analysis (code nodes + calls edges).
+        # after analysis (code nodes + calls edges + module structure).
         self._save_graph()
         return self.components, self.leaf_nodes
 
@@ -188,10 +195,11 @@ class DocPipeline:
         stem = os.path.splitext(fname)[0]
         return f"doc/{rel_dir}/{stem}" if rel_dir else f"doc/{stem}"
 
-    def _add_doc_to_graph(self, result, comp_id: str = None) -> None:
+    def _add_doc_to_graph(self, result, target_id: str = None) -> None:
         """Incrementally attach a generated doc to the knowledge graph:
-        add the DocNode now (not by scanning files afterwards) and, for
-        component docs, the precise describes edge to that component."""
+        add the DocNode now (not by scanning files afterwards) and, when the
+        doc describes a known graph node (component or module), the precise
+        describes edge to it."""
         if not self.graph:
             return
         if not getattr(result, "success", False):
@@ -211,8 +219,8 @@ class DocPipeline:
                 file_path=fpath,
             )
         )
-        if comp_id and self.graph.has_node(comp_id):
-            self.graph.add_edge(doc_id, comp_id, REL_DESCRIBES, 1.0)
+        if target_id and self.graph.has_node(target_id):
+            self.graph.add_edge(doc_id, target_id, REL_DESCRIBES, 1.0)
 
     def load_module_tree(self):
         project_name = self.get_project_name()
@@ -497,7 +505,8 @@ class DocPipeline:
             }
         )
         if result is not None and getattr(result, "success", False):
-            self._add_doc_to_graph(result)
+            # Module docs describe the module node itself (when it exists).
+            self._add_doc_to_graph(result, target_id=full_path)
         return result
 
     async def _generate_single_component(
@@ -540,7 +549,7 @@ class DocPipeline:
         )
         if result is not None and getattr(result, "success", False):
             # Precise describes edge at generation time (no filename matching).
-            self._add_doc_to_graph(result, comp_id=node_id)
+            self._add_doc_to_graph(result, target_id=node_id)
         return result
 
     async def generate_component_docs(

@@ -105,6 +105,13 @@ def analyze(
             click.echo(
                 f"Module tree saved: {tree_path} ({len(module_tree)} top-level module(s))"
             )
+            # Merge the clustering blueprint into the knowledge graph and
+            # persist: the graph is the single integrated asset.
+            from repodoc.graph.builder import attach_module_tree_to_graph
+
+            attach_module_tree_to_graph(graph, module_tree, components)
+            graph.save(kg_path)
+            click.echo(f"Knowledge graph updated with module structure: {kg_path}")
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         raise click.Abort()

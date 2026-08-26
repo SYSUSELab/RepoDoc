@@ -50,13 +50,25 @@ class CallRelationship(BaseModel):
 # Knowledge graph models
 # ---------------------------------------------------------------------------
 
-# Relation type constants for graph edges (design: calls, implements, describes, semantic_impact).
+# Relation type constants for graph edges
+# (design: calls, implements, describes, semantic_impact + module structure).
 REL_CALLS = "calls"
 REL_IMPLEMENTS = "implements"
 REL_DESCRIBES = "describes"
 REL_SEMANTIC_IMPACT = "semantic_impact"
+# Module clustering edges: contains (module -> component / child module),
+# depends_on (module -> module, cross-module call aggregation).
+REL_CONTAINS = "contains"
+REL_DEPENDS_ON = "depends_on"
 
-RELATION_TYPES = (REL_CALLS, REL_IMPLEMENTS, REL_DESCRIBES, REL_SEMANTIC_IMPACT)
+RELATION_TYPES = (
+    REL_CALLS,
+    REL_IMPLEMENTS,
+    REL_DESCRIBES,
+    REL_SEMANTIC_IMPACT,
+    REL_CONTAINS,
+    REL_DEPENDS_ON,
+)
 
 
 class CodeNode(BaseModel):
@@ -90,3 +102,12 @@ class ConceptNode(BaseModel):
     concept: str
     context: str = ""
     confidence: float = 1.0  # 0.0 to 1.0
+
+
+class ModuleNode(BaseModel):
+    """Clustered module from the LLM/heuristic clustering result (module tree)."""
+
+    id: str  # module path in the tree, e.g. "core" or "net/http"
+    name: str
+    path: str = ""  # source directory, e.g. "src/atcher/core"
+    parent: Optional[str] = None  # parent module id, None for top-level modules
