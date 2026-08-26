@@ -300,6 +300,62 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
     return graph
 
 
+def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
+    """Restore analysis Nodes from graph code nodes.
+
+    The knowledge graph carries every analysis field on its CodeNodes, so
+    doc generation/update can rely on the graph ALONE (no re-parsing, no
+    dependency_graph.json). Reverse of build_graph_from_analysis."""
+    components: Dict[str, Node] = {}
+    for node_id, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "code":
+            continue
+        d = attrs.get("data", {})
+        components[node_id] = Node(
+            id=d.get("id", node_id),
+            name=d.get("name", ""),
+            component_type=d.get("component_type") or d.get("type", "unknown"),
+            file_path=d.get("file_path", ""),
+            relative_path=d.get("relative_path", ""),
+            depends_on=set(d.get("depends_on", [])),
+            source_code=d.get("source_code"),
+            start_line=d.get("start_line", 0),
+            end_line=d.get("end_line", 0),
+            docstring=d.get("docstring", ""),
+            parameters=d.get("parameters"),
+            receiver=d.get("receiver"),
+        )
+    return components
+
+
+def graph_to_module_tree(graph: HeterogeneousGraph) -> dict:
+    """Restore the nested module tree dict from graph module nodes.
+
+    ModuleNodes carry name/path/components and their id is the tree path
+    ("net/http"), so the full hierarchy (children included) is rebuilt from
+    the graph alone. Empty dict when the graph has no module nodes."""
+    tree: dict = {}
+    modules = [
+        attrs.get("data", {})
+        for _nid, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "module"
+    ]
+    for d in sorted(modules, key=lambda m: m.get("id", "")):
+        mid = d.get("id", "")
+        parts = mid.split("/")
+        if not parts or not parts[-1]:
+            continue
+        target = tree
+        for part in parts[:-1]:
+            target = target[part]["children"]
+        target[parts[-1]] = {
+            "path": d.get("path", ""),
+            "components": list(d.get("components", [])),
+            "children": {},
+        }
+    return tree
+
+
 def attach_module_tree_to_graph(
     graph: HeterogeneousGraph,
     module_tree: dict,

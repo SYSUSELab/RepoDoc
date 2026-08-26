@@ -148,6 +148,16 @@ class DocPipeline:
         return "".join(c if c.isalnum() else "_" for c in repo_name)
 
     def run_analysis(self):
+        """Analyze, or restore from the persisted knowledge graph.
+
+        The knowledge graph is the single required input for doc generation:
+        when {data}/{project}_knowledge_graph.json exists (produced by
+        `repodoc analyze`), components and the module tree are restored from
+        the graph alone — no re-parsing of the repository, no other input
+        file. Otherwise the repo is analyzed and the graph persisted."""
+        if self.load_from_graph():
+            return self.components, self.leaf_nodes
+
         builder = DependencyGraphBuilder(self.config)
         self.components, self.leaf_nodes = builder.build_dependency_graph()
         self.graph = build_graph_from_analysis(self.components)
@@ -163,6 +173,26 @@ class DocPipeline:
         # after analysis (code nodes + calls edges + module structure).
         self._save_graph()
         return self.components, self.leaf_nodes
+
+    def load_from_graph(self) -> bool:
+        """Restore pipeline state (graph, components, module tree) from the
+        persisted knowledge graph. Returns True when the graph existed."""
+        project_name = self.get_project_name()
+        kg_path = os.path.join(
+            self.get_data_dir(), f"{project_name}_knowledge_graph.json"
+        )
+        if not os.path.exists(kg_path):
+            return False
+        from repodoc.graph.graph import HeterogeneousGraph
+        from repodoc.graph.builder import graph_to_components, graph_to_module_tree
+
+        self.graph = HeterogeneousGraph.load(kg_path)
+        self.components = graph_to_components(self.graph)
+        self.module_tree = graph_to_module_tree(self.graph)
+        # leaf_nodes is an analysis-internal value (clustering input only);
+        # it is not recoverable from the graph and not needed for docs.
+        self.leaf_nodes = []
+        return True
 
     def _save_graph(self) -> None:
         """Persist the knowledge graph to {data}/{project}_knowledge_graph.json."""
@@ -223,6 +253,17 @@ class DocPipeline:
             self.graph.add_edge(doc_id, target_id, REL_DESCRIBES, 1.0)
 
     def load_module_tree(self):
+        """Load the clustering blueprint: from the knowledge graph when it
+        carries module nodes (single-file input), else from module_tree.json
+        (legacy/compat), else empty."""
+        if self.graph is not None:
+            from repodoc.graph.builder import graph_to_module_tree
+
+            restored = graph_to_module_tree(self.graph)
+            if restored:
+                self.module_tree = restored
+                return self.module_tree
+
         project_name = self.get_project_name()
         data_dir = self.get_data_dir()
         new_path = os.path.join(data_dir, f"{project_name}_module_tree.json")

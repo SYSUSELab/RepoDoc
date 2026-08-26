@@ -167,9 +167,12 @@ def docs(
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
     try:
-        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
-        if not os.path.exists(tree_path):
-            click.echo("module_tree.json not found. Running clustering first...")
+        # The knowledge graph is the single required input: when it exists
+        # (produced by `repodoc analyze`), doc generation restores everything
+        # from the graph alone and skips re-analysis/clustering entirely.
+        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
+        if not os.path.exists(kg_path):
+            click.echo("knowledge graph not found. Running analysis first...")
             click.echo("=" * 40)
             click.echo("Phase 1: Analyzing dependencies...")
             builder = DependencyGraphBuilder(config)
@@ -181,6 +184,7 @@ def docs(
             click.echo("Phase 2: Clustering modules...")
             file_manager.ensure_directory(data_dir)
             module_tree = cluster_modules(leaf_nodes, components, config)
+            tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
             file_manager.save_json(module_tree, tree_path)
             click.echo(f"  Modules: {len(module_tree)}")
             click.echo("=" * 40)
