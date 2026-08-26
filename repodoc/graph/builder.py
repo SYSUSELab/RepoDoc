@@ -280,6 +280,7 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
         code_node = CodeNode(
             id=node.id,
             type=node.component_type,
+            component_type=node.component_type,
             file_path=node.file_path,
             source_code=node.source_code,
             name=node.name,
@@ -287,6 +288,9 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             start_line=node.start_line,
             end_line=node.end_line,
             docstring=node.docstring or "",
+            depends_on=sorted(node.depends_on),
+            parameters=node.parameters,
+            receiver=node.receiver,
         )
         graph.add_code_node(code_node)
     for nid, node in components.items():

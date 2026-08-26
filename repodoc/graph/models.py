@@ -72,10 +72,15 @@ RELATION_TYPES = (
 
 
 class CodeNode(BaseModel):
-    """Code entity: file, class, or function. Maps from analysis Node in Step 2."""
+    """Code entity: file, class, or function. Maps from analysis Node in Step 2.
+
+    component_type mirrors type from the analysis model, and depends_on /
+    parameters / receiver carry the FULL analysis fields, so the graph JSON
+    is self-contained: it covers everything dependency_graph.json holds."""
 
     id: str
     type: str  # e.g. "function", "class", "file"
+    component_type: str = ""  # same value as type (analysis model's field name)
     file_path: str
     source_code: Optional[str] = None
     name: Optional[str] = None
@@ -83,6 +88,9 @@ class CodeNode(BaseModel):
     start_line: int = 0
     end_line: int = 0
     docstring: str = ""
+    depends_on: List[str] = []  # full dependency list (incl. unresolved targets)
+    parameters: Optional[List[str]] = None
+    receiver: Optional[str] = None  # Go/Rust method receiver type
 
 
 class DocNode(BaseModel):
