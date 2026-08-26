@@ -105,9 +105,14 @@ class ConceptNode(BaseModel):
 
 
 class ModuleNode(BaseModel):
-    """Clustered module from the LLM/heuristic clustering result (module tree)."""
+    """Clustered module from the LLM/heuristic clustering result (module tree).
+
+    Member components are ALSO expressed as contains edges (the authoritative
+    graph relation); the components field keeps the node self-contained so
+    the graph JSON alone carries the full clustering result."""
 
     id: str  # module path in the tree, e.g. "core" or "net/http"
     name: str
     path: str = ""  # source directory, e.g. "src/atcher/core"
     parent: Optional[str] = None  # parent module id, None for top-level modules
+    components: List[str] = []  # member component ids (mirrors module_tree)

@@ -333,6 +333,7 @@ def attach_module_tree_to_graph(
                     name=name,
                     path=info.get("path", ""),
                     parent=parent,
+                    components=list(info.get("components", [])),
                 )
             )
             if parent is not None:
