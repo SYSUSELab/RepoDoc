@@ -1,338 +1,234 @@
-DOC_WRITER_SYSTEM_PROMPT = """You are an expert technical documentation writer. Your task is to generate comprehensive documentation for code components based on the provided analysis results.
+"""Prompts for architecture-narrative documentation.
 
-## Role
-You are an AI documentation assistant specializing in creating detailed, accurate technical documentation.
+Three layers, generated bottom-up:
+1. Component docs — role/cooperation in the architecture, length adapts to
+   the component's architectural importance (no API-manual tables).
+2. Module docs — responsibilities/boundaries, position between upstream and
+   downstream modules, member role list (from actual component docs).
+3. Overview README — architecture overview with an embedded module-level
+   mermaid diagram, theme map, and core flows.
+"""
 
-## Objectives
-Create documentation that helps developers and maintainers understand:
-1. The component's purpose and core functionality
-2. Architecture and component relationships
-3. How the component fits into the overall system
-4. API reference with all public methods and attributes
-5. Best practices and usage patterns
-6. Common issues and troubleshooting
+# ---------------------------------------------------------------------------
+# Layer 1: Component docs (architecture role, adaptive length)
+# ---------------------------------------------------------------------------
 
-## Documentation Structure
-Generate documentation with the following sections:
-1. **Overview**: Brief introduction and purpose
-2. **Key Responsibilities**: Core duties and features
-3. **Constructor/Init Parameters**: All parameters with types, defaults, and descriptions
-4. **Public Methods**: All public methods with descriptions - use a markdown TABLE format with columns: Method | Description | Parameters | Returns
-5. **Attributes/Properties**: All attributes with types - use TABLE format
-6. **Usage Examples**: Multiple code examples showing common use cases - each example must be runnable
-7. **Best Practices**: Recommended patterns for using this component
-8. **Common Issues**: Potential problems and solutions
-9. **Integration Points**: How this component interacts with others
-10. **Related Modules**: Links to related documentation
+COMPONENT_SYSTEM_PROMPT = """You are an expert software architect writing documentation for a code repository.
 
-## Output Format Requirements
-- Use markdown TABLE format for all API listings
-- Include COMPLETE method signatures with all parameters
-- Code examples must be complete and runnable
-- Include import statements in code examples
-- Add error handling examples showing common exceptions
+Your documentation is READ by developers to understand the repository's architecture:
+how components cooperate, what roles they play in flows, and why things are
+structured the way they are. It is NOT an API manual.
 
-## Guidelines
-1. Write comprehensive documentation - do not be brief
-2. Include ALL public API elements (methods, attributes, properties)
-3. Provide multiple usage examples (at least 3 different use cases)
-4. Use Markdown formatting for structure and readability
-5. Focus on the "why" not just the "what"
-6. Extract business concepts and design decisions from the code
-7. Be detailed - aim for thorough coverage"""
+Write in clear, precise technical prose in the repository's primary language
+(English unless the context is clearly otherwise). Ground everything in the
+provided context — never invent components, calls, or behaviors."""
 
+COMPONENT_USER_PROMPT = """Describe the role of this component in the repository's architecture.
 
-DOC_WRITER_USER_PROMPT = """Generate comprehensive documentation for the following code component:
+Component: {component_name}
+Type: {component_type}
+File: {file_path}
+Belongs to module: {module_name}
 
-Component Name: {component_name}
-Component Type: {component_type}
-File Path: {file_path}
-Docstring: {docstring}
+{component_context}
 
-Source Code:
+## What to write
+
+- **Architectural role**: what this component is for, and why it exists in the
+  architecture (its responsibility at a high level — NOT an API listing)
+- **Cooperation**: which components it calls and which components call it
+  (use the dependency lists below); what flows it participates in
+- **Position in flows**: entry points it serves, or outputs it produces
+
+## Length: ADAPT to architectural importance
+
+- **Architecturally important** (a core class, a flow hub, widely referenced):
+  write a thorough section — role, cooperation, flows; a small mermaid
+  diagram is welcome when it clarifies cooperation.
+- **Secondary components** (config holders, small helpers, internal
+  utilities): 1-3 short paragraphs. A short "Role" line plus key points is
+  enough. Do NOT pad.
+
+## Rules
+
+- NO method/API tables. NO full API listings. Describe behavior and role.
+- Never invent dependencies or flows not present in the context.
+- Return ONLY the Markdown document content.
+
+Component: {component_name}
+Calls: {dependencies}
+Called by: {predecessors}
+Source:
+```
 {source_code}
-
-Dependencies: {dependencies}
-
-Module Context: {module_context}
-
-Please generate detailed documentation following the structure in the system prompt. Include all public methods, attributes, parameters, and provide multiple usage examples."""
+```
+Docstring: {docstring}"""
 
 
-def format_doc_prompt(
+def format_component_prompt(
     component_name: str,
     component_type: str,
     file_path: str,
     docstring: str,
     source_code: str,
     dependencies: list[str],
-    module_context: str = "",
+    predecessors: list[str],
+    module_name: str,
+    component_context: str = "",
 ) -> tuple[str, str]:
-    user_prompt = DOC_WRITER_USER_PROMPT.format(
+    user_prompt = COMPONENT_USER_PROMPT.format(
         component_name=component_name,
         component_type=component_type,
         file_path=file_path,
         docstring=docstring or "No documentation provided.",
         source_code=source_code[:24000],
         dependencies=", ".join(dependencies) if dependencies else "None",
-        module_context=module_context,
-    )
-    return DOC_WRITER_SYSTEM_PROMPT, user_prompt
-
-
-REPO_OVERVIEW_PROMPT = """Generate a comprehensive repository overview document based on the following analysis:
-
-Repository Name: {repo_name}
-Total Components: {component_count}
-Module Structure: {module_structure}
-
-Code Analysis Statistics:
-- Component Types: {component_types}
-- Language Distribution: {language_counts}
-- Total Files Analyzed: {total_files}
-- Top Dependencies: {top_dependencies}
-
-Top-level Modules:
-{modules_summary}
-
-## IMPORTANT: Available Modules for Cross-References
-Only link to modules that exist in this list:
-{available_modules}
-
-When linking to modules, use the format:
-- [ModuleName](module_name.md) - for top-level modules in ROOT directory
-
-Please generate a well-structured README that includes:
-
-1. **Repository Overview**:
-   - Explain the repository purpose based on the code analysis
-   - Describe the main functionality and what this project does
-
-2. **Architecture Overview**:
-   - Include a Mermaid diagram showing high-level architecture
-   - Explain the main components and their relationships
-
-3. **Module Documentation**:
-   - List all main modules and their responsibilities
-   - Link to each module's documentation: [ModuleName](module_name.md)
-
-4. **Key Features**:
-   - List the main features discovered from code analysis
-   - Include technology stack and dependencies
-
-5. **Getting Started**:
-   - Installation/setup instructions if inferrable from code
-   - Basic usage examples
-
-6. **Project Structure**:
-   - Directory structure overview
-   - Key files and their purposes
-
-7. **Related Documentation**:
-   - Links to external resources (official docs, etc. if found in code)
-
-Generate a comprehensive README that serves as the entry point for this repository's documentation."""
-
-
-MODULE_OVERVIEW_PROMPT = """You are an AI documentation assistant. Your task is to generate a brief overview of `{module_name}` module.
-
-## IMPORTANT: Available Links for Cross-References
-Only link to modules and components that exist in this list:
-
-Available ROOT modules: {available_root_modules}
-
-Available components in THIS module ({module_name}): {available_components}
-
-When linking:
-- Use [ModuleName](module_name.md) for root-level modules (in ROOT directory)
-- Use [ComponentName](module_name/ComponentName.md) for components in module subdirectory
-  - Example: For Flask component in app module, use [Flask](app/Flask.md)
-- DO NOT link to modules or components not in the above lists
-
-Generate documentation following this structure:
-
-1. **Module Overview**:
-   - Brief introduction and purpose
-   - Architecture overview with Mermaid diagrams
-   - High-level functionality of each sub-module including references to its documentation file
-
-2. **API Reference**:
-   - Use TABLE format for all classes, methods, functions
-   - Include parameter types, return types, descriptions
-   - Group by class/namespace
-
-3. **Usage Examples**:
-   - At least 3 runnable code examples
-   - Include import statements
-   - Show common use cases
-
-4. **Best Practices**:
-   - Recommended patterns
-   - Common pitfalls to avoid
-   - Performance tips
-
-5. **Common Issues & Troubleshooting**:
-   - List common errors and their solutions
-   - Debug tips
-
-6. **Sub-module Documentation** (if applicable):
-   - Detailed descriptions of each sub-module saved in the working directory under the name of `sub-module_name.md`
-   - Core components and their responsibilities
-
-7. **Child Module Documentation** (summaries from children's docs):
-   {children_docs_summary}
-
-8. **Visual Documentation**:
-   - Mermaid diagrams for architecture, dependencies, and data flow
-   - Component interaction diagrams
-   - Process flow diagrams where relevant
-
-9. **Cross-references**:
-   - Link to other module documentation using [ModuleName](module_name.md) format instead of duplicating information
-   - Link to component documentation in the same module directory using [ComponentName](ComponentName.md) format
-
-10. **Related Modules**:
-    - Link to related module documentation
-
-Module Name: {module_name}
-Module Path: {module_path}
-Components: {components}
-Component Documentation (use these as reference):
-{component_docs}
-Sub-modules: {sub_modules}
-Children: {children}
-
-Generate the module documentation now. Include Mermaid diagrams where appropriate."""
-
-
-
-
-
-def format_overview_prompt(
-    repo_name: str,
-    component_count: int,
-    module_structure: dict,
-    code_statistics: dict = None,
-    modules_summary: str = "",
-    available_modules: list[str] = None,
-) -> tuple[str, str]:
-    comp_types = code_statistics.get("component_types", {}) if code_statistics else {}
-    lang_counts = code_statistics.get("language_counts", {}) if code_statistics else {}
-    total_files = code_statistics.get("total_files", 0) if code_statistics else 0
-    top_deps = code_statistics.get("top_dependencies", []) if code_statistics else []
-
-    avail_modules_str = (
-        ", ".join(available_modules)
-        if available_modules
-        else "None (no modules available yet)"
-    )
-
-    user_prompt = REPO_OVERVIEW_PROMPT.format(
-        repo_name=repo_name,
-        component_count=component_count,
-        component_types=", ".join([f"{k}: {v}" for k, v in comp_types.items()])
-        or "N/A",
-        language_counts=", ".join([f"{k}: {v}" for k, v in lang_counts.items()])
-        or "N/A",
-        total_files=total_files,
-        top_dependencies=", ".join([d[0] for d in top_deps]) if top_deps else "N/A",
-        module_structure=str(module_structure)[:1000],
-        modules_summary=(
-            modules_summary[:2000] if modules_summary else "No modules defined yet"
-        ),
-        available_modules=avail_modules_str,
-    )
-    return DOC_WRITER_SYSTEM_PROMPT, user_prompt
-
-
-# Mermaid diagram prompts
-DIAGRAM_SYSTEM_PROMPT = """You are an expert software architect. Your task is to generate Mermaid diagrams that visualize code structure and relationships.
-
-## Guidelines
-1. Generate syntactically correct Mermaid diagram code
-2. Use appropriate diagram type for the information:
-   - `flowchart TD` for process flows
-   - `graph TD` for dependencies
-   - `classDiagram` for class structures
-   - `sequenceDiagram` for interactions
-   - `stateDiagram-v2` for state machines
-3. Include meaningful labels and descriptions
-4. Keep diagrams focused and not overly complex"""
-
-DIAGRAM_ARCHITECTURE_PROMPT = """Generate a Mermaid flowchart diagram showing the architecture of this module.
-
-Module Name: {module_name}
-Components: {components}
-Dependencies: {dependencies}
-
-Output a Mermaid flowchart (use `flowchart TD` or `graph TD`) that shows:
-1. Main components and their relationships
-2. Data flow direction
-3. Key interfaces
-
-Return ONLY the Mermaid code block, no additional text."""
-
-def format_architecture_diagram_prompt(
-    module_name: str,
-    components: list[str],
-    dependencies: dict[str, list[str]],
-) -> tuple[str, str]:
-    deps_str = "\n".join(
-        [f"- {k} -> {v}" for k, vs in dependencies.items() for v in vs]
-    )
-    user_prompt = DIAGRAM_ARCHITECTURE_PROMPT.format(
+        predecessors=", ".join(predecessors) if predecessors else "None",
         module_name=module_name,
-        components="\n".join([f"- {c}" for c in components]),
-        dependencies=deps_str or "None",
+        component_context=component_context,
     )
-    return DIAGRAM_SYSTEM_PROMPT, user_prompt
+    return COMPONENT_SYSTEM_PROMPT, user_prompt
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: Module docs (architecture narrative per module-tree node)
+# ---------------------------------------------------------------------------
+
+MODULE_SYSTEM_PROMPT = """You are an expert software architect documenting a code repository.
+
+Your documentation is READ by developers to understand the repository's
+architecture. Describe modules at the ABSTRACT level: responsibilities,
+boundaries, cooperation with other modules, and flows. Do NOT write API
+manuals — no method listings, no API tables.
+
+Ground everything in the provided context (module info, member component
+docs, sub-module docs, module dependencies). Never invent modules, flows, or
+dependencies."""
+
+MODULE_USER_PROMPT = """Write the architecture-narrative documentation for the module `{module_name}`.
+
+Module path: {module_path}
+Parent module: {parent_module}
+Sibling modules: {sibling_modules}
+
+## Modules it depends on (calls)
+{module_dependencies}
+
+## Modules that depend on it (are called by)
+{dependent_modules}
+
+## Sub-modules
+{sub_modules}
+
+## Member components and their roles (from their component docs)
+{component_docs_summary}
+
+## Sub-module docs (actual content of child module docs)
+{children_docs_summary}
+
+## What to write
+
+1. **Module purpose**: what this module is responsible for, and its boundary
+   (what it deliberately does NOT do)
+2. **Architectural position**: which modules feed it (upstream), which it
+   serves (downstream), and what the dependency direction implies
+3. **Member components**: the role list above, woven into a short narrative —
+   which members are the core, which are supporting
+4. **Sub-modules**: one line each, linking to their docs
+5. **Key flows/cooperation**: 1-3 flows this module participates in, if the
+   context supports them
+
+Return ONLY the Markdown document content. Use relative markdown links to
+member component docs (`{module_name}/ComponentName.md`) and sub-module docs
+(`sub_module.md` for children)."""
 
 
 def format_module_prompt(
     module_name: str,
     module_path: str,
-    components: list[str],
+    parent_module: str,
+    sibling_modules: list[str],
+    module_dependencies: list[str],
+    dependent_modules: list[str],
     sub_modules: list[str],
-    children: dict,
-    children_docs: dict[str, str] = None,
-    component_docs: dict[str, str] = None,
-    available_root_modules: list[str] = None,
-    available_components: list[str] = None,
+    component_docs_summary: str,
+    children_docs_summary: str,
 ) -> tuple[str, str]:
-    children_docs_summary = "No child documentation available"
-    if children_docs:
-        docs_parts = []
-        for child_name, doc_content in children_docs.items():
-            summary = (
-                doc_content[:300] + "..." if len(doc_content) > 300 else doc_content
-            )
-            docs_parts.append(f"   - **{child_name}**: {summary}")
-        children_docs_summary = "\n".join(docs_parts)
-
-    component_docs_summary = "No component documentation available"
-    if component_docs:
-        docs_parts = []
-        for comp_name, doc_content in component_docs.items():
-            summary = (
-                doc_content[:500] + "..." if len(doc_content) > 500 else doc_content
-            )
-            docs_parts.append(f"### {comp_name}\n{summary}")
-        component_docs_summary = "\n\n".join(docs_parts)
-
-    avail_root = ", ".join(available_root_modules) if available_root_modules else "None"
-    avail_comps = ", ".join(available_components) if available_components else "None"
-
-    user_prompt = MODULE_OVERVIEW_PROMPT.format(
+    user_prompt = MODULE_USER_PROMPT.format(
         module_name=module_name,
-        module_path=module_path,
-        components="\n".join([f"- {c}" for c in components]) if components else "None",
-        component_docs=component_docs_summary,
-        sub_modules=(
-            "\n".join([f"- {s}" for s in sub_modules]) if sub_modules else "None"
-        ),
-        children=str(children)[:1000] if children else "None",
-        children_docs_summary=children_docs_summary,
-        available_root_modules=avail_root,
-        available_components=avail_comps,
+        module_path=module_path or ".",
+        parent_module=parent_module or "(root)",
+        sibling_modules=", ".join(sibling_modules) if sibling_modules else "None",
+        module_dependencies=", ".join(module_dependencies) if module_dependencies else "None",
+        dependent_modules=", ".join(dependent_modules) if dependent_modules else "None",
+        sub_modules="\n".join(f"- {s}" for s in sub_modules) if sub_modules else "None",
+        component_docs_summary=component_docs_summary or "No member component docs available",
+        children_docs_summary=children_docs_summary or "No sub-module docs available",
     )
-    return DOC_WRITER_SYSTEM_PROMPT, user_prompt
+    return MODULE_SYSTEM_PROMPT, user_prompt
+
+
+# ---------------------------------------------------------------------------
+# Layer 3: Overview README (architecture overview with module-level diagram)
+# ---------------------------------------------------------------------------
+
+OVERVIEW_SYSTEM_PROMPT = """You are an expert software architect writing the top-level architecture
+document (README) of a code repository.
+
+The README is the ENTRY POINT for developers. It must explain the
+repository's architecture at the abstract level: what the system does, how
+its modules fit together, and which flows connect them. It is NOT an API
+manual and NOT a changelog.
+
+Ground everything in the provided context: module docs (actual generated
+content), the module dependency map, and repository statistics. Never invent
+modules, flows, or capabilities."""
+
+OVERVIEW_USER_PROMPT = """Write the architecture overview (README.md) for the repository.
+
+Repository: {repo_name}
+Total components: {component_count}
+Modules: {module_count}
+
+## Module dependency map (module -> modules it depends on)
+{module_dependencies}
+
+## Module docs (actual content, one section per module)
+{module_docs_summary}
+
+## What to write
+
+1. **Project positioning**: one clear paragraph — what this system is and
+   what problem it solves
+2. **Architecture overview**: describe the module layout (layers/domains),
+   then include a **mermaid flowchart** showing modules and their dependency
+   edges (use the dependency map above; every module must be a node)
+3. **Theme map**: the top-level modules, one line of responsibility each,
+   linking to each module doc (`module_name.md`)
+4. **Core flows**: 2-4 key flows through the system (entry point -> modules
+   involved -> outcome), based on the dependency map
+5. **Module navigation**: a short list of all top-level module docs
+
+Return ONLY the Markdown document content. Mermaid diagrams must be valid
+(flowchart TD with `-->` edges)."""
+
+
+def format_overview_prompt(
+    repo_name: str,
+    component_count: int,
+    module_count: int,
+    module_dependencies: dict[str, list[str]],
+    module_docs_summary: str,
+) -> tuple[str, str]:
+    deps_str = "\n".join(
+        f"- {m} -> {', '.join(ds) if ds else '(none)'}"
+        for m, ds in sorted(module_dependencies.items())
+    )
+    user_prompt = OVERVIEW_USER_PROMPT.format(
+        repo_name=repo_name,
+        component_count=component_count,
+        module_count=module_count,
+        module_dependencies=deps_str or "None",
+        module_docs_summary=module_docs_summary or "No module docs available",
+    )
+    return OVERVIEW_SYSTEM_PROMPT, user_prompt

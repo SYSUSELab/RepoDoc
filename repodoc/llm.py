@@ -6,7 +6,10 @@ so metadata/ablation statistics never miss a call.
 """
 
 import asyncio
+import collections
 import logging
+import random
+import threading
 from typing import TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
@@ -23,6 +26,103 @@ class TokenUsage(TypedDict):
 
 # Prompt safety cap: keep under 60K chars.
 _MAX_PROMPT_CHARS = 60_000
+
+# Backoff retry budget for transient API errors (429/5xx/timeouts).
+_BACKOFF_BASE_SECONDS = 0.5
+_BACKOFF_MAX_SECONDS = 8.0
+_BACKOFF_MAX_RETRIES = 3
+
+
+class AdaptiveLimiter:
+    """AIMD adaptive concurrency limiter for LLM API calls.
+
+    Concurrency shrinks multiplicatively when failures spike (busy gateway)
+    and grows additively when everything succeeds (idle gateway) — the TCP
+    congestion-control pattern. One shared instance serves both the sync
+    (clustering thread pool) and async (doc generation) paths; they never
+    run concurrently (stage separation), so no double bookkeeping.
+    """
+
+    def __init__(
+        self,
+        initial: int = 16,
+        min_permits: int = 4,
+        max_permits: int = 24,
+        window: int = 40,
+    ) -> None:
+        self._cond = threading.Condition()
+        self._permits = initial
+        self._min = min_permits
+        self._max = max_permits
+        self._window = window
+        self._results: collections.deque[bool] = collections.deque(maxlen=window)
+        self._inflight = 0
+        self._result_count = 0
+
+    def acquire(self) -> None:
+        with self._cond:
+            while self._inflight >= self._permits:
+                self._cond.wait()
+            self._inflight += 1
+
+    async def acquire_async(self) -> None:
+        await asyncio.to_thread(self.acquire)
+
+    def release(self, success: bool) -> None:
+        with self._cond:
+            self._inflight -= 1
+            self._results.append(success)
+            self._result_count += 1
+            # adjust at most once per half-window of new results
+            if self._result_count % (self._window // 2) == 0:
+                self._maybe_adjust()
+            self._cond.notify()
+
+    def _maybe_adjust(self) -> None:
+        if len(self._results) < self._window // 2:
+            return  # not enough samples yet
+        fail_rate = 1.0 - sum(self._results) / len(self._results)
+        old = self._permits
+        if fail_rate > 0.3:
+            self._permits = max(self._min, self._permits // 2)  # multiplicative decrease
+        elif fail_rate < 0.1:
+            self._permits = min(self._max, self._permits + 1)  # additive increase
+        if self._permits != old:
+            logger.info(
+                "Adaptive limiter: permits %d -> %d (fail_rate %.0f%%)",
+                old,
+                self._permits,
+                fail_rate * 100,
+            )
+
+    def force_decrease(self) -> int:
+        """Explicitly halve permits (called by callers after failed batches)
+        so retries run at lower concurrency until they succeed. Returns the
+        new permit count."""
+        with self._cond:
+            old = self._permits
+            self._permits = max(self._min, self._permits // 2)
+            if self._permits != old:
+                logger.info(
+                    "Adaptive limiter: permits %d -> %d (forced decrease)",
+                    old,
+                    self._permits,
+                )
+            self._cond.notify_all()
+            return self._permits
+
+    @property
+    def permits(self) -> int:
+        with self._cond:
+            return self._permits
+
+    @property
+    def min_permits(self) -> int:
+        return self._min
+
+
+# Shared across clustering and doc generation (they are stage-separated).
+_LIMITER = AdaptiveLimiter()
 
 
 class LLMClient:
@@ -54,6 +154,7 @@ class LLMClient:
         client = AsyncOpenAI(
             base_url=self.config.llm_base_url,
             api_key=self.config.llm_api_key,
+            max_retries=1,  # SDK does one quick retry; backoff is ours
         )
 
         if len(prompt) > _MAX_PROMPT_CHARS:
@@ -77,21 +178,55 @@ class LLMClient:
             response = await _create(max_tokens, response_format)
         except APIError as e:
             logger.error(f"API Error: {e}")
-            # Fallback chain: drop response_format first (unsupported by some
-            # endpoints), then shrink max_tokens (existing behavior).
-            if response_format and max_tokens > 4096:
-                logger.info(
-                    "Retrying without response_format, max_tokens=4096..."
-                )
-                response = await _create(4096, None)
-            elif response_format:
-                logger.info("Retrying without response_format...")
-                response = await _create(max_tokens, None)
-            elif max_tokens > 4096:
-                logger.info("Retrying with smaller max_tokens...")
-                response = await _create(4096, None)
-            else:
+            # Config errors (4xx other than 408/429) never recover: no retry.
+            # 408/429 ARE retryable (timeout / rate limit).
+            if (
+                e.status_code is not None
+                and 400 <= e.status_code < 500
+                and e.status_code not in (408, 429)
+            ):
                 raise
+            # Transient errors (429/5xx/timeouts): exponential backoff.
+            last_error = e
+            success = False
+            for attempt in range(_BACKOFF_MAX_RETRIES):
+                delay = min(
+                    _BACKOFF_BASE_SECONDS * (2**attempt)
+                    + random.uniform(0, 0.3),
+                    _BACKOFF_MAX_SECONDS,
+                )
+                logger.warning(
+                    "Retrying in %.2fs (attempt %d/%d) after %s",
+                    delay,
+                    attempt + 1,
+                    _BACKOFF_MAX_RETRIES,
+                    e,
+                )
+                await asyncio.sleep(delay)
+                try:
+                    response = await _create(max_tokens, response_format)
+                    success = True
+                    break
+                except APIError as e2:
+                    last_error = e2
+                    if (
+                        e2.status_code is not None
+                        and 400 <= e2.status_code < 500
+                        and e2.status_code not in (408, 429)
+                    ):
+                        raise
+            if not success:
+                # Backoff exhausted: try the max_tokens fallback once
+                # (existing behavior) before giving up.
+                if max_tokens > 4096:
+                    logger.info("Retrying with smaller max_tokens...")
+                    try:
+                        response = await _create(4096, None)
+                        success = True
+                    except APIError:
+                        pass
+                if not success:
+                    raise last_error
         finally:
             await client.close()
 
@@ -158,13 +293,20 @@ def call_llm(
     Returns:
         Tuple of (assistant message content, token usage dict).
     """
-    return get_llm_client(config).complete_sync(
-        prompt=prompt,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format=response_format,
-    )
+    _LIMITER.acquire()
+    try:
+        result = get_llm_client(config).complete_sync(
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+    except Exception:
+        _LIMITER.release(False)
+        raise
+    _LIMITER.release(True)
+    return result
 
 
 async def call_llm_async(
@@ -176,13 +318,20 @@ async def call_llm_async(
     response_format: str | None = None,
 ) -> tuple[str, TokenUsage]:
     """Async version of call_llm with OpenAI-compatible async chat API."""
-    return await get_llm_client(config).complete(
-        prompt=prompt,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        response_format=response_format,
-    )
+    await _LIMITER.acquire_async()
+    try:
+        result = await get_llm_client(config).complete(
+            prompt=prompt,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format=response_format,
+        )
+    except Exception:
+        _LIMITER.release(False)
+        raise
+    _LIMITER.release(True)
+    return result
 
 
 def total_token_usage(config: "Config") -> dict:

@@ -77,6 +77,58 @@ def get_module_depth(
     return -1
 
 
+def _collect_component_modules(
+    tree: dict[str, Any],
+) -> dict[str, list[str]]:
+    """Map each component id to its DEEPEST owning module chain in the tree.
+
+    A component may appear in a parent module's full member list AND in a
+    child module's sub-division; the deepest module is its true home, so its
+    doc lands in the most specific directory."""
+    best: dict[str, list[str]] = {}
+
+    def walk(nodes: dict[str, Any], path: list[str]) -> None:
+        for name, info in nodes.items():
+            cur = path + [name]
+            for cid in info.get("components", []):
+                if cid not in best or len(cur) > len(best[cid]):
+                    best[cid] = cur
+            children = info.get("children")
+            if isinstance(children, dict):
+                walk(children, cur)
+
+    walk(tree, [])
+    return best
+
+
+def _build_module_dependencies(
+    components: dict[str, Any],
+    module_tree: dict[str, Any],
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Aggregate cross-module call edges.
+
+    Returns (module -> modules it depends on, module -> modules that depend
+    on it), using each component's deepest module home."""
+    comp_modules = _collect_component_modules(module_tree)
+
+    def module_of(cid: str) -> str | None:
+        chain = comp_modules.get(cid)
+        return chain[0] if chain else None
+
+    deps: dict[str, set[str]] = {}
+    dependents: dict[str, set[str]] = {}
+    for cid, node in components.items():
+        m = module_of(cid)
+        if m is None:
+            continue
+        for dep_id in getattr(node, "depends_on", []):
+            dm = module_of(dep_id)
+            if dm and dm != m:
+                deps.setdefault(m, set()).add(dm)
+                dependents.setdefault(dm, set()).add(m)
+    return deps, dependents
+
+
 class DocPipeline:
     def __init__(self, config: Config):
         self.config = config
@@ -161,13 +213,29 @@ class DocPipeline:
         return stats
 
     async def generate_overview(self, output_path: str = None):
+        """Layer 3: overview README, based on the actual module docs (layer 2)
+        and the module dependency map."""
         if not self.agent:
             self.initialize_agent()
 
         module_structure = self.load_module_tree()
-        code_stats = self.get_code_statistics()
-        available_modules = list(module_structure.keys()) if module_structure else []
+        module_deps, _ = _build_module_dependencies(
+            self.components, module_structure
+        )
 
+        # Module doc summaries (top-level module docs generated in layer 2)
+        module_docs_summary = {}
+        docs_dir = self.config.docs_dir
+        for name in module_structure.keys():
+            md_path = os.path.join(docs_dir, f"{name}.md")
+            if os.path.exists(md_path):
+                try:
+                    with open(md_path, "r") as f:
+                        module_docs_summary[name] = f.read()[:2500]
+                except Exception:
+                    pass
+
+        module_count = len(module_structure)
         result = await self.agent.execute(
             {
                 "type": "write_doc",
@@ -176,9 +244,11 @@ class DocPipeline:
                     "type": "overview",
                     "repo_name": os.path.basename(self.config.repo_path),
                     "component_count": len(self.components),
-                    "module_structure": module_structure,
-                    "code_statistics": code_stats,
-                    "available_modules": available_modules,
+                    "module_count": module_count,
+                    "module_dependencies": {
+                        m: sorted(ds) for m, ds in module_deps.items()
+                    },
+                    "module_docs_summary": module_docs_summary,
                     "output_path": output_path
                     or os.path.join(self.config.docs_dir, "README.md"),
                 },
@@ -192,10 +262,12 @@ class DocPipeline:
         parent_dir: str = None,
         children_docs: dict[str, str] = None,
     ):
-        """Generate module documentation with parallel processing by depth level.
+        """Layer 2: generate module docs for every tree node, BOTTOM-UP.
 
-        Modules at the same depth level are processed in parallel.
-        Parent modules wait for their children to complete before generation.
+        Modules at the same depth are processed in parallel; deeper (leaf)
+        modules are generated before their parents, so a parent module can
+        reference its children's actual docs. Component docs (layer 1) must
+        already exist.
         """
         if not self.agent:
             self.initialize_agent()
@@ -210,21 +282,71 @@ class DocPipeline:
             children_docs = {}
 
         depth_groups = group_modules_by_depth(module_tree)
+        module_deps, module_dependents = _build_module_dependencies(
+            self.components, module_tree
+        )
 
         results = []
 
-        for depth in sorted(depth_groups.keys()):
+        # Bottom-up: deepest modules first (reverse depth order)
+        for depth in sorted(depth_groups.keys(), reverse=True):
             modules_at_depth = depth_groups[depth]
 
-            tasks = []
-            for module_name, module_info, full_path in modules_at_depth:
-                task = self._generate_single_module_doc(
-                    module_name, module_info, full_path, module_tree
+            def make_task(module_name, module_info, full_path):
+                return self._generate_single_module_doc(
+                    module_name,
+                    module_info,
+                    full_path,
+                    module_tree,
+                    module_deps,
+                    module_dependents,
                 )
-                tasks.append(task)
 
-            depth_results = await asyncio.gather(*tasks, return_exceptions=True)
-            results.extend([r for r in depth_results if not isinstance(r, Exception)])
+            jobs = [(m, i, p) for m, i, p in modules_at_depth]
+            depth_results = await asyncio.gather(
+                *(make_task(*j) for j in jobs), return_exceptions=True
+            )
+
+            # Failure-driven retry loop: lower concurrency explicitly on each
+            # failed round until all module docs succeed (doc completeness
+            # is the hard goal).
+            from repodoc.llm import _LIMITER
+
+            for _round in range(4):
+                failed = [
+                    j
+                    for j, r in zip(jobs, depth_results)
+                    if isinstance(r, Exception)
+                    or (r is not None and not getattr(r, "success", False))
+                ]
+                if not failed:
+                    break
+                if _LIMITER.permits > _LIMITER.min_permits:
+                    _LIMITER.force_decrease()
+                print(
+                    f"Concurrency {_LIMITER.permits}, retrying "
+                    f"{len(failed)} failed module docs (round {_round + 1})..."
+                )
+                retry = await asyncio.gather(
+                    *(make_task(*j) for j in failed), return_exceptions=True
+                )
+                # slot retry results back at the failed positions
+                retry_iter = iter(retry)
+                depth_results = [
+                    next(retry_iter)
+                    if (
+                        isinstance(r, Exception)
+                        or (r is not None and not getattr(r, "success", False))
+                    )
+                    else r
+                    for r in depth_results
+                ]
+                if _LIMITER.permits <= _LIMITER.min_permits:
+                    break  # concurrency bottomed out: last try done
+
+            results.extend(
+                [r for r in depth_results if not isinstance(r, Exception)]
+            )
 
         return results
 
@@ -234,8 +356,10 @@ class DocPipeline:
         module_info: dict,
         full_path: str,
         module_tree: dict,
+        module_deps: dict[str, set[str]] = None,
+        module_dependents: dict[str, set[str]] = None,
     ):
-        """Generate documentation for a single module."""
+        """Generate documentation for a single module (architecture narrative)."""
         components = module_info.get("components", [])
         children = module_info.get("children", {})
         path_parts = full_path.split("/")
@@ -248,6 +372,7 @@ class DocPipeline:
         if children:
             file_manager.ensure_directory(module_dir)
 
+        # Child module docs (leaf modules generated first, so they exist)
         child_docs_content = {}
         for child_name in children.keys():
             child_doc_path = os.path.join(module_dir, f"{child_name}.md")
@@ -255,41 +380,39 @@ class DocPipeline:
                 try:
                     with open(child_doc_path, "r") as f:
                         child_docs_content[child_name] = f.read()[:2000]
-                except:
+                except Exception:
                     pass
 
+        # Member component docs (layer 1, generated before module docs).
+        # Each component's doc lives in its deepest module dir.
         component_docs_content = {}
-        component_docs_dir = os.path.join(self.config.docs_dir, module_name)
+        comp_modules = _collect_component_modules(module_tree)
         for comp_id in components:
             node = self.components.get(comp_id)
-            if node and node.name:
-                comp_doc_path = os.path.join(component_docs_dir, f"{node.name}.md")
-                if os.path.exists(comp_doc_path):
-                    try:
-                        with open(comp_doc_path, "r") as f:
-                            component_docs_content[node.name] = f.read()[:3000]
-                    except Exception:
-                        pass
+            if not (node and node.name):
+                continue
+            chain = comp_modules.get(comp_id, [module_name])
+            comp_doc_path = os.path.join(self.config.docs_dir, *chain, f"{node.name}.md")
+            if os.path.exists(comp_doc_path):
+                try:
+                    with open(comp_doc_path, "r") as f:
+                        component_docs_content[node.name] = f.read()[:3000]
+                except Exception:
+                    pass
 
-        module_components = []
-        for comp_id in components:
-            node = self.components.get(comp_id)
-            if node:
-                module_components.append(
-                    {
-                        "name": node.name,
-                        "component_type": node.component_type,
-                        "docstring": node.docstring,
-                        "file_path": node.file_path,
-                    }
-                )
-
-        available_root_modules = list(module_tree.keys()) if module_tree else []
-        available_components = [
-            f"{module_name}/{node.name}"
-            for node in [self.components.get(comp_id) for comp_id in components]
-            if node and node.name
-        ]
+        # Sibling / parent context from the tree
+        parent_module = ""
+        sibling_modules = []
+        if path_parts:
+            parent_parts = path_parts[:-1]
+            parent_module = parent_parts[-1] if parent_parts else ""
+            if parent_parts:
+                parent_info = module_tree
+                for p in parent_parts:
+                    parent_info = parent_info.get(p, {}).get("children", {})
+                sibling_modules = [k for k in parent_info.keys() if k != module_name]
+            else:
+                sibling_modules = [k for k in module_tree.keys() if k != module_name]
 
         result = await self.agent.execute(
             {
@@ -299,13 +422,13 @@ class DocPipeline:
                     "type": "module",
                     "module_name": module_name,
                     "module_path": module_info.get("path", module_name),
-                    "components": module_components,
+                    "parent_module": parent_module,
+                    "sibling_modules": sibling_modules,
+                    "module_dependencies": sorted(module_deps.get(module_name, set())),
+                    "dependent_modules": sorted(module_dependents.get(module_name, set())),
                     "component_docs": component_docs_content,
                     "sub_modules": list(children.keys()),
-                    "children": children,
                     "children_docs": child_docs_content,
-                    "available_root_modules": available_root_modules,
-                    "available_components": available_components,
                     "output_path": os.path.join(
                         current_parent_dir, f"{module_name}.md"
                     ),
@@ -315,11 +438,19 @@ class DocPipeline:
         return result
 
     async def _generate_single_component(
-        self, node_id: str, output_dir: str, module_name: str
+        self, node_id: str, output_dir: str, module_chain: list[str]
     ) -> dict:
         node = self.components.get(node_id)
         if not node:
             return None
+
+        # Reverse dependencies: which components call this one (its role in
+        # flows). Computed from the full component map.
+        predecessors = [
+            cid
+            for cid, n in self.components.items()
+            if node_id in getattr(n, "depends_on", set())
+        ]
 
         component = {
             "name": node.name,
@@ -338,6 +469,8 @@ class DocPipeline:
                 "input": {
                     "type": "component",
                     "component": component,
+                    "predecessors": predecessors,
+                    "module_name": ".".join(module_chain),
                     "output_path": os.path.join(output_dir, f"{node.name}.md"),
                 },
             }
@@ -347,6 +480,9 @@ class DocPipeline:
     async def generate_component_docs(
         self, docs_dir: str = None, module_tree: dict = None
     ):
+        """Layer 1: generate docs for ALL components in the tree (including
+        nested modules). Each component doc lands in its deepest module's
+        directory. Runs in parallel (Semaphore 16)."""
         if not self.agent:
             self.initialize_agent()
 
@@ -355,115 +491,82 @@ class DocPipeline:
         if not module_tree:
             module_tree = self.load_module_tree()
 
-        module_components_map = {}
-        for module_name, module_info in module_tree.items():
-            for comp_id in module_info.get("components", []):
-                node = self.components.get(comp_id)
-                if node and node.name:
-                    if module_name not in module_components_map:
-                        module_components_map[module_name] = []
-                    module_components_map[module_name].append(comp_id)
+        comp_modules = _collect_component_modules(module_tree)
 
         sem = asyncio.Semaphore(16)
 
-        async def _run(comp_id: str, module_dir: str, module_name: str):
+        async def _run(comp_id: str, module_chain: list[str]):
             async with sem:
+                module_dir = os.path.join(docs_dir, *module_chain)
+                file_manager.ensure_directory(module_dir)
                 return await self._generate_single_component(
-                    comp_id, module_dir, module_name
+                    comp_id, module_dir, module_chain
                 )
 
-        tasks = []
-        for module_name, comp_ids in module_components_map.items():
-            module_dir = os.path.join(docs_dir, module_name)
-            file_manager.ensure_directory(module_dir)
-            for comp_id in comp_ids:
-                tasks.append(_run(comp_id, module_dir, module_name))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return [r for r in results if r is not None and not isinstance(r, Exception)]
-
-    async def generate_architecture_diagrams(self, output_dir: str = None):
-        """Generate Mermaid diagrams for architecture and dependency visualization."""
-        if not self.agent:
-            self.initialize_agent()
-
-        output_dir = output_dir or self.config.docs_dir
-        file_manager.ensure_directory(output_dir)
-
-        project_name = self.get_project_name()
-
-        module_tree = self.load_module_tree()
-
-        all_components = []
-        dependencies = {}
-
-        for comp_id, node in self.components.items():
-            all_components.append(
-                {
-                    "name": node.name,
-                    "component_type": node.component_type,
-                }
-            )
-            if hasattr(node, "depends_on") and node.depends_on:
-                dependencies[node.name] = list(node.depends_on)[:5]
-
-        diagram_result = await self.agent.execute(
-            {
-                "type": "write_doc",
-                "config": self.config,
-                "input": {
-                    "type": "architecture_diagram",
-                    "module_name": os.path.basename(self.config.repo_path),
-                    "components": all_components[:20],
-                    "dependencies": dependencies,
-                    "output_path": os.path.join(
-                        output_dir, f"{project_name}_architecture.mmd"
-                    ),
-                },
-            }
+        jobs = [
+            (comp_id, chain)
+            for comp_id, chain in sorted(comp_modules.items())
+            if comp_id in self.components
+        ]
+        results = await asyncio.gather(
+            *(_run(*j) for j in jobs), return_exceptions=True
         )
 
-        if diagram_result.success and hasattr(diagram_result, "output"):
-            diagram_path = os.path.join(output_dir, f"{project_name}_architecture.mmd")
-            diagram_content = diagram_result.output.get("diagram", "")
+        # Failure-driven retry loop: after each round of failures, explicitly
+        # lower the concurrency (visible in the terminal) and retry the
+        # failed docs — doc completeness is the hard goal, so we keep
+        # lowering until everything succeeds or concurrency bottoms out.
+        from repodoc.llm import _LIMITER
 
-            # Validate Mermaid diagram
-            from repodoc.utils import validate_mermaid_syntax
-
-            is_valid, error_msg = validate_mermaid_syntax(diagram_content)
-            if not is_valid:
-                # Generate a simpler fallback diagram
-                diagram_content = self._generate_fallback_diagram(
-                    all_components, dependencies
+        for _round in range(4):
+            failed = [
+                j
+                for j, r in zip(jobs, results)
+                if isinstance(r, Exception)
+                or (r is not None and not getattr(r, "success", False))
+            ]
+            if not failed:
+                break
+            if _LIMITER.permits > _LIMITER.min_permits:
+                _LIMITER.force_decrease()
+            print(
+                f"Concurrency {_LIMITER.permits}, retrying "
+                f"{len(failed)} failed component docs (round {_round + 1})..."
+            )
+            retry = await asyncio.gather(
+                *(_run(*j) for j in failed), return_exceptions=True
+            )
+            # slot retry results back at the failed positions
+            retry_iter = iter(retry)
+            results = [
+                next(retry_iter)
+                if (
+                    isinstance(r, Exception)
+                    or (r is not None and not getattr(r, "success", False))
                 )
+                else r
+                for r in results
+            ]
+            if _LIMITER.permits <= _LIMITER.min_permits:
+                break  # concurrency bottomed out: this round was the last try
 
-            with open(diagram_path, "w") as f:
-                f.write(diagram_content)
+        still_failed = [
+            j
+            for j, r in zip(jobs, results)
+            if isinstance(r, Exception)
+            or (r is not None and not getattr(r, "success", False))
+        ]
+        if still_failed:
+            print(
+                f"WARNING: {len(still_failed)} component docs failed permanently: "
+                + ", ".join(j[0] for j in still_failed[:5])
+                + ("..." if len(still_failed) > 5 else "")
+            )
 
-        return diagram_result
+        return [
+            r for r in results if r is not None and not isinstance(r, Exception)
+        ]
 
-    def _generate_fallback_diagram(self, components: list, dependencies: dict) -> str:
-        """Generate a simple fallback Mermaid diagram if validation fails."""
-        lines = ["```mermaid", "flowchart TD", "    %% Fallback architecture diagram"]
-
-        # Add components as nodes
-        for comp in components[:15]:
-            node_id = comp["name"].replace(".", "_").replace("-", "_")
-            lines.append(f"    {node_id}[{comp['name']}]")
-
-        # Add dependencies as edges
-        seen = set()
-        for comp_name, deps in dependencies.items():
-            source_id = comp_name.replace(".", "_").replace("-", "_")
-            for dep in deps[:3]:
-                dep_id = dep.replace(".", "_").replace("-", "_")
-                edge_key = f"{source_id}--> {dep_id}"
-                if edge_key not in seen:
-                    seen.add(edge_key)
-                    lines.append(f"    {source_id} --> {dep_id}")
-
-        lines.append("```")
-        return "\n".join(lines)
 
     def update_graph_with_docs(self, data_dir: str, docs_dir: str = None):
         if not self.graph:
@@ -533,14 +636,9 @@ class DocPipeline:
             print(f"Warning: Overview generation failed: {e}")
             return None
 
-    async def _generate_diagram_safe(self, output_dir: str):
-        try:
-            return await self.generate_architecture_diagrams(output_dir)
-        except Exception as e:
-            print(f"Warning: Architecture diagram generation failed: {e}")
-            return None
-
     async def generate_all(self, docs_dir: str = None, data_dir: str = None):
+        """Bottom-up layered generation:
+        layer 1 component docs -> layer 2 module docs -> layer 3 overview."""
         docs_dir = docs_dir or self.config.docs_dir
         data_dir = data_dir or self.get_data_dir()
         file_manager.ensure_directory(docs_dir)
@@ -551,15 +649,21 @@ class DocPipeline:
 
         module_tree = self.load_module_tree()
 
+        # Layer 1: all component docs (parallel)
         component_results = await self.generate_component_docs(
             docs_dir=docs_dir, module_tree=module_tree
         )
+        print(f"Layer 1: {len(component_results)} component docs")
 
-        module_results, overview_result, diagram_results = await asyncio.gather(
-            self._generate_module_docs_safe(),
-            self._generate_overview_safe(os.path.join(docs_dir, "README.md")),
-            self._generate_diagram_safe(data_dir),
+        # Layer 2: module docs, bottom-up (leaf modules first)
+        module_results = await self._generate_module_docs_safe()
+        print(f"Layer 2: {len(module_results)} module docs")
+
+        # Layer 3: overview README
+        overview_result = await self._generate_overview_safe(
+            os.path.join(docs_dir, "README.md")
         )
+        print("Layer 3: overview README")
 
         self._update_graph_with_docs_safe(data_dir, docs_dir)
         self._extract_concepts_safe(data_dir)
@@ -579,7 +683,6 @@ class DocPipeline:
             "overview": overview_result,
             "modules": module_results,
             "components": component_results,
-            "diagrams": diagram_results,
             "total_components": len(self.components),
             "docs_directory": docs_dir,
         }

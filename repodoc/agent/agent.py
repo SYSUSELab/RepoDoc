@@ -11,8 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from repodoc.agent.prompts import (
-    format_architecture_diagram_prompt,
-    format_doc_prompt,
+    format_component_prompt,
     format_module_prompt,
     format_overview_prompt,
 )
@@ -81,8 +80,6 @@ class DocAgent:
                 return await self._generate_component_doc(input_data, llm_tool, file_tool)
             elif doc_type == "module":
                 return await self._generate_module_doc(input_data, llm_tool, file_tool)
-            elif doc_type == "architecture_diagram":
-                return await self._generate_architecture_diagram(input_data, llm_tool)
             else:
                 return SkillResult(
                     success=False, error=f"Unknown documentation type: {doc_type}"
@@ -117,24 +114,18 @@ class DocAgent:
     async def _generate_overview(self, input_data: dict, llm_tool, file_tool) -> SkillResult:
         repo_name = input_data.get("repo_name", "Repository")
         component_count = input_data.get("component_count", 0)
-        module_structure = input_data.get("module_structure", {})
-        code_statistics = input_data.get("code_statistics", {})
-
-        modules_summary = "\n".join(
-            [
-                f"- {name}: {len(info.get('components', []))} components"
-                for name, info in module_structure.items()
-            ]
-        )
-        available_modules = list(module_structure.keys()) if module_structure else []
+        module_count = input_data.get("module_count", 0)
+        module_dependencies = input_data.get("module_dependencies", {})
+        module_docs_summary = input_data.get("module_docs_summary", {})
 
         system_prompt, user_prompt = format_overview_prompt(
             repo_name=repo_name,
             component_count=component_count,
-            module_structure=module_structure,
-            code_statistics=code_statistics,
-            modules_summary=modules_summary,
-            available_modules=available_modules,
+            module_count=module_count,
+            module_dependencies=module_dependencies,
+            module_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in module_docs_summary.items()
+            ),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -145,15 +136,18 @@ class DocAgent:
 
     async def _generate_component_doc(self, input_data: dict, llm_tool, file_tool) -> SkillResult:
         component = input_data.get("component", {})
+        predecessors = input_data.get("predecessors", [])
+        module_name = input_data.get("module_name", "")
 
-        system_prompt, user_prompt = format_doc_prompt(
+        system_prompt, user_prompt = format_component_prompt(
             component_name=component.get("name", "Unknown"),
             component_type=component.get("component_type", "unknown"),
             file_path=component.get("file_path", ""),
             docstring=component.get("docstring", ""),
             source_code=component.get("source_code", ""),
             dependencies=list(component.get("depends_on", set())),
-            module_context=input_data.get("module_context", ""),
+            predecessors=list(predecessors),
+            module_name=module_name,
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -171,13 +165,17 @@ class DocAgent:
         system_prompt, user_prompt = format_module_prompt(
             module_name=module_name,
             module_path=module_path,
-            components=input_data.get("components", []),
+            parent_module=input_data.get("parent_module", ""),
+            sibling_modules=input_data.get("sibling_modules", []),
+            module_dependencies=input_data.get("module_dependencies", []),
+            dependent_modules=input_data.get("dependent_modules", []),
             sub_modules=input_data.get("sub_modules", []),
-            children=input_data.get("children", {}),
-            children_docs=input_data.get("children_docs", {}),
-            component_docs=input_data.get("component_docs", {}),
-            available_root_modules=input_data.get("available_root_modules", []),
-            available_components=input_data.get("available_components", []),
+            component_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("component_docs", {}).items()
+            ),
+            children_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("children_docs", {}).items()
+            ),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -185,32 +183,6 @@ class DocAgent:
             return result
         output_path = input_data.get("output_path", f"docs/modules/{module_name}.md")
         return await self._write_result(output_path, result.output, "module", file_tool)
-
-    async def _generate_architecture_diagram(self, input_data: dict, llm_tool) -> SkillResult:
-        module_name = input_data.get("module_name", "Module")
-        components = input_data.get("components", [])
-        dependencies = input_data.get("dependencies", {})
-
-        system_prompt, user_prompt = format_architecture_diagram_prompt(
-            module_name=module_name,
-            components=[c.get("name", "") for c in components],
-            dependencies=dependencies,
-        )
-
-        result = await self._call_llm(
-            llm_tool, system_prompt, user_prompt, temperature=0.2, max_tokens=2048
-        )
-        if not result.success:
-            return result
-        return SkillResult(
-            success=True,
-            output={
-                "type": "architecture_diagram",
-                "diagram": result.output,
-                "module_name": module_name,
-            },
-            metadata={"skill": "doc_writer", "doc_type": "architecture_diagram"},
-        )
 
     async def _generate_direct(self, doc_type: str, input_data: dict, llm_tool, file_tool) -> SkillResult:
         """Unified single-prompt path (ablation baseline)."""
@@ -222,11 +194,5 @@ class DocAgent:
         result = await self._call_llm(llm_tool, "", prompt)
         if not result.success:
             return result
-        if doc_type == "architecture_diagram":
-            return SkillResult(
-                success=True,
-                output={"type": "architecture_diagram", "diagram": result.output},
-                metadata={"skill": "doc_writer", "doc_type": doc_type},
-            )
         output_path = input_data.get("output_path", f"docs/{doc_type}.md")
         return await self._write_result(output_path, result.output, doc_type, file_tool)
