@@ -45,6 +45,57 @@ def get_project_name(repo_path: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in repo_name)
 
 
+def _build_and_save_graph(
+    components: dict,
+    module_tree: dict,
+    data_dir: str,
+    project_name: str,
+) -> None:
+    """Build the heterogeneous knowledge graph (code nodes + calls edges +
+    module structure) and persist it as the single input for doc generation."""
+    from repodoc.graph.builder import (
+        attach_module_tree_to_graph,
+        build_graph_from_analysis,
+    )
+
+    graph = build_graph_from_analysis(components)
+    attach_module_tree_to_graph(graph, module_tree, components)
+    kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
+    graph.save(kg_path)
+
+
+def _ensure_knowledge_graph(config: Config, data_dir: str, project_name: str) -> bool:
+    """Prepare the analysis inputs for doc generation.
+
+    Returns True when the knowledge graph already exists (doc generation
+    restores components + module tree from it, skipping analysis/clustering).
+    Otherwise runs analysis + clustering, persists the module tree and the
+    knowledge graph, and returns False."""
+    kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
+    if os.path.exists(kg_path):
+        return True
+
+    file_manager.ensure_directory(data_dir)
+    click.echo("=" * 40)
+    click.echo("Phase 1: Analyzing dependencies...")
+    builder = DependencyGraphBuilder(config)
+    components, leaf_nodes = builder.build_dependency_graph()
+    click.echo(f"  Components: {len(components)}")
+    click.echo(f"  Leaf nodes: {len(leaf_nodes)}")
+
+    click.echo("=" * 40)
+    click.echo("Phase 2: Clustering modules...")
+    module_tree = cluster_modules(leaf_nodes, components, config)
+    tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
+    file_manager.save_json(module_tree, tree_path)
+    click.echo(f"  Modules: {len(module_tree)}")
+
+    _build_and_save_graph(components, module_tree, data_dir, project_name)
+    click.echo(f"  Knowledge graph saved: {kg_path}")
+    click.echo("=" * 40)
+    return False
+
+
 @click.group()
 @click.version_option(version="0.1.0")
 def cli():
@@ -90,12 +141,11 @@ def analyze(
 
         # Persist the knowledge graph right after analysis: it is the
         # pipeline's backbone, not a post-doc-generation summary.
-        from repodoc.graph.builder import build_graph_from_analysis
-
-        graph = build_graph_from_analysis(components)
-        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
-        graph.save(kg_path)
-        click.echo(f"Knowledge graph saved: {kg_path}")
+        _build_and_save_graph(components, {}, data_dir, project_name)
+        click.echo(
+            f"Knowledge graph saved: "
+            f"{os.path.join(data_dir, project_name + '_knowledge_graph.json')}"
+        )
 
         if not no_cluster:
             file_manager.ensure_directory(data_dir)
@@ -107,10 +157,8 @@ def analyze(
             )
             # Merge the clustering blueprint into the knowledge graph and
             # persist: the graph is the single integrated asset.
-            from repodoc.graph.builder import attach_module_tree_to_graph
-
-            attach_module_tree_to_graph(graph, module_tree, components)
-            graph.save(kg_path)
+            _build_and_save_graph(components, module_tree, data_dir, project_name)
+            kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
             click.echo(f"Knowledge graph updated with module structure: {kg_path}")
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
@@ -170,24 +218,7 @@ def docs(
         # The knowledge graph is the single required input: when it exists
         # (produced by `repodoc analyze`), doc generation restores everything
         # from the graph alone and skips re-analysis/clustering entirely.
-        kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
-        if not os.path.exists(kg_path):
-            click.echo("knowledge graph not found. Running analysis first...")
-            click.echo("=" * 40)
-            click.echo("Phase 1: Analyzing dependencies...")
-            builder = DependencyGraphBuilder(config)
-            components, leaf_nodes = builder.build_dependency_graph()
-            click.echo(f"  Components: {len(components)}")
-            click.echo(f"  Leaf nodes: {len(leaf_nodes)}")
-
-            click.echo("=" * 40)
-            click.echo("Phase 2: Clustering modules...")
-            file_manager.ensure_directory(data_dir)
-            module_tree = cluster_modules(leaf_nodes, components, config)
-            tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
-            file_manager.save_json(module_tree, tree_path)
-            click.echo(f"  Modules: {len(module_tree)}")
-            click.echo("=" * 40)
+        _ensure_knowledge_graph(config, data_dir, project_name)
 
         results = run_pipeline(config, generate_docs=True)
         click.echo(f"Documentation generated: {results['docs_directory']}")
@@ -247,20 +278,11 @@ def generate(
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
     try:
-        click.echo("=" * 40)
-        click.echo("Phase 1: Analyzing dependencies...")
-        builder = DependencyGraphBuilder(config)
-        components, leaf_nodes = builder.build_dependency_graph()
-        click.echo(f"  Components: {len(components)}")
-        click.echo(f"  Leaf nodes: {len(leaf_nodes)}")
-
-        click.echo("=" * 40)
-        click.echo("Phase 2: Clustering modules...")
-        file_manager.ensure_directory(data_dir)
-        module_tree = cluster_modules(leaf_nodes, components, config)
-        tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
-        file_manager.save_json(module_tree, tree_path)
-        click.echo(f"  Modules: {len(module_tree)}")
+        # Identical to `analyze` + `docs`: when the knowledge graph already
+        # exists this skips analysis/clustering entirely (no wasted LLM calls).
+        graph_existed = _ensure_knowledge_graph(config, data_dir, project_name)
+        if graph_existed:
+            click.echo("Knowledge graph found; skipping analysis/clustering.")
 
         click.echo("=" * 40)
         click.echo("Phase 3: Generating documentation...")
