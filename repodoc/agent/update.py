@@ -29,7 +29,7 @@ from repodoc.graph.analyzers import get_analyzer
 from repodoc.graph.cluster import assign_new_components
 from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import REL_CALLS, CodeNode, Node
-from repodoc.utils import file_manager, log_operation
+from repodoc.utils import file_manager, log_operation, project_name as project_name_of
 
 logger = logging.getLogger(__name__)
 
@@ -941,10 +941,7 @@ async def run_update(
     """
     start_time = time.time()
 
-    project_name = "".join(
-        c if c.isalnum() else "_"
-        for c in os.path.basename(os.path.normpath(config.repo_path))
-    )
+    project_name = project_name_of(config.repo_path)
     data_dir = os.path.join(config.output_dir, "data")
     metadata_path = os.path.join(data_dir, f"{project_name}_metadata.json")
 

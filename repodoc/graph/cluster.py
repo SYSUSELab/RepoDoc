@@ -9,7 +9,6 @@ import json
 import logging
 import os
 import re
-import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
@@ -40,8 +39,6 @@ MIN_COMPONENTS_FOR_RECURSION = 40
 # concurrent requests and ~87% of batches returned empty responses. A single
 # process-wide semaphore caps ALL LLM calls (top-level and recursive).
 MAX_BATCH_WORKERS = 16
-MAX_CONCURRENT_LLM_CALLS = 16
-_LLM_CALL_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 # Only skip clustering when content is small AND we have few leaves (avoid one big module for medium projects).
 # Keep low: at 25, atcher (18 leaves) skipped LLM clustering entirely and
 # lost its config/core/services module split.
@@ -270,21 +267,11 @@ def _call_llm_with_retry(
 ) -> Tuple[str, Dict[str, Any]]:
     """Call LLM with retry on parse failure, using lower temperature.
 
-    The process-wide semaphore serializes ALL clustering LLM calls (batch
-    pools and recursive single calls alike) — nested thread pools would
-    otherwise multiply concurrent requests (libevent: dozens concurrent ->
-    ~87% empty responses).
+    Concurrency is governed by the shared AdaptiveLimiter inside
+    call_llm (it serializes batch pools and recursive single calls alike —
+    nested thread pools would otherwise multiply concurrent requests,
+    libevent: dozens concurrent -> ~87% empty responses).
     """
-    with _LLM_CALL_SEMAPHORE:
-        return _call_llm_with_retry_locked(prompt, config, max_retries)
-
-
-def _call_llm_with_retry_locked(
-    prompt: str,
-    config: Config,
-    max_retries: int = 2,
-) -> Tuple[str, Dict[str, Any]]:
-    """Internal: the retry loop, run under the global LLM semaphore."""
     last_error = None
     last_response = ""
 

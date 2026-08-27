@@ -34,20 +34,22 @@ CONCEPT_PATTERNS = {
 }
 
 
+def _build_name_index(components: Dict[str, Node]) -> Dict[str, str]:
+    """Map component name -> component id (built once per extraction run,
+    instead of the old per-edge O(n) scan)."""
+    return {node.name: cid for cid, node in components.items() if node.name}
+
+
 def _add_concept_edges(
     graph: HeterogeneousGraph,
-    components: Dict[str, Node],
     comp_name: str,
+    name_to_id: Dict[str, str],
     concept_name: str,
     confidence: float,
     context: str,
 ) -> None:
     """Link a component to a concept node in the graph (idempotent)."""
-    comp_id = None
-    for cid, node in components.items():
-        if node.name == comp_name:
-            comp_id = cid
-            break
+    comp_id = name_to_id.get(comp_name)
     if not comp_id:
         return
     concept_id = f"concept/{concept_name.lower()}"
@@ -65,7 +67,9 @@ def _add_concept_edges(
 
 
 def _extract_keyword_concepts(
-    graph: HeterogeneousGraph, components: Dict[str, Node]
+    graph: HeterogeneousGraph,
+    components: Dict[str, Node],
+    name_to_id: Dict[str, str],
 ) -> set[str]:
     """Keyword matching over component names and docstrings (fast path)."""
     matched: set[str] = set()
@@ -81,8 +85,8 @@ def _extract_keyword_concepts(
                 matched.add(comp_id)
                 _add_concept_edges(
                     graph,
-                    components,
                     node.name,
+                    name_to_id,
                     concept_name,
                     confidence=0.8,
                     context=f"{node.name}: {node.docstring[:200] if node.docstring else ''}",
@@ -153,7 +157,8 @@ def extract_concepts(
     Keyword matching always runs; LLM enhancement runs only when
     config.llm_concept_extraction is enabled.
     """
-    matched = _extract_keyword_concepts(graph, components)
+    name_to_id = _build_name_index(components)
+    matched = _extract_keyword_concepts(graph, components, name_to_id)
 
     if config.llm_concept_extraction:
         # Components that have no concept edges yet
@@ -182,17 +187,14 @@ def extract_concepts(
                 for concept_name in concepts:
                     _add_concept_edges(
                         graph,
-                        components,
                         comp_name,
+                        name_to_id,
                         concept_name,
                         confidence=0.7,  # Slightly lower than keyword matching
                         context=f"{comp_name}: LLM extracted concept",
                     )
 
     # Persist the graph with concept nodes
-    project_name = "".join(
-        c if c.isalnum() else "_"
-        for c in os.path.basename(os.path.normpath(config.repo_path))
-    )
+    project_name = project_name_of(config.repo_path)
     kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
     graph.save(kg_path)

@@ -103,7 +103,7 @@ Belongs to module: {module_name}
 Component: {component_name}
 Calls: {dependencies}
 Called by: {predecessors}
-Source:
+{predecessor_details}Source:
 ```
 {source_code}
 ```
@@ -119,6 +119,7 @@ def format_component_prompt(
     dependencies: list[str],
     predecessors: list[str],
     module_name: str,
+    predecessor_details: str = "",
     component_context: str = "",
 ) -> tuple[str, str]:
     user_prompt = COMPONENT_USER_PROMPT.format(
@@ -129,6 +130,7 @@ def format_component_prompt(
         source_code=source_code[:24000],
         dependencies=", ".join(dependencies) if dependencies else "None",
         predecessors=", ".join(predecessors) if predecessors else "None",
+        predecessor_details=predecessor_details,
         module_name=module_name,
         component_context=component_context,
     )

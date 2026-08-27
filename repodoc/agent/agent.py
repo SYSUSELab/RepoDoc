@@ -148,6 +148,7 @@ class DocAgent:
             dependencies=list(component.get("depends_on", set())),
             predecessors=list(predecessors),
             module_name=module_name,
+            predecessor_details=input_data.get("predecessor_details", ""),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)

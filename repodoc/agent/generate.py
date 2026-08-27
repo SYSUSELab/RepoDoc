@@ -146,8 +146,9 @@ class DocPipeline:
         return os.path.join(self.config.output_dir, "data")
 
     def get_project_name(self) -> str:
-        repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
-        return "".join(c if c.isalnum() else "_" for c in repo_name)
+        from repodoc.utils import project_name
+
+        return project_name(self.config.repo_path)
 
     def run_analysis(self):
         """Analyze, or restore from the persisted knowledge graph.
@@ -564,6 +565,26 @@ class DocPipeline:
             if node_id in getattr(n, "depends_on", set())
         ]
 
+        # 1-hop caller context: name (type) + docstring snippet, capped at 15
+        # — the model writes about "cooperation" but cannot know what the
+        # callers ARE from bare ids alone.
+        detail_lines = []
+        for pid in sorted(predecessors)[:15]:
+            pn = self.components.get(pid)
+            if not pn:
+                continue
+            snippet = ""
+            doc_lines = (pn.docstring or "").strip().splitlines()
+            if doc_lines:
+                snippet = doc_lines[0][:100]
+            detail_lines.append(
+                f"- {pid} ({pn.component_type})"
+                + (f": {snippet}" if snippet else "")
+            )
+        predecessor_details = (
+            "\n".join(detail_lines) + "\n" if detail_lines else ""
+        )
+
         component = {
             "name": node.name,
             "component_type": node.component_type,
@@ -582,6 +603,7 @@ class DocPipeline:
                     "type": "component",
                     "component": component,
                     "predecessors": predecessors,
+                    "predecessor_details": predecessor_details,
                     "module_name": ".".join(module_chain),
                     "output_path": os.path.join(output_dir, f"{node.name}.md"),
                 },

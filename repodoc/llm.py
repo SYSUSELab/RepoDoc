@@ -126,11 +126,29 @@ _LIMITER = AdaptiveLimiter()
 
 
 class LLMClient:
-    """Async LLM client with token usage history, shared per (base_url, api_key)."""
+    """Async LLM client with token usage history, shared per (base_url, api_key).
+
+    The underlying AsyncOpenAI client is created lazily ONCE per LLMClient
+    (the module-level _clients dict dedups by endpoint), so hundreds of
+    doc-generation calls reuse one HTTP connection instead of paying a
+    TLS handshake each time.
+    """
 
     def __init__(self, config: "Config"):
         self.config = config
         self.history: list[TokenUsage] = []
+        self._openai = None
+
+    def _get_openai(self):
+        if self._openai is None:
+            from openai import AsyncOpenAI
+
+            self._openai = AsyncOpenAI(
+                base_url=self.config.llm_base_url,
+                api_key=self.config.llm_api_key,
+                max_retries=1,  # SDK does one quick retry; backoff is ours
+            )
+        return self._openai
 
     async def complete(
         self,
@@ -146,16 +164,11 @@ class LLMClient:
         "json_object" (None = default free-form output). Endpoints that do
         not support it fail with APIError and fall back automatically.
         """
-        from openai import AsyncOpenAI
         from openai import APIError
 
         if model is None:
             model = self.config.main_model
-        client = AsyncOpenAI(
-            base_url=self.config.llm_base_url,
-            api_key=self.config.llm_api_key,
-            max_retries=1,  # SDK does one quick retry; backoff is ours
-        )
+        client = self._get_openai()
 
         if len(prompt) > _MAX_PROMPT_CHARS:
             logger.warning(
@@ -227,8 +240,8 @@ class LLMClient:
                         pass
                 if not success:
                     raise last_error
-        finally:
-            await client.close()
+        # NOTE: the AsyncOpenAI client is intentionally NOT closed — it is
+        # cached on the LLMClient and reused across calls (connection reuse).
 
         usage = response.usage
         token_usage: TokenUsage = {
