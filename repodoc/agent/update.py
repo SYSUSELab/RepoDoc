@@ -966,6 +966,41 @@ async def run_update(
     if current_commit:
         print(f"Current commit: {current_commit[:8]}")
 
+    # --- Skip when this exact update was already applied ---
+    # Same base commit as the last update AND the code state is unchanged
+    # (same HEAD, clean working tree) means re-running regenerates every
+    # affected doc again for the identical base->current diff — wasted LLM
+    # calls. The working-tree check keeps real (uncommitted) changes safe.
+    if (
+        base_commit
+        and current_commit
+        and os.path.exists(metadata_path)
+        and not changed_files
+    ):
+        try:
+            meta = file_manager.load_json(metadata_path) or {}
+            ui = meta.get("update_info") or {}
+            if (
+                base_commit == ui.get("last_base_commit")
+                and current_commit == ui.get("last_update_commit")
+            ):
+                dirty = (
+                    subprocess.run(
+                        ["git", "diff", "--quiet", "HEAD"],
+                        cwd=config.repo_path,
+                        capture_output=True,
+                    ).returncode
+                    != 0
+                )
+                if not dirty:
+                    print(
+                        f"Already up to date: update {base_commit[:8]} -> "
+                        f"{current_commit[:8]} was applied in the last update."
+                    )
+                    return {"status": "no_changes", "impact": None}
+        except Exception:
+            pass
+
     # --- Change analysis ---
     analyses: Optional[dict[str, FileChangeAnalysis]] = None
     if analyze_changes and not changed_files:
