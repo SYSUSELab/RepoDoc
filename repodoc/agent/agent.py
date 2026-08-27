@@ -116,16 +116,15 @@ class DocAgent:
         component_count = input_data.get("component_count", 0)
         module_count = input_data.get("module_count", 0)
         module_dependencies = input_data.get("module_dependencies", {})
-        module_docs_summary = input_data.get("module_docs_summary", {})
+        # Already a budgeted string (budget_context) — never a raw dict.
+        module_docs_summary = input_data.get("module_docs_summary", "")
 
         system_prompt, user_prompt = format_overview_prompt(
             repo_name=repo_name,
             component_count=component_count,
             module_count=module_count,
             module_dependencies=module_dependencies,
-            module_docs_summary="\n\n".join(
-                f"### {name}\n{content}" for name, content in module_docs_summary.items()
-            ),
+            module_docs_summary=module_docs_summary,
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)

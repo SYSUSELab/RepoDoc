@@ -14,6 +14,7 @@ from typing import Any, Dict, List
 from repodoc.config import Config
 from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import REL_SEMANTIC_IMPACT, ConceptNode, Node
+from repodoc.utils import project_name as project_name_of
 from repodoc.llm import call_llm
 
 logger = logging.getLogger(__name__)
