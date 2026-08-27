@@ -10,6 +10,7 @@ from repodoc.config import Config
 from repodoc.graph import DependencyGraphBuilder
 from repodoc.graph.builder import build_graph_from_analysis
 from repodoc.agent.agent import DocAgent
+from repodoc.agent.retry import run_with_retry
 from repodoc.utils import file_manager, validate_and_fix_links, log_operation
 
 
@@ -413,47 +414,9 @@ class DocPipeline:
                 )
 
             jobs = [(m, i, p) for m, i, p in modules_at_depth]
-            depth_results = await asyncio.gather(
-                *(make_task(*j) for j in jobs), return_exceptions=True
+            depth_results, _ = await run_with_retry(
+                jobs, lambda j: make_task(*j), "module docs"
             )
-
-            # Failure-driven retry loop: lower concurrency explicitly on each
-            # failed round until all module docs succeed (doc completeness
-            # is the hard goal).
-            from repodoc.llm import _LIMITER
-
-            for _round in range(4):
-                failed = [
-                    j
-                    for j, r in zip(jobs, depth_results)
-                    if isinstance(r, Exception)
-                    or (r is not None and not getattr(r, "success", False))
-                ]
-                if not failed:
-                    break
-                if _LIMITER.permits > _LIMITER.min_permits:
-                    _LIMITER.force_decrease()
-                print(
-                    f"Concurrency {_LIMITER.permits}, retrying "
-                    f"{len(failed)} failed module docs (round {_round + 1})..."
-                )
-                retry = await asyncio.gather(
-                    *(make_task(*j) for j in failed), return_exceptions=True
-                )
-                # slot retry results back at the failed positions
-                retry_iter = iter(retry)
-                depth_results = [
-                    next(retry_iter)
-                    if (
-                        isinstance(r, Exception)
-                        or (r is not None and not getattr(r, "success", False))
-                    )
-                    else r
-                    for r in depth_results
-                ]
-                if _LIMITER.permits <= _LIMITER.min_permits:
-                    break  # concurrency bottomed out: last try done
-
             results.extend(
                 [r for r in depth_results if not isinstance(r, Exception)]
             )
@@ -624,54 +587,10 @@ class DocPipeline:
             for comp_id, chain in sorted(comp_modules.items())
             if comp_id in self.components
         ]
-        results = await asyncio.gather(
-            *(_run(*j) for j in jobs), return_exceptions=True
+        results, still_failed = await run_with_retry(
+            jobs, lambda j: _run(*j), "component docs"
         )
 
-        # Failure-driven retry loop: after each round of failures, explicitly
-        # lower the concurrency (visible in the terminal) and retry the
-        # failed docs — doc completeness is the hard goal, so we keep
-        # lowering until everything succeeds or concurrency bottoms out.
-        from repodoc.llm import _LIMITER
-
-        for _round in range(4):
-            failed = [
-                j
-                for j, r in zip(jobs, results)
-                if isinstance(r, Exception)
-                or (r is not None and not getattr(r, "success", False))
-            ]
-            if not failed:
-                break
-            if _LIMITER.permits > _LIMITER.min_permits:
-                _LIMITER.force_decrease()
-            print(
-                f"Concurrency {_LIMITER.permits}, retrying "
-                f"{len(failed)} failed component docs (round {_round + 1})..."
-            )
-            retry = await asyncio.gather(
-                *(_run(*j) for j in failed), return_exceptions=True
-            )
-            # slot retry results back at the failed positions
-            retry_iter = iter(retry)
-            results = [
-                next(retry_iter)
-                if (
-                    isinstance(r, Exception)
-                    or (r is not None and not getattr(r, "success", False))
-                )
-                else r
-                for r in results
-            ]
-            if _LIMITER.permits <= _LIMITER.min_permits:
-                break  # concurrency bottomed out: this round was the last try
-
-        still_failed = [
-            j
-            for j, r in zip(jobs, results)
-            if isinstance(r, Exception)
-            or (r is not None and not getattr(r, "success", False))
-        ]
         if still_failed:
             print(
                 f"WARNING: {len(still_failed)} component docs failed permanently: "
