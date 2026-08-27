@@ -280,6 +280,7 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
         code_node = CodeNode(
             id=node.id,
             type=node.component_type,
+            component_type=node.component_type,
             file_path=node.file_path,
             source_code=node.source_code,
             name=node.name,
@@ -287,12 +288,138 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             start_line=node.start_line,
             end_line=node.end_line,
             docstring=node.docstring or "",
+            depends_on=sorted(node.depends_on),
+            parameters=node.parameters,
+            receiver=node.receiver,
         )
         graph.add_code_node(code_node)
     for nid, node in components.items():
         for callee_id in node.depends_on:
             if callee_id in components:
                 graph.add_edge(nid, callee_id, REL_CALLS, 1.0)
+    return graph
+
+
+def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
+    """Restore analysis Nodes from graph code nodes.
+
+    The knowledge graph carries every analysis field on its CodeNodes, so
+    doc generation/update can rely on the graph ALONE (no re-parsing, no
+    dependency_graph.json). Reverse of build_graph_from_analysis."""
+    components: Dict[str, Node] = {}
+    for node_id, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "code":
+            continue
+        d = attrs.get("data", {})
+        components[node_id] = Node(
+            id=d.get("id", node_id),
+            name=d.get("name", ""),
+            component_type=d.get("component_type") or d.get("type", "unknown"),
+            file_path=d.get("file_path", ""),
+            relative_path=d.get("relative_path", ""),
+            depends_on=set(d.get("depends_on", [])),
+            source_code=d.get("source_code"),
+            start_line=d.get("start_line", 0),
+            end_line=d.get("end_line", 0),
+            docstring=d.get("docstring", ""),
+            parameters=d.get("parameters"),
+            receiver=d.get("receiver"),
+        )
+    return components
+
+
+def graph_to_module_tree(graph: HeterogeneousGraph) -> dict:
+    """Restore the nested module tree dict from graph module nodes.
+
+    ModuleNodes carry name/path/components and their id is the tree path
+    ("net/http"), so the full hierarchy (children included) is rebuilt from
+    the graph alone. Empty dict when the graph has no module nodes."""
+    tree: dict = {}
+    modules = [
+        attrs.get("data", {})
+        for _nid, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "module"
+    ]
+    for d in sorted(modules, key=lambda m: m.get("id", "")):
+        mid = d.get("id", "")
+        parts = mid.split("/")
+        if not parts or not parts[-1]:
+            continue
+        target = tree
+        for part in parts[:-1]:
+            target = target[part]["children"]
+        target[parts[-1]] = {
+            "path": d.get("path", ""),
+            "components": list(d.get("components", [])),
+            "children": {},
+        }
+    return tree
+
+
+def attach_module_tree_to_graph(
+    graph: HeterogeneousGraph,
+    module_tree: dict,
+    components: Dict[str, Node],
+) -> HeterogeneousGraph:
+    """Attach the clustering result (module tree) to the knowledge graph.
+
+    Adds a ModuleNode per module (id = module path in the tree), contains
+    edges for module -> component and module -> child module, and depends_on
+    edges for cross-module call aggregation (component calls that cross
+    module boundaries, using each component's deepest module home).
+
+    Returns the graph for chaining. Components/modules missing from the
+    graph are skipped silently (e.g. modules over components the tree
+    excludes from documentation)."""
+    from repodoc.graph.models import REL_CONTAINS, REL_DEPENDS_ON, ModuleNode
+
+    def deepest_module(nodes: dict, path: str, best: dict) -> None:
+        """Map each component id to its DEEPEST owning module path."""
+        for name, info in nodes.items():
+            cur = f"{path}/{name}" if path else name
+            for cid in info.get("components", []):
+                if cid not in best or len(cur) > len(best[cid]):
+                    best[cid] = cur
+            children = info.get("children")
+            if isinstance(children, dict):
+                deepest_module(children, cur, best)
+
+    def add_module_nodes(nodes: dict, parent: str | None) -> None:
+        for name, info in nodes.items():
+            cur = f"{parent}/{name}" if parent else name
+            graph.add_module_node(
+                ModuleNode(
+                    id=cur,
+                    name=name,
+                    path=info.get("path", ""),
+                    parent=parent,
+                    components=list(info.get("components", [])),
+                )
+            )
+            if parent is not None:
+                graph.add_edge(parent, cur, REL_CONTAINS, 1.0)
+            for cid in info.get("components", []):
+                if graph.has_node(cid):
+                    graph.add_edge(cur, cid, REL_CONTAINS, 1.0)
+            children = info.get("children")
+            if isinstance(children, dict):
+                add_module_nodes(children, cur)
+
+    add_module_nodes(module_tree, None)
+
+    # Cross-module dependency edges: component calls that cross module
+    # boundaries (module A depends on module B).
+    comp_module: dict[str, str] = {}
+    deepest_module(module_tree, "", comp_module)
+    for cid, node in components.items():
+        m = comp_module.get(cid)
+        if m is None or not graph.has_node(m):
+            continue
+        for dep_id in getattr(node, "depends_on", []):
+            dm = comp_module.get(dep_id)
+            if dm and dm != m and graph.has_node(dm):
+                graph.add_edge(m, dm, REL_DEPENDS_ON, 1.0)
+
     return graph
 
 

@@ -15,10 +15,11 @@ from repodoc.graph.models import (
     CodeNode,
     ConceptNode,
     DocNode,
+    ModuleNode,
 )
 
-NodeType = Literal["code", "doc", "concept"]
-NodeLike = CodeNode | DocNode | ConceptNode
+NodeType = Literal["code", "doc", "concept", "module"]
+NodeLike = CodeNode | DocNode | ConceptNode | ModuleNode
 
 
 class HeterogeneousGraph:
@@ -55,8 +56,16 @@ class HeterogeneousGraph:
             data=node.model_dump(),
         )
 
-    def get_node(self, node_id: str) -> CodeNode | DocNode | ConceptNode | None:
-        """Return the node as CodeNode, DocNode, or ConceptNode; None if missing."""
+    def add_module_node(self, node: ModuleNode) -> None:
+        """Add or overwrite a ModuleNode by id."""
+        self._g.add_node(
+            node.id,
+            node_type="module",
+            data=node.model_dump(),
+        )
+
+    def get_node(self, node_id: str) -> CodeNode | DocNode | ConceptNode | ModuleNode | None:
+        """Return the node as CodeNode, DocNode, ConceptNode, or ModuleNode; None if missing."""
         if not self._g.has_node(node_id):
             return None
         attrs = self._g.nodes[node_id]
@@ -68,6 +77,8 @@ class HeterogeneousGraph:
             return DocNode.model_validate(data)
         if node_type == "concept":
             return ConceptNode.model_validate(data)
+        if node_type == "module":
+            return ModuleNode.model_validate(data)
         return None
 
     def has_node(self, node_id: str) -> bool:

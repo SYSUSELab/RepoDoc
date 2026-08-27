@@ -50,20 +50,37 @@ class CallRelationship(BaseModel):
 # Knowledge graph models
 # ---------------------------------------------------------------------------
 
-# Relation type constants for graph edges (design: calls, implements, describes, semantic_impact).
+# Relation type constants for graph edges
+# (design: calls, implements, describes, semantic_impact + module structure).
 REL_CALLS = "calls"
 REL_IMPLEMENTS = "implements"
 REL_DESCRIBES = "describes"
 REL_SEMANTIC_IMPACT = "semantic_impact"
+# Module clustering edges: contains (module -> component / child module),
+# depends_on (module -> module, cross-module call aggregation).
+REL_CONTAINS = "contains"
+REL_DEPENDS_ON = "depends_on"
 
-RELATION_TYPES = (REL_CALLS, REL_IMPLEMENTS, REL_DESCRIBES, REL_SEMANTIC_IMPACT)
+RELATION_TYPES = (
+    REL_CALLS,
+    REL_IMPLEMENTS,
+    REL_DESCRIBES,
+    REL_SEMANTIC_IMPACT,
+    REL_CONTAINS,
+    REL_DEPENDS_ON,
+)
 
 
 class CodeNode(BaseModel):
-    """Code entity: file, class, or function. Maps from analysis Node in Step 2."""
+    """Code entity: file, class, or function. Maps from analysis Node in Step 2.
+
+    component_type mirrors type from the analysis model, and depends_on /
+    parameters / receiver carry the FULL analysis fields, so the graph JSON
+    is self-contained: it covers everything dependency_graph.json holds."""
 
     id: str
     type: str  # e.g. "function", "class", "file"
+    component_type: str = ""  # same value as type (analysis model's field name)
     file_path: str
     source_code: Optional[str] = None
     name: Optional[str] = None
@@ -71,6 +88,9 @@ class CodeNode(BaseModel):
     start_line: int = 0
     end_line: int = 0
     docstring: str = ""
+    depends_on: List[str] = []  # full dependency list (incl. unresolved targets)
+    parameters: Optional[List[str]] = None
+    receiver: Optional[str] = None  # Go/Rust method receiver type
 
 
 class DocNode(BaseModel):
@@ -90,3 +110,17 @@ class ConceptNode(BaseModel):
     concept: str
     context: str = ""
     confidence: float = 1.0  # 0.0 to 1.0
+
+
+class ModuleNode(BaseModel):
+    """Clustered module from the LLM/heuristic clustering result (module tree).
+
+    Member components are ALSO expressed as contains edges (the authoritative
+    graph relation); the components field keeps the node self-contained so
+    the graph JSON alone carries the full clustering result."""
+
+    id: str  # module path in the tree, e.g. "core" or "net/http"
+    name: str
+    path: str = ""  # source directory, e.g. "src/atcher/core"
+    parent: Optional[str] = None  # parent module id, None for top-level modules
+    components: List[str] = []  # member component ids (mirrors module_tree)

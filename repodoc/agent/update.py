@@ -677,7 +677,11 @@ def _get_git_commit(repo_path: str) -> Optional[str]:
 def _load_graph_and_assets(
     config: Config, project_name: str
 ) -> tuple[HeterogeneousGraph, dict]:
-    """Load the knowledge graph and module tree from previous output."""
+    """Load the knowledge graph and module tree from previous output.
+
+    The knowledge graph is the single required input: the module tree is
+    restored from its module nodes. module_tree.json is only a fallback for
+    graphs produced before module nodes existed."""
     graph_path = os.path.join(
         config.output_dir, "data", f"{project_name}_knowledge_graph.json"
     )
@@ -688,31 +692,24 @@ def _load_graph_and_assets(
         )
     graph = HeterogeneousGraph.load(graph_path)
 
-    module_tree_path = os.path.join(
-        config.output_dir, "data", f"{project_name}_module_tree.json"
-    )
-    module_tree = {}
-    if os.path.exists(module_tree_path):
-        module_tree = file_manager.load_json(module_tree_path) or {}
+    from repodoc.graph.builder import graph_to_module_tree
+
+    module_tree = graph_to_module_tree(graph)
+    if not module_tree:
+        module_tree_path = os.path.join(
+            config.output_dir, "data", f"{project_name}_module_tree.json"
+        )
+        if os.path.exists(module_tree_path):
+            module_tree = file_manager.load_json(module_tree_path) or {}
     return graph, module_tree
 
 
 def _build_pipeline_from_graph(graph: HeterogeneousGraph, config: Config) -> DocPipeline:
     """Reconstruct the DocPipeline component map from graph code nodes."""
+    from repodoc.graph.builder import graph_to_components
+
     pipeline = DocPipeline(config)
-    pipeline.components = {}
-
-    for node_id, attrs in graph.nodes(data=True):
-        if attrs.get("node_type") != "code":
-            continue
-        data = attrs.get("data", {}).copy()
-        # KG stores 'type' but Node model expects 'component_type'
-        if "component_type" not in data and "type" in data:
-            data["component_type"] = data["type"]
-        if "component_type" not in data:
-            continue
-        pipeline.components[node_id] = Node(**data)
-
+    pipeline.components = graph_to_components(graph)
     pipeline.load_module_tree()
     pipeline.initialize_agent()
     return pipeline
