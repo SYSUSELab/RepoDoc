@@ -170,12 +170,9 @@ class DocAgent:
             module_dependencies=input_data.get("module_dependencies", []),
             dependent_modules=input_data.get("dependent_modules", []),
             sub_modules=input_data.get("sub_modules", []),
-            component_docs_summary="\n\n".join(
-                f"### {name}\n{content}" for name, content in input_data.get("component_docs", {}).items()
-            ),
-            children_docs_summary="\n\n".join(
-                f"### {name}\n{content}" for name, content in input_data.get("children_docs", {}).items()
-            ),
+            # Already budgeted strings (budget_context) — never raw dicts.
+            component_docs_summary=input_data.get("component_docs", ""),
+            children_docs_summary=input_data.get("children_docs", ""),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
