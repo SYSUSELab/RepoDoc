@@ -192,14 +192,17 @@ class LLMClient:
         except APIError as e:
             logger.error(f"API Error: {e}")
             # Config errors (4xx other than 408/429) never recover: no retry.
-            # 408/429 ARE retryable (timeout / rate limit).
+            # 408/429 ARE retryable (timeout / rate limit). APITimeoutError
+            # and other connection errors carry NO status_code — they are
+            # always retryable.
+            status = getattr(e, "status_code", None)
             if (
-                e.status_code is not None
-                and 400 <= e.status_code < 500
-                and e.status_code not in (408, 429)
+                status is not None
+                and 400 <= status < 500
+                and status not in (408, 429)
             ):
                 raise
-            # Transient errors (429/5xx/timeouts): exponential backoff.
+            # Transient errors (429/5xx/timeouts/connection): exponential backoff.
             last_error = e
             success = False
             for attempt in range(_BACKOFF_MAX_RETRIES):
@@ -222,10 +225,11 @@ class LLMClient:
                     break
                 except APIError as e2:
                     last_error = e2
+                    status = getattr(e2, "status_code", None)
                     if (
-                        e2.status_code is not None
-                        and 400 <= e2.status_code < 500
-                        and e2.status_code not in (408, 429)
+                        status is not None
+                        and 400 <= status < 500
+                        and status not in (408, 429)
                     ):
                         raise
             if not success:
