@@ -10,6 +10,8 @@ from repodoc.config import Config
 from repodoc.graph import DependencyGraphBuilder
 from repodoc.graph.builder import build_graph_from_analysis
 from repodoc.agent.agent import DocAgent
+from repodoc.agent.prompts import budget_context
+from repodoc.agent.retry import run_with_retry
 from repodoc.utils import file_manager, validate_and_fix_links, log_operation
 
 
@@ -144,8 +146,9 @@ class DocPipeline:
         return os.path.join(self.config.output_dir, "data")
 
     def get_project_name(self) -> str:
-        repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
-        return "".join(c if c.isalnum() else "_" for c in repo_name)
+        from repodoc.utils import project_name
+
+        return project_name(self.config.repo_path)
 
     def run_analysis(self):
         """Analyze, or restore from the persisted knowledge graph.
@@ -329,11 +332,13 @@ class DocPipeline:
             self.initialize_agent()
 
         module_structure = self.load_module_tree()
-        module_deps, _ = _build_module_dependencies(
+        module_deps, module_dependents = _build_module_dependencies(
             self.components, module_structure
         )
 
-        # Module doc summaries (top-level module docs generated in layer 2)
+        # Module doc summaries (top-level module docs generated in layer 2).
+        # Budgeted: per-doc 1200 chars, 24K total, modules with the most
+        # dependents survive first.
         module_docs_summary = {}
         docs_dir = self.config.docs_dir
         for name in module_structure.keys():
@@ -341,9 +346,16 @@ class DocPipeline:
             if os.path.exists(md_path):
                 try:
                     with open(md_path, "r") as f:
-                        module_docs_summary[name] = f.read()[:2500]
+                        module_docs_summary[name] = f.read()
                 except Exception:
                     pass
+        dependents_count = {m: len(ds) for m, ds in module_dependents.items()}
+        module_docs_summary = budget_context(
+            module_docs_summary,
+            per_doc_limit=1200,
+            total_budget=24000,
+            priority=lambda m: dependents_count.get(m, 0),
+        )
 
         module_count = len(module_structure)
         result = await self.agent.execute(
@@ -413,47 +425,9 @@ class DocPipeline:
                 )
 
             jobs = [(m, i, p) for m, i, p in modules_at_depth]
-            depth_results = await asyncio.gather(
-                *(make_task(*j) for j in jobs), return_exceptions=True
+            depth_results, _ = await run_with_retry(
+                jobs, lambda j: make_task(*j), "module docs"
             )
-
-            # Failure-driven retry loop: lower concurrency explicitly on each
-            # failed round until all module docs succeed (doc completeness
-            # is the hard goal).
-            from repodoc.llm import _LIMITER
-
-            for _round in range(4):
-                failed = [
-                    j
-                    for j, r in zip(jobs, depth_results)
-                    if isinstance(r, Exception)
-                    or (r is not None and not getattr(r, "success", False))
-                ]
-                if not failed:
-                    break
-                if _LIMITER.permits > _LIMITER.min_permits:
-                    _LIMITER.force_decrease()
-                print(
-                    f"Concurrency {_LIMITER.permits}, retrying "
-                    f"{len(failed)} failed module docs (round {_round + 1})..."
-                )
-                retry = await asyncio.gather(
-                    *(make_task(*j) for j in failed), return_exceptions=True
-                )
-                # slot retry results back at the failed positions
-                retry_iter = iter(retry)
-                depth_results = [
-                    next(retry_iter)
-                    if (
-                        isinstance(r, Exception)
-                        or (r is not None and not getattr(r, "success", False))
-                    )
-                    else r
-                    for r in depth_results
-                ]
-                if _LIMITER.permits <= _LIMITER.min_permits:
-                    break  # concurrency bottomed out: last try done
-
             results.extend(
                 [r for r in depth_results if not isinstance(r, Exception)]
             )
@@ -482,21 +456,29 @@ class DocPipeline:
         if children:
             file_manager.ensure_directory(module_dir)
 
-        # Child module docs (leaf modules generated first, so they exist)
+        # Child module docs (leaf modules generated first, so they exist).
+        # Budgeted: per-doc 600 chars, 8K total.
         child_docs_content = {}
         for child_name in children.keys():
             child_doc_path = os.path.join(module_dir, f"{child_name}.md")
             if os.path.exists(child_doc_path):
                 try:
                     with open(child_doc_path, "r") as f:
-                        child_docs_content[child_name] = f.read()[:2000]
+                        child_docs_content[child_name] = f.read()
                 except Exception:
                     pass
+        children_docs_summary = budget_context(
+            child_docs_content, per_doc_limit=600, total_budget=8000
+        )
 
         # Member component docs (layer 1, generated before module docs).
-        # Each component's doc lives in its deepest module dir.
+        # Each component's doc lives in its deepest module dir. Budgeted:
+        # per-doc 800 chars, 32K total, most-called components survive first
+        # (prompt cap is hard — this keeps the module narrative coherent
+        # instead of the LLM call silently truncating the instructions).
         component_docs_content = {}
         comp_modules = _collect_component_modules(module_tree)
+        name_to_id = {n.name: cid for cid, n in self.components.items()}
         for comp_id in components:
             node = self.components.get(comp_id)
             if not (node and node.name):
@@ -506,9 +488,27 @@ class DocPipeline:
             if os.path.exists(comp_doc_path):
                 try:
                     with open(comp_doc_path, "r") as f:
-                        component_docs_content[node.name] = f.read()[:3000]
+                        component_docs_content[node.name] = f.read()
                 except Exception:
                     pass
+
+        def _importance(name: str) -> int:
+            """Architectural importance = how many components call it."""
+            cid = name_to_id.get(name)
+            if cid is None:
+                return 0
+            return sum(
+                1
+                for n in self.components.values()
+                if cid in getattr(n, "depends_on", set())
+            )
+
+        component_docs_summary = budget_context(
+            component_docs_content,
+            per_doc_limit=800,
+            total_budget=32000,
+            priority=_importance,
+        )
 
         # Sibling / parent context from the tree
         parent_module = ""
@@ -536,9 +536,9 @@ class DocPipeline:
                     "sibling_modules": sibling_modules,
                     "module_dependencies": sorted(module_deps.get(module_name, set())),
                     "dependent_modules": sorted(module_dependents.get(module_name, set())),
-                    "component_docs": component_docs_content,
+                    "component_docs": component_docs_summary,
                     "sub_modules": list(children.keys()),
-                    "children_docs": child_docs_content,
+                    "children_docs": children_docs_summary,
                     "output_path": os.path.join(
                         current_parent_dir, f"{module_name}.md"
                     ),
@@ -565,6 +565,26 @@ class DocPipeline:
             if node_id in getattr(n, "depends_on", set())
         ]
 
+        # 1-hop caller context: name (type) + docstring snippet, capped at 15
+        # — the model writes about "cooperation" but cannot know what the
+        # callers ARE from bare ids alone.
+        detail_lines = []
+        for pid in sorted(predecessors)[:15]:
+            pn = self.components.get(pid)
+            if not pn:
+                continue
+            snippet = ""
+            doc_lines = (pn.docstring or "").strip().splitlines()
+            if doc_lines:
+                snippet = doc_lines[0][:100]
+            detail_lines.append(
+                f"- {pid} ({pn.component_type})"
+                + (f": {snippet}" if snippet else "")
+            )
+        predecessor_details = (
+            "\n".join(detail_lines) + "\n" if detail_lines else ""
+        )
+
         component = {
             "name": node.name,
             "component_type": node.component_type,
@@ -583,6 +603,7 @@ class DocPipeline:
                     "type": "component",
                     "component": component,
                     "predecessors": predecessors,
+                    "predecessor_details": predecessor_details,
                     "module_name": ".".join(module_chain),
                     "output_path": os.path.join(output_dir, f"{node.name}.md"),
                 },
@@ -624,54 +645,10 @@ class DocPipeline:
             for comp_id, chain in sorted(comp_modules.items())
             if comp_id in self.components
         ]
-        results = await asyncio.gather(
-            *(_run(*j) for j in jobs), return_exceptions=True
+        results, still_failed = await run_with_retry(
+            jobs, lambda j: _run(*j), "component docs"
         )
 
-        # Failure-driven retry loop: after each round of failures, explicitly
-        # lower the concurrency (visible in the terminal) and retry the
-        # failed docs — doc completeness is the hard goal, so we keep
-        # lowering until everything succeeds or concurrency bottoms out.
-        from repodoc.llm import _LIMITER
-
-        for _round in range(4):
-            failed = [
-                j
-                for j, r in zip(jobs, results)
-                if isinstance(r, Exception)
-                or (r is not None and not getattr(r, "success", False))
-            ]
-            if not failed:
-                break
-            if _LIMITER.permits > _LIMITER.min_permits:
-                _LIMITER.force_decrease()
-            print(
-                f"Concurrency {_LIMITER.permits}, retrying "
-                f"{len(failed)} failed component docs (round {_round + 1})..."
-            )
-            retry = await asyncio.gather(
-                *(_run(*j) for j in failed), return_exceptions=True
-            )
-            # slot retry results back at the failed positions
-            retry_iter = iter(retry)
-            results = [
-                next(retry_iter)
-                if (
-                    isinstance(r, Exception)
-                    or (r is not None and not getattr(r, "success", False))
-                )
-                else r
-                for r in results
-            ]
-            if _LIMITER.permits <= _LIMITER.min_permits:
-                break  # concurrency bottomed out: this round was the last try
-
-        still_failed = [
-            j
-            for j, r in zip(jobs, results)
-            if isinstance(r, Exception)
-            or (r is not None and not getattr(r, "success", False))
-        ]
         if still_failed:
             print(
                 f"WARNING: {len(still_failed)} component docs failed permanently: "

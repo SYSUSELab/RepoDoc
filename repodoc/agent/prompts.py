@@ -7,7 +7,52 @@ Three layers, generated bottom-up:
    downstream modules, member role list (from actual component docs).
 3. Overview README — architecture overview with an embedded module-level
    mermaid diagram, theme map, and core flows.
+
+Prompt hygiene: the "## What to write" instructions always come BEFORE the
+context blocks. The LLM call truncates over-long prompts from the TAIL, so
+tail-placed instructions would be cut exactly when the context is biggest —
+instructions first means truncation only ever sacrifices context.
 """
+
+from typing import Callable, Dict, Optional
+
+
+def budget_context(
+    items: Dict[str, str],
+    per_doc_limit: int,
+    total_budget: int,
+    priority: Optional[Callable[[str], int]] = None,
+) -> str:
+    """Build a context block from {name: full_text} docs under a character
+    budget, as a markdown "### name\ncontent" section.
+
+    Each doc is truncated to per_doc_limit chars. When the total still
+    exceeds total_budget, whole docs are dropped by priority (lowest first;
+    tie-break by key for determinism) so the most architecturally important
+    members survive. Survivors keep their original order. Returns an empty
+    string when nothing fits."""
+    key_order = list(items.keys())
+    truncated = {k: v[:per_doc_limit] for k, v in items.items()}
+    total = sum(len(v) for v in truncated.values())
+
+    if total <= total_budget:
+        return "\n\n".join(f"### {k}\n{v}" for k, v in truncated.items())
+
+    def sort_key(name: str) -> tuple[int, str]:
+        return (priority(name) if priority else 0, name)
+
+    drop_order = sorted(key_order, key=sort_key)
+    survivors = set(key_order)
+    for name in drop_order:
+        if total <= total_budget:
+            break
+        survivors.discard(name)
+        total -= len(truncated[name])
+    if not survivors:
+        return ""
+    return "\n\n".join(
+        f"### {k}\n{v}" for k, v in truncated.items() if k in survivors
+    )
 
 # ---------------------------------------------------------------------------
 # Layer 1: Component docs (architecture role, adaptive length)
@@ -58,7 +103,7 @@ Belongs to module: {module_name}
 Component: {component_name}
 Calls: {dependencies}
 Called by: {predecessors}
-Source:
+{predecessor_details}Source:
 ```
 {source_code}
 ```
@@ -74,6 +119,7 @@ def format_component_prompt(
     dependencies: list[str],
     predecessors: list[str],
     module_name: str,
+    predecessor_details: str = "",
     component_context: str = "",
 ) -> tuple[str, str]:
     user_prompt = COMPONENT_USER_PROMPT.format(
@@ -84,6 +130,7 @@ def format_component_prompt(
         source_code=source_code[:24000],
         dependencies=", ".join(dependencies) if dependencies else "None",
         predecessors=", ".join(predecessors) if predecessors else "None",
+        predecessor_details=predecessor_details,
         module_name=module_name,
         component_context=component_context,
     )
@@ -107,6 +154,24 @@ dependencies."""
 
 MODULE_USER_PROMPT = """Write the architecture-narrative documentation for the module `{module_name}`.
 
+## What to write
+
+1. **Module purpose**: what this module is responsible for, and its boundary
+   (what it deliberately does NOT do)
+2. **Architectural position**: which modules feed it (upstream), which it
+   serves (downstream), and what the dependency direction implies
+3. **Member components**: the role list below, woven into a short narrative —
+   which members are the core, which are supporting
+4. **Sub-modules**: one line each, linking to their docs
+5. **Key flows/cooperation**: 1-3 flows this module participates in, if the
+   context supports them
+
+Return ONLY the Markdown document content. Use relative markdown links to
+member component docs (`{module_name}/ComponentName.md`) and sub-module docs
+(`sub_module.md` for children).
+
+## Context
+
 Module path: {module_path}
 Parent module: {parent_module}
 Sibling modules: {sibling_modules}
@@ -124,23 +189,7 @@ Sibling modules: {sibling_modules}
 {component_docs_summary}
 
 ## Sub-module docs (actual content of child module docs)
-{children_docs_summary}
-
-## What to write
-
-1. **Module purpose**: what this module is responsible for, and its boundary
-   (what it deliberately does NOT do)
-2. **Architectural position**: which modules feed it (upstream), which it
-   serves (downstream), and what the dependency direction implies
-3. **Member components**: the role list above, woven into a short narrative —
-   which members are the core, which are supporting
-4. **Sub-modules**: one line each, linking to their docs
-5. **Key flows/cooperation**: 1-3 flows this module participates in, if the
-   context supports them
-
-Return ONLY the Markdown document content. Use relative markdown links to
-member component docs (`{module_name}/ComponentName.md`) and sub-module docs
-(`sub_module.md` for children)."""
+{children_docs_summary}"""
 
 
 def format_module_prompt(
@@ -162,8 +211,10 @@ def format_module_prompt(
         module_dependencies=", ".join(module_dependencies) if module_dependencies else "None",
         dependent_modules=", ".join(dependent_modules) if dependent_modules else "None",
         sub_modules="\n".join(f"- {s}" for s in sub_modules) if sub_modules else "None",
-        component_docs_summary=component_docs_summary or "No member component docs available",
-        children_docs_summary=children_docs_summary or "No sub-module docs available",
+        component_docs_summary=component_docs_summary
+        or "No member component docs available",
+        children_docs_summary=children_docs_summary
+        or "No sub-module docs available",
     )
     return MODULE_SYSTEM_PROMPT, user_prompt
 
@@ -190,19 +241,13 @@ Repository: {repo_name}
 Total components: {component_count}
 Modules: {module_count}
 
-## Module dependency map (module -> modules it depends on)
-{module_dependencies}
-
-## Module docs (actual content, one section per module)
-{module_docs_summary}
-
 ## What to write
 
 1. **Project positioning**: one clear paragraph — what this system is and
    what problem it solves
 2. **Architecture overview**: describe the module layout (layers/domains),
    then include a **mermaid flowchart** showing modules and their dependency
-   edges (use the dependency map above; every module must be a node)
+   edges (use the dependency map below; every module must be a node)
 3. **Theme map**: the top-level modules, one line of responsibility each,
    linking to each module doc (`module_name.md`)
 4. **Core flows**: 2-4 key flows through the system (entry point -> modules
@@ -210,7 +255,15 @@ Modules: {module_count}
 5. **Module navigation**: a short list of all top-level module docs
 
 Return ONLY the Markdown document content. Mermaid diagrams must be valid
-(flowchart TD with `-->` edges)."""
+(flowchart TD with `-->` edges).
+
+## Context
+
+## Module dependency map (module -> modules it depends on)
+{module_dependencies}
+
+## Module docs (actual content, one section per module)
+{module_docs_summary}"""
 
 
 def format_overview_prompt(
