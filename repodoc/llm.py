@@ -132,6 +132,20 @@ class LLMClient:
         self.config = config
         self.history: list[TokenUsage] = []
 
+    def _build_headers(self) -> dict[str, str]:
+        """Extra headers for every request.
+
+        Base: config.llm_headers (LLM_EXTRA_HEADERS JSON via make_config).
+        Built-in: opencode.ai gateways route requests by session and reject
+        callers without `x-opencode-session` (400 MissingSessionID) — attach
+        a stable id automatically; a user-configured value wins.
+        """
+        headers = dict(getattr(self.config, "llm_headers", None) or {})
+        base_url = self.config.llm_base_url or ""
+        if "opencode" in base_url and "x-opencode-session" not in headers:
+            headers["x-opencode-session"] = "repodoc"
+        return headers
+
     async def complete(
         self,
         prompt: str,
@@ -151,11 +165,15 @@ class LLMClient:
 
         if model is None:
             model = self.config.main_model
-        client = AsyncOpenAI(
+        openai_kwargs = dict(
             base_url=self.config.llm_base_url,
             api_key=self.config.llm_api_key,
             max_retries=1,  # SDK does one quick retry; backoff is ours
         )
+        headers = self._build_headers()
+        if headers:
+            openai_kwargs["default_headers"] = headers
+        client = AsyncOpenAI(**openai_kwargs)
 
         if len(prompt) > _MAX_PROMPT_CHARS:
             logger.warning(

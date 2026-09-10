@@ -1,6 +1,6 @@
 """RepoDoc configuration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 
 # Token limit for clustering: skip LLM cluster when content is under this (CodeWiki default)
@@ -34,6 +34,10 @@ class Config:
     llm_api_key: str = "sk-1234"
     main_model: str = "deepseek-chat"
     cluster_model: str | None = None  # defaults to main_model
+    # Extra HTTP headers for every LLM request (e.g. gateways that require a
+    # session/routing header). Populated from LLM_EXTRA_HEADERS (JSON) by the
+    # CLI's make_config.
+    llm_headers: dict[str, str] = field(default_factory=dict)
     # Ablation switches: cluster_strategy / doc_strategy
     cluster_strategy: str = "llm"  # "llm" | "heuristic"
     doc_strategy: str = "agent"  # "agent" | "direct"

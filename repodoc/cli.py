@@ -22,6 +22,17 @@ def make_config(
     cluster_strategy: str = "llm",
     doc_strategy: str = "agent",
 ) -> Config:
+    extra_headers: dict[str, str] = {}
+    headers_env = os.getenv("LLM_EXTRA_HEADERS", "").strip()
+    if headers_env:
+        import json
+
+        try:
+            parsed = json.loads(headers_env)
+            if isinstance(parsed, dict):
+                extra_headers = {str(k): str(v) for k, v in parsed.items()}
+        except Exception:
+            pass
     return Config(
         repo_path=repo_path,
         output_dir=output_dir,
@@ -32,6 +43,7 @@ def make_config(
         or os.getenv("MAIN_MODEL", "deepseek-chat"),
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
+        llm_headers=extra_headers,
     )
 
 
