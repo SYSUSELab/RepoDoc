@@ -797,6 +797,15 @@ class DocPipeline:
         self._extract_concepts_safe(data_dir)
 
         link_results = validate_and_fix_links(docs_dir)
+        quality_results = self._run_quality_checks(docs_dir)
+        if quality_results["mermaid_problems"]:
+            print(
+                f"WARNING: {len(quality_results['mermaid_problems'])} mermaid "
+                f"problem(s) in generated docs:"
+            )
+            for p in quality_results["mermaid_problems"][:5]:
+                print(f"  - {p}")
+
         all_files = self._collect_generated_files(docs_dir, data_dir)
         total_duration = time.time() - self._start_time if self._start_time else 0
 
@@ -804,7 +813,13 @@ class DocPipeline:
         git_commit = self._get_git_commit()
 
         self._save_and_log_metadata(
-            data_dir, all_files, total_duration, token_usage, git_commit, link_results
+            data_dir,
+            all_files,
+            total_duration,
+            token_usage,
+            git_commit,
+            link_results,
+            quality_results,
         )
 
         return {
@@ -813,6 +828,52 @@ class DocPipeline:
             "components": component_results,
             "total_components": len(self.components),
             "docs_directory": docs_dir,
+        }
+
+    def _run_quality_checks(self, docs_dir: str) -> dict[str, Any]:
+        """Validate generated docs: mermaid syntax (hard check) and reference
+        statistics. Regex-only, runs over every .md — cheap enough to always
+        run."""
+        from repodoc.agent.quality import reference_stats, validate_mermaid
+
+        known_roots = {n.name for n in self.components.values() if n.name}
+
+        def _collect_module_names(nodes: dict) -> None:
+            for name, info in nodes.items():
+                known_roots.add(name)
+                children = info.get("children")
+                if isinstance(children, dict):
+                    _collect_module_names(children)
+
+        _collect_module_names(self.module_tree)
+
+        files_checked = 0
+        mermaid_problems: list[str] = []
+        project_refs = 0
+        external_refs = 0
+        for root, _dirs, files in os.walk(docs_dir):
+            for fname in files:
+                if not fname.endswith(".md"):
+                    continue
+                path = os.path.join(root, fname)
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+                files_checked += 1
+                rel = os.path.relpath(path, docs_dir)
+                for problem in validate_mermaid(content):
+                    mermaid_problems.append(f"{rel}: {problem}")
+                stats = reference_stats(content, known_roots)
+                project_refs += stats["project_refs"]
+                external_refs += stats["external_refs"]
+
+        return {
+            "files_checked": files_checked,
+            "mermaid_problems": mermaid_problems,
+            "project_refs": project_refs,
+            "external_refs": external_refs,
         }
 
     def _extract_concepts_safe(self, data_dir: str) -> None:
@@ -861,6 +922,7 @@ class DocPipeline:
         token_usage: dict[str, Any],
         git_commit: str | None,
         link_results: dict[str, Any],
+        quality_results: dict[str, Any] | None = None,
     ) -> None:
         """Save metadata to JSON and log operation."""
         metadata = {
@@ -889,6 +951,7 @@ class DocPipeline:
                 "files_fixed": len(link_results.get("fixed", [])),
                 "broken_links_removed": len(link_results.get("removed", [])),
             },
+            "quality": quality_results or {},
         }
         project_name = self.get_project_name()
         file_manager.save_json(

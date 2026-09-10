@@ -299,25 +299,31 @@ def analyze_git_diff(
 
     for file_path in changed_files:
         full_path = Path(repo_path) / file_path
+
+        spec = get_diff_spec(file_path)
+        if spec is None:
+            # Non-code file (md, json, ...) — does not affect API docs
+            continue
+
+        # Old content at the base commit (needed for both modified and
+        # deleted files).
+        show_cmd = ["git", "show", f"{base_commit or 'HEAD'}:{file_path}"]
+        show_result = subprocess.run(
+            show_cmd, cwd=repo_path, capture_output=True, text=True
+        )
+        old_content = show_result.stdout if show_result.returncode == 0 else ""
+
         if not full_path.exists():
-            # Deleted files: the component removal cannot be detected without
-            # the old content — skip (documented limitation)
+            # Deleted file: every component it defined at the base commit is
+            # REMOVED. Compare the old content against empty content — the
+            # analyzer reports all old components as removed.
+            if old_content:
+                analyses[file_path] = analyze_diff(file_path, old_content, "", spec)
             continue
 
         try:
             new_content = full_path.read_text()
         except Exception:
-            continue
-
-        show_cmd = ["git", "show", f"{base_commit or 'HEAD'}:{file_path}"]
-        result = subprocess.run(
-            show_cmd, cwd=repo_path, capture_output=True, text=True
-        )
-        old_content = result.stdout if result.returncode == 0 else ""
-
-        spec = get_diff_spec(file_path)
-        if spec is None:
-            # Non-code file (md, json, ...) — does not affect API docs
             continue
 
         analyses[file_path] = analyze_diff(file_path, old_content, new_content, spec)
@@ -773,6 +779,99 @@ def _resolve_cross_file_depends(
                     break
 
 
+def _mark_docs_deprecated(
+    docs_dir: str,
+    module_tree: dict,
+    components: dict[str, Node],
+    removed_ids: list[str],
+) -> list[str]:
+    """Prepend a deprecation notice to the deleted components' doc files.
+
+    File-level (no LLM call) — the component is gone, so a full regeneration
+    buys nothing. Returns the touched file paths."""
+    comp_modules = _collect_component_modules(module_tree)
+    touched: list[str] = []
+    for cid in removed_ids:
+        node = components.get(cid)
+        if not (node and node.name):
+            continue
+        chain = comp_modules.get(cid)
+        if not chain:
+            continue
+        path = os.path.join(docs_dir, *chain, f"{node.name}.md")
+        if not os.path.exists(path):
+            continue
+        try:
+            content = Path(path).read_text(encoding="utf-8")
+            if content.startswith("> ⚠️ **DEPRECATED**"):
+                continue
+            notice = (
+                f"> ⚠️ **DEPRECATED**: `{cid}` was removed from the code base.\n"
+                f"> This document is kept for historical reference.\n\n"
+            )
+            Path(path).write_text(notice + content, encoding="utf-8")
+            touched.append(path)
+        except Exception:
+            continue
+    return touched
+
+
+def _remove_components_from_tree(
+    graph: HeterogeneousGraph,
+    module_tree: dict,
+    components: dict[str, Node],
+    removed_ids: list[str],
+) -> set[str]:
+    """Drop deleted components from the module tree and the graph (code
+    nodes and every edge touching them). The graph reflects the CURRENT code
+    state. Returns module ids whose membership changed (their docs should be
+    regenerated)."""
+    from repodoc.graph.models import ModuleNode
+
+    removed = set(removed_ids)
+    affected_modules: set[str] = set()
+
+    def walk(nodes: dict, path: str) -> None:
+        for name, info in nodes.items():
+            cur = f"{path}/{name}" if path else name
+            members = info.get("components", [])
+            kept = [c for c in members if c not in removed]
+            if len(kept) != len(members):
+                info["components"] = kept
+                affected_modules.add(cur)
+            children = info.get("children")
+            if isinstance(children, dict):
+                walk(children, cur)
+
+    walk(module_tree, "")
+
+    for cid in removed:
+        graph.remove_node(cid)  # node + all its edges
+        components.pop(cid, None)
+
+    # Mirror the updated membership into the graph's ModuleNodes.
+    def find_info(nodes: dict, path: str, target: str) -> dict | None:
+        for name, info in nodes.items():
+            cur = f"{path}/{name}" if path else name
+            if cur == target:
+                return info
+            children = info.get("children")
+            if isinstance(children, dict):
+                found = find_info(children, cur, target)
+                if found is not None:
+                    return found
+        return None
+
+    for mod_id in affected_modules:
+        info = find_info(module_tree, "", mod_id)
+        node = graph.get_node(mod_id)
+        if info is not None and isinstance(node, ModuleNode):
+            node.components = list(info.get("components", []))
+            graph.add_module_node(node)
+
+    return affected_modules
+
+
 def _extract_new_component_nodes(
     change_map: dict[str, ComponentChange],
     config: Config,
@@ -1136,11 +1235,36 @@ async def run_update(
             )
         )
 
+    # Deleted components: mark their docs deprecated (file-level, no LLM),
+    # then drop them from the module tree and the graph. Modules that lost a
+    # member get their docs regenerated.
+    removed_ids = [
+        cid
+        for cid, ch in (change_map or {}).items()
+        if ch.change_type == ChangeType.REMOVED_COMPONENT
+    ]
+    removed_present = [cid for cid in removed_ids if cid in components_all]
+    removed_modules: set[str] = set()
+    if removed_present:
+        print(f"\n  Components deleted from the code ({len(removed_present)}):")
+        for cid in removed_present[:10]:
+            print(f"    - {cid}")
+        touched = _mark_docs_deprecated(
+            docs_dir, module_tree, components_all, removed_present
+        )
+        if touched:
+            print(f"    Marked {len(touched)} doc(s) as deprecated")
+        removed_modules = _remove_components_from_tree(
+            graph, module_tree, components_all, removed_present
+        )
+        pipeline.module_tree = module_tree
+
     comp_modules = _collect_component_modules(module_tree)
 
     # Affected set: impact callers + new components + existing components the
-    # new ones call (their docs should mention the new caller).
-    affected = set(impact["affected_components"])
+    # new ones call (their docs should mention the new caller). Deleted
+    # components are excluded — their docs were handled above.
+    affected = set(impact["affected_components"]) - set(removed_present)
     if new_nodes:
         affected.update(new_nodes.keys())
         for nid, node in new_nodes.items():
@@ -1175,8 +1299,6 @@ async def run_update(
                     source_code = extracted.get("source_code", source_code)
                     docstring = extracted.get("docstring", docstring)
                     parameters = extracted.get("parameters", parameters)
-            elif change_info.change_type == ChangeType.REMOVED_COMPONENT:
-                docstring = f"⚠️ DEPRECATED: This component was removed.\n\n{docstring}"
         else:
             # Downstream component — use current working tree
             if node.file_path:
@@ -1237,13 +1359,14 @@ async def run_update(
             + ("..." if len(still_failed) > 5 else "")
         )
 
-    # --- Module docs for modules that gained new members ---
+    # --- Module docs for modules whose membership changed ---
+    # (gained new components and/or lost deleted ones)
     affected_modules = {
         mid for cid, mid in assignment.items() if cid in new_nodes
-    }
+    } | removed_modules
     if affected_modules:
         print(
-            f"Regenerating {len(affected_modules)} module doc(s) with new members..."
+            f"Regenerating {len(affected_modules)} module doc(s) with changed membership..."
         )
         module_deps, module_dependents = _build_module_dependencies(
             components_all, module_tree
@@ -1331,6 +1454,7 @@ async def run_update(
                 metadata["update_info"]["new_component_modules"] = sorted(
                     set(assignment.values())
                 )
+                metadata["update_info"]["removed_components"] = removed_present
                 metadata["generation_info"]["timestamp"] = datetime.now().isoformat()
                 file_manager.save_json(metadata, metadata_path)
         except Exception as e:
