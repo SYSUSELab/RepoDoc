@@ -163,13 +163,6 @@ class HeterogeneousGraph:
             return None
         return dict(self._g.edges[source_id, target_id])
 
-    def remove_node(self, node_id: str) -> None:
-        """Remove a node and every edge touching it (networkx semantics).
-        Used by incremental update to drop components deleted from the code —
-        the graph reflects the CURRENT code state."""
-        if self._g.has_node(node_id):
-            self._g.remove_node(node_id)
-
     def remove_out_edges(
         self, node_id: str, relation_type: str | None = None
     ) -> None:
