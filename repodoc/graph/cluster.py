@@ -8,7 +8,7 @@ Two strategies (config.cluster_strategy):
 import json
 import logging
 import os
-import re
+import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Tuple
@@ -39,6 +39,8 @@ MIN_COMPONENTS_FOR_RECURSION = 40
 # concurrent requests and ~87% of batches returned empty responses. A single
 # process-wide semaphore caps ALL LLM calls (top-level and recursive).
 MAX_BATCH_WORKERS = 16
+MAX_CONCURRENT_LLM_CALLS = 16
+_LLM_CALL_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_LLM_CALLS)
 # Only skip clustering when content is small AND we have few leaves (avoid one big module for medium projects).
 # Keep low: at 25, atcher (18 leaves) skipped LLM clustering entirely and
 # lost its config/core/services module split.
@@ -267,11 +269,21 @@ def _call_llm_with_retry(
 ) -> Tuple[str, Dict[str, Any]]:
     """Call LLM with retry on parse failure, using lower temperature.
 
-    Concurrency is governed by the shared AdaptiveLimiter inside
-    call_llm (it serializes batch pools and recursive single calls alike —
-    nested thread pools would otherwise multiply concurrent requests,
-    libevent: dozens concurrent -> ~87% empty responses).
+    The process-wide semaphore serializes ALL clustering LLM calls (batch
+    pools and recursive single calls alike) — nested thread pools would
+    otherwise multiply concurrent requests (libevent: dozens concurrent ->
+    ~87% empty responses).
     """
+    with _LLM_CALL_SEMAPHORE:
+        return _call_llm_with_retry_locked(prompt, config, max_retries)
+
+
+def _call_llm_with_retry_locked(
+    prompt: str,
+    config: Config,
+    max_retries: int = 2,
+) -> Tuple[str, Dict[str, Any]]:
+    """Internal: the retry loop, run under the global LLM semaphore."""
     last_error = None
     last_response = ""
 
@@ -909,214 +921,3 @@ def cluster_modules(
     if is_outermost:
         tree = _validate_and_backfill(tree, leaf_nodes, components)
     return tree
-
-
-# ---------------------------------------------------------------------------
-# Incremental assignment (new components -> existing module tree)
-# ---------------------------------------------------------------------------
-
-ASSIGN_NEW_COMPONENT_PROMPT = """
-You are a code analysis assistant. New components were added to a repository
-whose module structure already exists. Assign each new component to a module.
-
-## Existing modules (id: source path, member count)
-{module_lines}
-
-## New components to assign
-{component_lines}
-
-## Rules
-1. Assign each new component to the most fitting EXISTING module id (ids are
-   tree paths like "net/http")
-2. Only create a new module when NO existing module fits (e.g. an entirely
-   new domain)
-3. A new module must have: "name" (short, descriptive) and "path" (a REAL
-   directory containing at least one new component's file)
-4. Include EVERY new component exactly once
-
-## Output format (ONLY valid JSON, no explanation):
-{{
-    "component.id": "existing_module_id",
-    "other.component.id": {{"new_module": {{"name": "name", "path": "dir"}}}}
-}}
-""".strip()
-
-
-def _match_module_by_path(module_items: list[tuple[str, str, int]], comp_dir: str) -> str | None:
-    """Return the DEEPEST module id whose source path is an ancestor of
-    comp_dir (or equals it). None when nothing matches."""
-    best_id: str | None = None
-    best_len = -1
-    for mid, mpath, _count in module_items:
-        if not mpath or mpath == ".":
-            continue
-        mpath_norm = mpath.rstrip("/")
-        if comp_dir == mpath_norm or comp_dir.startswith(mpath_norm + "/"):
-            if len(mpath_norm) > best_len:
-                best_id, best_len = mid, len(mpath_norm)
-    return best_id
-
-
-def _longest_common_prefix_len(a: str, b: str) -> int:
-    """Number of equal leading path segments (0 when roots differ)."""
-    pa, pb = a.split("/"), b.split("/")
-    n = 0
-    for x, y in zip(pa, pb):
-        if x != y:
-            break
-        n += 1
-    return n
-
-
-def _assign_with_llm(
-    unmatched: list[str],
-    new_nodes: Dict[str, Node],
-    module_items: list[tuple[str, str, int]],
-    config: Config,
-) -> dict[str, Any]:
-    """One batch LLM call deciding where unmatched components belong.
-
-    Returns a dict {component_id: "module_id" | {"new_module": {...}}}.
-    Empty dict when the call fails or the response is unparsable."""
-    module_lines = "\n".join(
-        f"- {mid} (path: {mpath or 'unknown'}, {count} components)"
-        for mid, mpath, count in module_items
-    )
-    lines = []
-    for cid in unmatched:
-        n = new_nodes[cid]
-        lines.append(
-            f"- {cid}: file {n.relative_path or n.file_path}, "
-            f"docstring: {(n.docstring or '')[:200]}"
-        )
-    component_lines = "\n".join(lines)
-    prompt = ASSIGN_NEW_COMPONENT_PROMPT.format(
-        module_lines=module_lines, component_lines=component_lines
-    )
-    try:
-        response, _ = call_llm(prompt, config, temperature=0.0, max_tokens=2048)
-        try:
-            parsed = json.loads(response)
-        except json.JSONDecodeError:
-            match = re.search(r"\{.*\}", response, re.DOTALL)
-            if not match:
-                return {}
-            parsed = json.loads(match.group())
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception as e:
-        logger.warning(f"Incremental assignment LLM call failed: {e}")
-    return {}
-
-
-def assign_new_components(
-    module_tree: Dict[str, Any],
-    new_nodes: Dict[str, Node],
-    config: Config,
-) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    """Incrementally assign NEW components to the existing module tree.
-
-    Never re-clusters: existing module boundaries and memberships are
-    untouched; every new component either joins the deepest module whose
-    source path contains its file (free, deterministic), or is assigned by a
-    single LLM batch call (which may create a new module when nothing fits),
-    or falls back deterministically (longest common directory prefix, then
-    the component's own first directory as a new module).
-
-    Returns (updated module tree, component_id -> module_id assignment)."""
-    module_items: list[tuple[str, str, int]] = []
-
-    def walk(nodes: dict, prefix: str) -> None:
-        for name, info in nodes.items():
-            cur = f"{prefix}/{name}" if prefix else name
-            module_items.append(
-                (cur, info.get("path", ""), len(info.get("components", [])))
-            )
-            children = info.get("children")
-            if isinstance(children, dict):
-                walk(children, cur)
-
-    walk(module_tree, "")
-
-    assignment: Dict[str, str] = {}
-
-    # 1. Deterministic path matching (deepest containing module).
-    unmatched: list[str] = []
-    for cid, node in new_nodes.items():
-        comp_dir = os.path.dirname(node.relative_path or node.file_path or "")
-        mid = _match_module_by_path(module_items, comp_dir)
-        if mid is not None:
-            assignment[cid] = mid
-        else:
-            unmatched.append(cid)
-
-    # 2. One LLM batch call for components no module path contains.
-    if unmatched:
-        llm_assignment = _assign_with_llm(unmatched, new_nodes, module_items, config)
-        existing_ids = {mid for mid, _p, _c in module_items}
-        top_level_names = set(module_tree.keys())
-        for cid in list(unmatched):
-            target = llm_assignment.get(cid)
-            if isinstance(target, str) and target in existing_ids:
-                assignment[cid] = target
-                unmatched.remove(cid)
-            elif isinstance(target, dict) and isinstance(target.get("new_module"), dict):
-                info = target["new_module"]
-                name = str(info.get("name", "")).strip()
-                path = str(info.get("path", "")).strip()
-                if not name or not path:
-                    continue
-                while name in top_level_names:
-                    name = f"{name}_2"  # avoid clobbering an existing module
-                module_tree[name] = {
-                    "path": path,
-                    "components": [cid],
-                    "children": {},
-                }
-                top_level_names.add(name)
-                assignment[cid] = name
-                unmatched.remove(cid)
-
-    # 3. Deterministic fallback: longest common directory prefix; else the
-    #    component's own first directory becomes a new top-level module.
-    for cid in unmatched:
-        node = new_nodes[cid]
-        comp_dir = os.path.dirname(node.relative_path or node.file_path or "")
-        if comp_dir:
-            best_id: str | None = None
-            best_len = 0
-            for mid, mpath, _count in module_items:
-                if not mpath or mpath == ".":
-                    continue
-                lcp = _longest_common_prefix_len(comp_dir, mpath)
-                if lcp > best_len:
-                    best_id, best_len = mid, lcp
-            if best_id is not None:
-                assignment[cid] = best_id
-                continue
-        # Own first directory as a new top-level module.
-        parts = comp_dir.split("/") if comp_dir else []
-        name = parts[0] if parts else "core"
-        while name in top_level_names:
-            name = f"{name}_2"
-        module_tree[name] = {
-            "path": comp_dir or ".",
-            "components": [cid],
-            "children": {},
-        }
-        top_level_names.add(name)
-        assignment[cid] = name
-
-    # Persist membership into the tree so it stays the single source.
-    # Module ids are tree paths ("core/http"): intermediate levels live
-    # under the parent's "children" key, the last segment is the module.
-    for cid, mid in assignment.items():
-        parts = mid.split("/")
-        target = module_tree
-        for part in parts[:-1]:
-            target = target[part]["children"]
-        target = target[parts[-1]]
-        if cid not in target["components"]:
-            target["components"].append(cid)
-
-    return module_tree, assignment

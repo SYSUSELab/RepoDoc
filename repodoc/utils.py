@@ -382,10 +382,3 @@ __all__ = [
     "safe_open_text",
     "assert_safe_path",
 ]
-
-
-def project_name(repo_path: str) -> str:
-    """Safe project name derived from the repo directory name
-    (non-alphanumeric chars replaced with '_')."""
-    repo_name = os.path.basename(os.path.normpath(repo_path))
-    return "".join(c if c.isalnum() else "_" for c in repo_name)

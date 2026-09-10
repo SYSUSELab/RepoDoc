@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from repodoc.config import Config
-from repodoc.llm import call_llm_async
+from repodoc.llm import TokenUsage, call_llm_async, get_llm_client
 
 
 class ToolResult:
@@ -19,6 +19,23 @@ class ToolResult:
         if self.success:
             return f"ToolResult(success=True, output={self.output})"
         return f"ToolResult(success=False, error={self.error})"
+
+
+class FileReaderTool:
+    name = "file_reader"
+    description = "Read file content from the repository"
+
+    async def execute(self, file_path: str, **kwargs) -> ToolResult:
+        try:
+            if not os.path.exists(file_path):
+                return ToolResult(success=False, error=f"File not found: {file_path}")
+
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            return ToolResult(success=True, output=content)
+        except Exception as e:
+            return ToolResult(success=False, error=str(e))
 
 
 class FileWriterTool:
@@ -41,6 +58,11 @@ class LLMTool:
 
     def __init__(self, config: Config):
         self.config = config
+
+    def get_token_usage_history(self) -> list[TokenUsage]:
+        """Token history lives on the shared LLM client, so clustering and
+        concept-extraction calls are counted too."""
+        return get_llm_client(self.config).history
 
     async def execute(
         self,

@@ -48,11 +48,9 @@ class Config:
         if self.dependency_graph_dir is None:
             self.dependency_graph_dir = os.path.join(self.output_dir, "data")
         if self.docs_dir is None:
-            from repodoc.utils import project_name
-
-            self.docs_dir = os.path.join(
-                self.output_dir, "docs", f"{project_name(self.repo_path)}-docs"
-            )
+            repo_name = os.path.basename(os.path.normpath(self.repo_path))
+            safe_name = "".join(c if c.isalnum() else "_" for c in repo_name)
+            self.docs_dir = os.path.join(self.output_dir, "docs", f"{safe_name}-docs")
         if self.cluster_strategy not in ("llm", "heuristic"):
             raise ValueError(
                 f"cluster_strategy must be 'llm' or 'heuristic', got {self.cluster_strategy!r}"

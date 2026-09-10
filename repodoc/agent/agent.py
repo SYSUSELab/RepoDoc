@@ -116,15 +116,16 @@ class DocAgent:
         component_count = input_data.get("component_count", 0)
         module_count = input_data.get("module_count", 0)
         module_dependencies = input_data.get("module_dependencies", {})
-        # Already a budgeted string (budget_context) — never a raw dict.
-        module_docs_summary = input_data.get("module_docs_summary", "")
+        module_docs_summary = input_data.get("module_docs_summary", {})
 
         system_prompt, user_prompt = format_overview_prompt(
             repo_name=repo_name,
             component_count=component_count,
             module_count=module_count,
             module_dependencies=module_dependencies,
-            module_docs_summary=module_docs_summary,
+            module_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in module_docs_summary.items()
+            ),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -147,7 +148,6 @@ class DocAgent:
             dependencies=list(component.get("depends_on", set())),
             predecessors=list(predecessors),
             module_name=module_name,
-            predecessor_details=input_data.get("predecessor_details", ""),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -170,9 +170,12 @@ class DocAgent:
             module_dependencies=input_data.get("module_dependencies", []),
             dependent_modules=input_data.get("dependent_modules", []),
             sub_modules=input_data.get("sub_modules", []),
-            # Already budgeted strings (budget_context) — never raw dicts.
-            component_docs_summary=input_data.get("component_docs", ""),
-            children_docs_summary=input_data.get("children_docs", ""),
+            component_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("component_docs", {}).items()
+            ),
+            children_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("children_docs", {}).items()
+            ),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)

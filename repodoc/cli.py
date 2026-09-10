@@ -41,9 +41,8 @@ def make_config(
 
 def get_project_name(repo_path: str) -> str:
     """Extract safe project name from repo path."""
-    from repodoc.utils import project_name
-
-    return project_name(repo_path)
+    repo_name = os.path.basename(os.path.normpath(repo_path))
+    return "".join(c if c.isalnum() else "_" for c in repo_name)
 
 
 def _build_and_save_graph(

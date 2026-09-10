@@ -126,29 +126,11 @@ _LIMITER = AdaptiveLimiter()
 
 
 class LLMClient:
-    """Async LLM client with token usage history, shared per (base_url, api_key).
-
-    The underlying AsyncOpenAI client is created lazily ONCE per LLMClient
-    (the module-level _clients dict dedups by endpoint), so hundreds of
-    doc-generation calls reuse one HTTP connection instead of paying a
-    TLS handshake each time.
-    """
+    """Async LLM client with token usage history, shared per (base_url, api_key)."""
 
     def __init__(self, config: "Config"):
         self.config = config
         self.history: list[TokenUsage] = []
-        self._openai = None
-
-    def _get_openai(self):
-        if self._openai is None:
-            from openai import AsyncOpenAI
-
-            self._openai = AsyncOpenAI(
-                base_url=self.config.llm_base_url,
-                api_key=self.config.llm_api_key,
-                max_retries=1,  # SDK does one quick retry; backoff is ours
-            )
-        return self._openai
 
     async def complete(
         self,
@@ -164,11 +146,16 @@ class LLMClient:
         "json_object" (None = default free-form output). Endpoints that do
         not support it fail with APIError and fall back automatically.
         """
+        from openai import AsyncOpenAI
         from openai import APIError
 
         if model is None:
             model = self.config.main_model
-        client = self._get_openai()
+        client = AsyncOpenAI(
+            base_url=self.config.llm_base_url,
+            api_key=self.config.llm_api_key,
+            max_retries=1,  # SDK does one quick retry; backoff is ours
+        )
 
         if len(prompt) > _MAX_PROMPT_CHARS:
             logger.warning(
@@ -192,17 +179,14 @@ class LLMClient:
         except APIError as e:
             logger.error(f"API Error: {e}")
             # Config errors (4xx other than 408/429) never recover: no retry.
-            # 408/429 ARE retryable (timeout / rate limit). APITimeoutError
-            # and other connection errors carry NO status_code — they are
-            # always retryable.
-            status = getattr(e, "status_code", None)
+            # 408/429 ARE retryable (timeout / rate limit).
             if (
-                status is not None
-                and 400 <= status < 500
-                and status not in (408, 429)
+                e.status_code is not None
+                and 400 <= e.status_code < 500
+                and e.status_code not in (408, 429)
             ):
                 raise
-            # Transient errors (429/5xx/timeouts/connection): exponential backoff.
+            # Transient errors (429/5xx/timeouts): exponential backoff.
             last_error = e
             success = False
             for attempt in range(_BACKOFF_MAX_RETRIES):
@@ -225,11 +209,10 @@ class LLMClient:
                     break
                 except APIError as e2:
                     last_error = e2
-                    status = getattr(e2, "status_code", None)
                     if (
-                        status is not None
-                        and 400 <= status < 500
-                        and status not in (408, 429)
+                        e2.status_code is not None
+                        and 400 <= e2.status_code < 500
+                        and e2.status_code not in (408, 429)
                     ):
                         raise
             if not success:
@@ -244,8 +227,8 @@ class LLMClient:
                         pass
                 if not success:
                     raise last_error
-        # NOTE: the AsyncOpenAI client is intentionally NOT closed — it is
-        # cached on the LLMClient and reused across calls (connection reuse).
+        finally:
+            await client.close()
 
         usage = response.usage
         token_usage: TokenUsage = {

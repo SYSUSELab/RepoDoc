@@ -17,7 +17,7 @@ from repodoc.config import Config
 from repodoc.graph.analyzers import EXTENSION_MAP, analyze_file
 from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import REL_CALLS, CallRelationship, CodeNode, Node
-from repodoc.utils import file_manager, project_name, safe_open_text
+from repodoc.utils import file_manager, safe_open_text
 
 logger = logging.getLogger(__name__)
 
@@ -440,7 +440,8 @@ class DependencyGraphBuilder:
         kg_output_path: str | None = None,
     ) -> Tuple[Dict[str, Node], List[str]]:
         file_manager.ensure_directory(self.config.dependency_graph_dir)
-        sanitized = project_name(self.config.repo_path)
+        repo_name = os.path.basename(os.path.normpath(self.config.repo_path))
+        sanitized = "".join(c if c.isalnum() else "_" for c in repo_name)
         dependency_graph_path = os.path.join(
             self.config.dependency_graph_dir,
             f"{sanitized}_dependency_graph.json",

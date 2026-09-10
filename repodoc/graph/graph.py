@@ -163,18 +163,6 @@ class HeterogeneousGraph:
             return None
         return dict(self._g.edges[source_id, target_id])
 
-    def remove_out_edges(
-        self, node_id: str, relation_type: str | None = None
-    ) -> None:
-        """Remove all out-edges from the node, optionally filtered by relation
-        type (e.g. only calls edges). Used by incremental update to refresh a
-        component's dependency edges after its source changed."""
-        if not self._g.has_node(node_id):
-            return
-        for _s, t, attrs in list(self._g.out_edges(node_id, data=True)):
-            if relation_type is None or attrs.get("relation_type") == relation_type:
-                self._g.remove_edge(node_id, t)
-
     def save(self, path: str | Path) -> None:
         """Persist graph to a JSON file (nodes and edges)."""
         path = Path(path)
