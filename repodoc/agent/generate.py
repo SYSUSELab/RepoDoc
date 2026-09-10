@@ -141,6 +141,43 @@ class DocPipeline:
         self.module_tree = {}
         self._start_time = None
         self._generated_files = []
+        self._skipped_docs = {"component": 0, "module": 0, "overview": 0}
+
+    def _already_generated(self, target_id: str) -> bool:
+        """True when a doc for this component/module was already generated:
+        the graph carries a precise describes edge to a DocNode whose file is
+        still on disk. Makes generation resumable — a re-run after an
+        interrupt only generates what is missing (unless force_regenerate)."""
+        if not self.graph or not self.graph.has_node(target_id):
+            return False
+        from repodoc.graph.models import REL_DESCRIBES, DocNode
+
+        for pred in self.graph.predecessors(target_id):
+            edge = self.graph.get_edge_data(pred, target_id)
+            if not edge or edge.get("relation_type") != REL_DESCRIBES:
+                continue
+            node = self.graph.get_node(pred)
+            if (
+                isinstance(node, DocNode)
+                and node.file_path
+                and os.path.exists(node.file_path)
+            ):
+                return True
+        return False
+
+    def _overview_generated(self) -> bool:
+        """True when the overview README was already generated (the overview
+        DocNode has no describes edge — id is the fixed 'overview')."""
+        if not self.graph or not self.graph.has_node("overview"):
+            return False
+        from repodoc.graph.models import DocNode
+
+        node = self.graph.get_node("overview")
+        return (
+            isinstance(node, DocNode)
+            and bool(node.file_path)
+            and os.path.exists(node.file_path)
+        )
 
     def get_data_dir(self) -> str:
         return os.path.join(self.config.output_dir, "data")
@@ -410,11 +447,21 @@ class DocPipeline:
 
         results = []
 
+        async def _skip_coro():
+            return None
+
         # Bottom-up: deepest modules first (reverse depth order)
         for depth in sorted(depth_groups.keys(), reverse=True):
             modules_at_depth = depth_groups[depth]
 
             def make_task(module_name, module_info, full_path):
+                # Resumable generation: already-generated module docs are
+                # skipped (graph describes edge + file on disk).
+                if not self.config.force_regenerate and self._already_generated(
+                    full_path
+                ):
+                    self._skipped_docs["module"] += 1
+                    return _skip_coro()
                 return self._generate_single_module_doc(
                     module_name,
                     module_info,
@@ -645,6 +692,16 @@ class DocPipeline:
             for comp_id, chain in sorted(comp_modules.items())
             if comp_id in self.components
         ]
+        if not self.config.force_regenerate:
+            # Resumable generation: components whose docs already exist
+            # (graph describes edge + file on disk) are skipped.
+            pending = []
+            for j in jobs:
+                if self._already_generated(j[0]):
+                    self._skipped_docs["component"] += 1
+                else:
+                    pending.append(j)
+            jobs = pending
         results, still_failed = await run_with_retry(
             jobs, lambda j: _run(*j), "component docs"
         )
@@ -697,28 +754,44 @@ class DocPipeline:
 
         self._start_time = time.time()
         self._generated_files = []
+        self._skipped_docs = {"component": 0, "module": 0, "overview": 0}
 
         module_tree = self.load_module_tree()
+
+        def _skip_note(kind: str) -> str:
+            n = self._skipped_docs[kind]
+            return f" ({n} already generated, skipped)" if n else ""
 
         # Layer 1: all component docs (parallel)
         component_results = await self.generate_component_docs(
             docs_dir=docs_dir, module_tree=module_tree
         )
-        print(f"Layer 1: {len(component_results)} component docs")
+        print(
+            f"Layer 1: {len(component_results)} component docs"
+            + _skip_note("component")
+        )
         self._save_graph_safe()  # graph now carries code + component docs
 
         # Layer 2: module docs, bottom-up (leaf modules first)
         module_results = await self._generate_module_docs_safe()
-        print(f"Layer 2: {len(module_results)} module docs")
+        print(
+            f"Layer 2: {len(module_results)} module docs" + _skip_note("module")
+        )
         self._save_graph_safe()  # + module docs
 
         # Layer 3: overview README
-        overview_result = await self._generate_overview_safe(
-            os.path.join(docs_dir, "README.md")
-        )
-        if overview_result is not None and getattr(overview_result, "success", False):
-            self._add_doc_to_graph(overview_result)  # overview doc node
-        print("Layer 3: overview README")
+        if not self.config.force_regenerate and self._overview_generated():
+            self._skipped_docs["overview"] += 1
+            overview_result = None
+        else:
+            overview_result = await self._generate_overview_safe(
+                os.path.join(docs_dir, "README.md")
+            )
+            if overview_result is not None and getattr(
+                overview_result, "success", False
+            ):
+                self._add_doc_to_graph(overview_result)  # overview doc node
+        print("Layer 3: overview README" + _skip_note("overview"))
 
         self._save_graph_safe()
         self._extract_concepts_safe(data_dir)

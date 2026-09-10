@@ -40,6 +40,9 @@ class Config:
     # Ablation switches: cluster_strategy / doc_strategy
     cluster_strategy: str = "llm"  # "llm" | "heuristic"
     doc_strategy: str = "agent"  # "agent" | "direct"
+    # Resumable generation: when False (default), docs that are already
+    # generated (graph describes edge + file on disk) are skipped on re-runs.
+    force_regenerate: bool = False
 
     def __post_init__(self) -> None:
         self.llm_base_url = _strip_chat_completions_suffix(self.llm_base_url)
