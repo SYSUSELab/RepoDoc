@@ -34,9 +34,6 @@ class Config:
     llm_api_key: str = "sk-1234"
     main_model: str = "deepseek-chat"
     cluster_model: str | None = None  # defaults to main_model
-    # Optional LLM-based concept extraction (enhances keyword matching)
-    llm_concept_extraction: bool = False  # set True for LLM-enhanced concept extraction
-    llm_concept_max_components: int = 100  # max components to process with LLM (cost control)
     # Ablation switches: cluster_strategy / doc_strategy
     cluster_strategy: str = "llm"  # "llm" | "heuristic"
     doc_strategy: str = "agent"  # "agent" | "direct"

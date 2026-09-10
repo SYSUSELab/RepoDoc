@@ -1,7 +1,7 @@
 """
 Repository knowledge graph: models, heterogeneous graph, and graph building.
 
-Public API: Node/CallRelationship (analysis), CodeNode/DocNode/ConceptNode and
+Public API: Node/CallRelationship (analysis), CodeNode/DocNode/ModuleNode and
 relation constants (graph), HeterogeneousGraph, build_graph_from_analysis,
 DependencyGraphBuilder.
 
@@ -18,11 +18,9 @@ from repodoc.graph.models import (
     REL_CALLS,
     REL_DESCRIBES,
     REL_IMPLEMENTS,
-    REL_SEMANTIC_IMPACT,
     RELATION_TYPES,
     CallRelationship,
     CodeNode,
-    ConceptNode,
     DocNode,
     Node,
 )
@@ -32,13 +30,11 @@ __all__ = [
     "build_graph_from_analysis",
     "HeterogeneousGraph",
     "CodeNode",
-    "ConceptNode",
     "DocNode",
     "Node",
     "CallRelationship",
     "REL_CALLS",
     "REL_DESCRIBES",
     "REL_IMPLEMENTS",
-    "REL_SEMANTIC_IMPACT",
     "RELATION_TYPES",
 ]

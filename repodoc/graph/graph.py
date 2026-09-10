@@ -1,5 +1,5 @@
 """
-Heterogeneous knowledge graph: CodeNode, DocNode, ConceptNode with typed edges.
+Heterogeneous knowledge graph: CodeNode, DocNode, ModuleNode with typed edges.
 
 Backed by NetworkX DiGraph; supports add/query nodes and edges, and JSON save/load.
 """
@@ -13,18 +13,17 @@ import networkx as nx
 from repodoc.graph.models import (
     RELATION_TYPES,
     CodeNode,
-    ConceptNode,
     DocNode,
     ModuleNode,
 )
 
-NodeType = Literal["code", "doc", "concept", "module"]
-NodeLike = CodeNode | DocNode | ConceptNode | ModuleNode
+NodeType = Literal["code", "doc", "module"]
+NodeLike = CodeNode | DocNode | ModuleNode
 
 
 class HeterogeneousGraph:
     """
-    Heterogeneous graph over code, doc, and concept nodes with typed, weighted edges.
+    Heterogeneous graph over code, doc, and module nodes with typed, weighted edges.
 
     Node id is a global string. Edges carry relation_type and weight for propagation.
     """
@@ -48,14 +47,6 @@ class HeterogeneousGraph:
             data=node.model_dump(),
         )
 
-    def add_concept_node(self, node: ConceptNode) -> None:
-        """Add or overwrite a ConceptNode by id."""
-        self._g.add_node(
-            node.id,
-            node_type="concept",
-            data=node.model_dump(),
-        )
-
     def add_module_node(self, node: ModuleNode) -> None:
         """Add or overwrite a ModuleNode by id."""
         self._g.add_node(
@@ -64,8 +55,8 @@ class HeterogeneousGraph:
             data=node.model_dump(),
         )
 
-    def get_node(self, node_id: str) -> CodeNode | DocNode | ConceptNode | ModuleNode | None:
-        """Return the node as CodeNode, DocNode, ConceptNode, or ModuleNode; None if missing."""
+    def get_node(self, node_id: str) -> CodeNode | DocNode | ModuleNode | None:
+        """Return the node as CodeNode, DocNode, or ModuleNode; None if missing."""
         if not self._g.has_node(node_id):
             return None
         attrs = self._g.nodes[node_id]
@@ -75,8 +66,6 @@ class HeterogeneousGraph:
             return CodeNode.model_validate(data)
         if node_type == "doc":
             return DocNode.model_validate(data)
-        if node_type == "concept":
-            return ConceptNode.model_validate(data)
         if node_type == "module":
             return ModuleNode.model_validate(data)
         return None
@@ -88,9 +77,9 @@ class HeterogeneousGraph:
     def get_nodes_by_type(
         self,
         node_type: NodeType,
-    ) -> list[CodeNode | DocNode | ConceptNode]:
-        """Return all nodes of the given type (code, doc, or concept)."""
-        out: list[CodeNode | DocNode | ConceptNode] = []
+    ) -> list[CodeNode | DocNode | ModuleNode]:
+        """Return all nodes of the given type (code, doc, or module)."""
+        out: list[CodeNode | DocNode | ModuleNode] = []
         for nid, attrs in self._g.nodes(data=True):
             if attrs.get("node_type") != node_type:
                 continue

@@ -744,7 +744,6 @@ class DocPipeline:
         print("Layer 3: overview README")
 
         self._save_graph_safe()
-        self._extract_concepts_safe(data_dir)
 
         link_results = validate_and_fix_links(docs_dir)
         all_files = self._collect_generated_files(docs_dir, data_dir)
@@ -765,18 +764,9 @@ class DocPipeline:
             "docs_directory": docs_dir,
         }
 
-    def _extract_concepts_safe(self, data_dir: str) -> None:
-        """Extract concepts into the graph (keyword or LLM-enhanced), ignoring errors."""
-        try:
-            from repodoc.graph.concepts import extract_concepts
-
-            extract_concepts(self.graph, self.components, self.config, data_dir)
-        except Exception as e:
-            print(f"Warning: Concept extraction failed: {e}")
-
     def _collect_token_usage(self) -> dict[str, Any]:
-        """Collect token usage from the shared LLM client (covers clustering,
-        concept extraction, and doc generation)."""
+        """Collect token usage from the shared LLM client (covers clustering
+        and doc generation)."""
         from repodoc.llm import total_token_usage
 
         usage = total_token_usage(self.config)

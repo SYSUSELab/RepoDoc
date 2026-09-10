@@ -3,7 +3,7 @@ Data models for the repository knowledge graph.
 
 Two families live here:
 - Analysis models: Node (code component), CallRelationship (parser output).
-- Graph models: CodeNode / DocNode / ConceptNode and relation constants
+- Graph models: CodeNode / DocNode / ModuleNode and relation constants
   (nodes and typed edges stored in the HeterogeneousGraph).
 
 Note: CodeNode.type (KG) and Node.component_type (analysis) carry the same
@@ -51,11 +51,10 @@ class CallRelationship(BaseModel):
 # ---------------------------------------------------------------------------
 
 # Relation type constants for graph edges
-# (design: calls, implements, describes, semantic_impact + module structure).
+# (design: calls, implements, describes + module structure).
 REL_CALLS = "calls"
 REL_IMPLEMENTS = "implements"
 REL_DESCRIBES = "describes"
-REL_SEMANTIC_IMPACT = "semantic_impact"
 # Module clustering edges: contains (module -> component / child module),
 # depends_on (module -> module, cross-module call aggregation).
 REL_CONTAINS = "contains"
@@ -65,7 +64,6 @@ RELATION_TYPES = (
     REL_CALLS,
     REL_IMPLEMENTS,
     REL_DESCRIBES,
-    REL_SEMANTIC_IMPACT,
     REL_CONTAINS,
     REL_DEPENDS_ON,
 )
@@ -101,15 +99,6 @@ class DocNode(BaseModel):
     format: str  # e.g. "markdown", "mermaid"
     version: int = 1
     file_path: Optional[str] = None
-
-
-class ConceptNode(BaseModel):
-    """Business concept extracted from comments, naming, or commit messages."""
-
-    id: str
-    concept: str
-    context: str = ""
-    confidence: float = 1.0  # 0.0 to 1.0
 
 
 class ModuleNode(BaseModel):

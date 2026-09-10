@@ -60,8 +60,8 @@ class LLMTool:
         self.config = config
 
     def get_token_usage_history(self) -> list[TokenUsage]:
-        """Token history lives on the shared LLM client, so clustering and
-        concept-extraction calls are counted too."""
+        """Token history lives on the shared LLM client, so clustering
+        calls are counted too."""
         return get_llm_client(self.config).history
 
     async def execute(

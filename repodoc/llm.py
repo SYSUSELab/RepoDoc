@@ -1,7 +1,7 @@
 """LLM calls (OpenAI-compatible API). Used by clustering and doc generation.
 
 Single implementation lives in LLMClient (async). All calls — doc generation,
-clustering, concept extraction — record token usage into a per-endpoint client
+clustering, summarization — record token usage into a per-endpoint client
 so metadata/ablation statistics never miss a call.
 """
 

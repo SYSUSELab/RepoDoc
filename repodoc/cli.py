@@ -19,8 +19,6 @@ from repodoc.utils import file_manager
 def make_config(
     repo_path: str,
     output_dir: str = "output",
-    llm_concept_extraction: bool = False,
-    llm_concept_max_components: int = 100,
     cluster_strategy: str = "llm",
     doc_strategy: str = "agent",
 ) -> Config:
@@ -32,8 +30,6 @@ def make_config(
         main_model=os.getenv("MAIN_MODEL", "deepseek-chat"),
         cluster_model=os.getenv("CLUSTER_MODEL")
         or os.getenv("MAIN_MODEL", "deepseek-chat"),
-        llm_concept_extraction=llm_concept_extraction,
-        llm_concept_max_components=llm_concept_max_components,
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
     )
@@ -170,16 +166,6 @@ def analyze(
 @click.option("-o", "--output-dir", default="output", help="Output directory")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
 @click.option(
-    "--llm-concept-extraction",
-    is_flag=True,
-    help="Enable LLM-enhanced concept extraction (higher quality but more token usage)",
-)
-@click.option(
-    "--llm-concept-max-components",
-    default=100,
-    help="Max components to process with LLM for concept extraction (default: 100)",
-)
-@click.option(
     "--cluster-strategy",
     type=click.Choice(["llm", "heuristic"], case_sensitive=False),
     default="llm",
@@ -195,8 +181,6 @@ def docs(
     repo_path: str,
     output_dir: str,
     verbose: bool,
-    llm_concept_extraction: bool,
-    llm_concept_max_components: int,
     cluster_strategy: str,
     doc_strategy: str,
 ):
@@ -207,8 +191,6 @@ def docs(
     config = make_config(
         repo_path,
         output_dir,
-        llm_concept_extraction=llm_concept_extraction,
-        llm_concept_max_components=llm_concept_max_components,
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
     )
@@ -233,16 +215,6 @@ def docs(
 @click.option("-o", "--output-dir", default="output", help="Output directory")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
 @click.option(
-    "--llm-concept-extraction",
-    is_flag=True,
-    help="Enable LLM-enhanced concept extraction (higher quality but more token usage)",
-)
-@click.option(
-    "--llm-concept-max-components",
-    default=100,
-    help="Max components to process with LLM for concept extraction (default: 100)",
-)
-@click.option(
     "--cluster-strategy",
     type=click.Choice(["llm", "heuristic"], case_sensitive=False),
     default="llm",
@@ -258,8 +230,6 @@ def generate(
     repo_path: str,
     output_dir: str,
     verbose: bool,
-    llm_concept_extraction: bool,
-    llm_concept_max_components: int,
     cluster_strategy: str,
     doc_strategy: str,
 ):
@@ -270,8 +240,6 @@ def generate(
     config = make_config(
         repo_path,
         output_dir,
-        llm_concept_extraction=llm_concept_extraction,
-        llm_concept_max_components=llm_concept_max_components,
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
     )
