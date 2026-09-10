@@ -171,6 +171,11 @@ def analyze(
 @click.option("-o", "--output-dir", default="output", help="Output directory")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
 @click.option(
+    "--force",
+    is_flag=True,
+    help="Regenerate every doc, even ones already generated (default: skip existing)",
+)
+@click.option(
     "--llm-concept-extraction",
     is_flag=True,
     help="Enable LLM-enhanced concept extraction (higher quality but more token usage)",
@@ -196,6 +201,7 @@ def docs(
     repo_path: str,
     output_dir: str,
     verbose: bool,
+    force: bool,
     llm_concept_extraction: bool,
     llm_concept_max_components: int,
     cluster_strategy: str,
@@ -213,6 +219,7 @@ def docs(
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
     )
+    config.force_regenerate = force
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
     try:
@@ -233,6 +240,11 @@ def docs(
 @click.argument("repo_path", default=".")
 @click.option("-o", "--output-dir", default="output", help="Output directory")
 @click.option("-v", "--verbose", is_flag=True, help="Enable verbose logging")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Regenerate every doc, even ones already generated (default: skip existing)",
+)
 @click.option(
     "--llm-concept-extraction",
     is_flag=True,
@@ -259,6 +271,7 @@ def generate(
     repo_path: str,
     output_dir: str,
     verbose: bool,
+    force: bool,
     llm_concept_extraction: bool,
     llm_concept_max_components: int,
     cluster_strategy: str,
@@ -276,6 +289,7 @@ def generate(
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
     )
+    config.force_regenerate = force
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
     try:
