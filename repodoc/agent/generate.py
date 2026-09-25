@@ -129,6 +129,51 @@ def _build_module_dependencies(
     return deps, dependents
 
 
+def refresh_doc_snapshots(graph, paths: list[str]) -> int:
+    """Adopt on-disk content for the given doc files into their graph DocNodes.
+
+    validate_and_fix_links rewrites markdown files (broken links, invalid
+    mermaid diagrams) AFTER the DocNode snapshot was taken. Without this
+    refresh the next update compares the file against the pre-fix snapshot,
+    concludes a human edited it, and skips that doc forever (stale) unless
+    --force is used. Only the files passed in are adopted: a doc the validator
+    did not touch keeps its snapshot, so genuine manual edits still surface."""
+    if graph is None or not paths:
+        return 0
+    from repodoc.graph.models import DocNode
+
+    targets = {os.path.abspath(p) for p in paths}
+    refreshed = 0
+    for nid, attrs in list(graph.nodes(data=True)):
+        if attrs.get("node_type") != "doc":
+            continue
+        d = attrs.get("data", {})
+        file_path = d.get("file_path")
+        if not file_path or os.path.abspath(file_path) not in targets:
+            continue
+        if not os.path.exists(file_path):
+            continue
+        try:
+            content = file_manager.load_text(file_path)
+        except Exception as e:
+            print(f"Warning: could not re-read {file_path}: {e}")
+            continue
+        if content == (d.get("content") or ""):
+            continue
+        graph.add_doc_node(
+            DocNode(
+                id=d.get("id", nid),
+                content=content,
+                format=d.get("format", "markdown"),
+                version=d.get("version", 1),
+                file_path=file_path,
+                stale=bool(d.get("stale")),
+            )
+        )
+        refreshed += 1
+    return refreshed
+
+
 class DocPipeline:
     def __init__(self, config: Config):
         self.config = config
@@ -746,6 +791,16 @@ class DocPipeline:
         self._save_graph_safe()
 
         link_results = validate_and_fix_links(docs_dir)
+        # The validator rewrites files AFTER the snapshots were taken; adopt
+        # those rewrites so the next update does not mistake them for manual
+        # edits (see refresh_doc_snapshots).
+        refreshed = refresh_doc_snapshots(
+            self.graph,
+            [os.path.join(docs_dir, rel) for rel in link_results.get("fixed", [])],
+        )
+        if refreshed:
+            print(f"  Refreshed {refreshed} doc snapshot(s) after link/mermaid fixes")
+        self._save_graph_safe()
         all_files = self._collect_generated_files(docs_dir, data_dir)
         total_duration = time.time() - self._start_time if self._start_time else 0
 

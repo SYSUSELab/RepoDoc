@@ -409,6 +409,25 @@ def config_validate():
     is_flag=True,
     help="Skip confirmation prompt and automatically proceed",
 )
+@click.option(
+    "--propagate",
+    type=click.Choice(["sig", "all"], case_sensitive=False),
+    default="sig",
+    help="Impact propagation: sig (only signature/new/removed changes spread "
+    "to callers) | all (every changed component spreads) (default: sig)",
+)
+@click.option(
+    "--max-hops",
+    type=int,
+    default=3,
+    show_default=True,
+    help="Max caller-propagation depth in the knowledge graph (0 disables)",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite docs that were manually edited since the last update",
+)
 
 
 def update(
@@ -420,6 +439,9 @@ def update(
     analyze_changes: bool,
     include_tests: bool,
     yes: bool,
+    propagate: str,
+    max_hops: int,
+    force: bool,
 ):
     """Update documentation incrementally for changed files.
 
@@ -430,6 +452,7 @@ def update(
         repodoc update /path/to/flask src/flask/app.py src/flask/ctx.py
         repodoc update /path/to/flask --base-commit HEAD~1
         repodoc update /path/to/flask --analyze-changes
+        repodoc update /path/to/flask --propagate all --max-hops 5
     """
     import asyncio
 
@@ -450,6 +473,9 @@ def update(
             analyze_changes=analyze_changes,
             include_tests=include_tests,
             confirm=None if yes else (lambda msg: click.confirm(msg)),
+            propagate=propagate,
+            max_hops=max_hops,
+            force=force,
         )
 
     result = asyncio.run(_run())

@@ -152,6 +152,41 @@ class HeterogeneousGraph:
             return None
         return dict(self._g.edges[source_id, target_id])
 
+    def has_edge(self, source_id: str, target_id: str) -> bool:
+        """Return True if a directed edge exists between the two nodes."""
+        return self._g.has_edge(source_id, target_id)
+
+    def edges(self, relation_type: str | None = None) -> list[tuple[str, str, str, float]]:
+        """Return all edges as (source_id, target_id, relation_type, weight).
+
+        When relation_type is given, only edges of that type are returned.
+        Used by the incremental updater to diff/rebuild typed edge sets."""
+        out: list[tuple[str, str, str, float]] = []
+        for s, t, attrs in self._g.edges(data=True):
+            rt = attrs.get("relation_type", "calls")
+            if relation_type is not None and rt != relation_type:
+                continue
+            out.append((s, t, rt, attrs.get("weight", 1.0)))
+        return out
+
+    def remove_edge(self, source_id: str, target_id: str) -> bool:
+        """Remove a single edge. Returns True when it existed and was removed."""
+        if not self._g.has_edge(source_id, target_id):
+            return False
+        self._g.remove_edge(source_id, target_id)
+        return True
+
+    def remove_node(self, node_id: str) -> bool:
+        """Remove a node and ALL incident edges (incoming and outgoing).
+
+        Returns True when the node existed and was removed. Used by the
+        incremental updater to delete removed components (and their calls /
+        describes / contains edges) from the knowledge graph."""
+        if not self._g.has_node(node_id):
+            return False
+        self._g.remove_node(node_id)
+        return True
+
     def save(self, path: str | Path) -> None:
         """Persist graph to a JSON file (nodes and edges)."""
         path = Path(path)

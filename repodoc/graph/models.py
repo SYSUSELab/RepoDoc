@@ -99,6 +99,9 @@ class DocNode(BaseModel):
     format: str  # e.g. "markdown", "mermaid"
     version: int = 1
     file_path: Optional[str] = None
+    # True when the last update skipped this doc (manual edit detected):
+    # subsequent updates keep retrying it until it is refreshed.
+    stale: bool = False
 
 
 class ModuleNode(BaseModel):

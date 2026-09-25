@@ -12,8 +12,11 @@ from pydantic import BaseModel
 
 from repodoc.agent.prompts import (
     format_component_prompt,
+    format_component_update_prompt,
     format_module_prompt,
+    format_module_update_prompt,
     format_overview_prompt,
+    format_overview_update_prompt,
 )
 from repodoc.agent.tools import FileWriterTool, LLMTool
 from repodoc.config import Config
@@ -80,6 +83,12 @@ class DocAgent:
                 return await self._generate_component_doc(input_data, llm_tool, file_tool)
             elif doc_type == "module":
                 return await self._generate_module_doc(input_data, llm_tool, file_tool)
+            elif doc_type == "update_component":
+                return await self._update_component_doc(input_data, llm_tool, file_tool)
+            elif doc_type == "update_module":
+                return await self._update_module_doc(input_data, llm_tool, file_tool)
+            elif doc_type == "update_overview":
+                return await self._update_overview_doc(input_data, llm_tool, file_tool)
             else:
                 return SkillResult(
                     success=False, error=f"Unknown documentation type: {doc_type}"
@@ -183,6 +192,78 @@ class DocAgent:
             return result
         output_path = input_data.get("output_path", f"docs/modules/{module_name}.md")
         return await self._write_result(output_path, result.output, "module", file_tool)
+
+    async def _update_component_doc(self, input_data: dict, llm_tool, file_tool) -> SkillResult:
+        component = input_data.get("component", {})
+        predecessors = input_data.get("predecessors", [])
+        module_name = input_data.get("module_name", "")
+
+        system_prompt, user_prompt = format_component_update_prompt(
+            component_name=component.get("name", "Unknown"),
+            component_type=component.get("component_type", "unknown"),
+            file_path=component.get("file_path", ""),
+            docstring=component.get("docstring", ""),
+            source_code=component.get("source_code", ""),
+            dependencies=list(component.get("depends_on", set())),
+            predecessors=list(predecessors),
+            module_name=module_name,
+            existing_doc=input_data.get("existing_doc", ""),
+            code_diff=input_data.get("code_diff", ""),
+        )
+
+        result = await self._call_llm(llm_tool, system_prompt, user_prompt)
+        if not result.success:
+            return result
+        output_path = input_data.get("output_path", f"docs/{component.get('relative_path', 'component')}.md")
+        return await self._write_result(output_path, result.output, "update_component", file_tool)
+
+    async def _update_module_doc(self, input_data: dict, llm_tool, file_tool) -> SkillResult:
+        module_name = input_data.get("module_name", "Module")
+
+        system_prompt, user_prompt = format_module_update_prompt(
+            module_name=module_name,
+            module_path=input_data.get("module_path", ""),
+            parent_module=input_data.get("parent_module", ""),
+            sibling_modules=input_data.get("sibling_modules", []),
+            module_dependencies=input_data.get("module_dependencies", []),
+            dependent_modules=input_data.get("dependent_modules", []),
+            sub_modules=input_data.get("sub_modules", []),
+            component_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("component_docs", {}).items()
+            ),
+            children_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("children_docs", {}).items()
+            ),
+            existing_doc=input_data.get("existing_doc", ""),
+        )
+
+        result = await self._call_llm(llm_tool, system_prompt, user_prompt)
+        if not result.success:
+            return result
+        output_path = input_data.get("output_path", f"docs/modules/{module_name}.md")
+        return await self._write_result(output_path, result.output, "update_module", file_tool)
+
+    async def _update_overview_doc(self, input_data: dict, llm_tool, file_tool) -> SkillResult:
+        repo_name = input_data.get("repo_name", "Repository")
+        component_count = input_data.get("component_count", 0)
+        module_count = input_data.get("module_count", 0)
+
+        system_prompt, user_prompt = format_overview_update_prompt(
+            repo_name=repo_name,
+            component_count=component_count,
+            module_count=module_count,
+            module_dependencies=input_data.get("module_dependencies", {}),
+            module_docs_summary="\n\n".join(
+                f"### {name}\n{content}" for name, content in input_data.get("module_docs_summary", {}).items()
+            ),
+            existing_doc=input_data.get("existing_doc", ""),
+        )
+
+        result = await self._call_llm(llm_tool, system_prompt, user_prompt)
+        if not result.success:
+            return result
+        output_path = input_data.get("output_path", "docs/README.md")
+        return await self._write_result(output_path, result.output, "update_overview", file_tool)
 
     async def _generate_direct(self, doc_type: str, input_data: dict, llm_tool, file_tool) -> SkillResult:
         """Unified single-prompt path (ablation baseline)."""

@@ -1,14 +1,29 @@
-"""Incremental documentation update: git diff analysis -> impact -> regenerate.
+"""Incremental documentation update: git diff analysis -> graph mutation -> impact -> docs.
 
-Merges the former diff_analysis / incremental_updater / code_extractor into
-one module. Per-language diff logic is genericized via DiffSpec; impact
-propagation direction is aligned with the graph edge convention
-(caller -> callee, so downstream = callers = predecessors).
+The knowledge graph is the single source of truth for the repository's
+current code state. `update` works in four stages:
+
+1. CHANGE ANALYSIS — git diff (old content @ base commit vs working tree) is
+   re-analyzed per file; component-level changes are classified by severity
+   (signature/new/removed are "severe", body/docstring changes are not).
+2. GRAPH MUTATION — the knowledge graph is mutated in place: new components
+   are added (with heuristic module placement), modified components are
+   overwritten (with calls-edge diffs), removed components are deleted with
+   all incident edges; cross-module edges are rebuilt.
+3. LAYERED IMPACT — propagation from the changed components over REL_CALLS
+   predecessors (callers), bounded by --max-hops; modules whose members
+   changed get their module docs refreshed; the overview follows.
+4. DOC UPDATE — Plan A minimal-edit regeneration: the existing document is
+   embedded as the format anchor and the LLM only edits affected sections,
+   so repeated updates do not cause format drift. Full regeneration is used
+   for new components, missing docs, or large-change/high-coverage cases.
 """
 
 import asyncio
+import difflib
 import logging
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -17,13 +32,29 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from repodoc.agent.agent import DocAgent
-from repodoc.agent.generate import DocPipeline
+from repodoc.agent.generate import (
+    DocPipeline,
+    _build_module_dependencies,
+    _collect_component_modules,
+    refresh_doc_snapshots,
+)
 from repodoc.config import Config
 from repodoc.graph.analyzers import get_analyzer
 from repodoc.graph.graph import HeterogeneousGraph
-from repodoc.graph.models import REL_CALLS, Node
-from repodoc.utils import file_manager, log_operation
+from repodoc.graph.models import (
+    REL_CALLS,
+    REL_DESCRIBES,
+    CodeNode,
+    DocNode,
+    ModuleNode,
+    Node,
+)
+from repodoc.graph.mutation import (
+    GraphMutationResult,
+    apply_file_changes_to_graph,
+    component_module_ids,
+)
+from repodoc.utils import file_manager, log_operation, validate_and_fix_links
 
 logger = logging.getLogger(__name__)
 
@@ -60,12 +91,31 @@ class FileChangeAnalysis:
     has_important_changes: bool = False
 
 
+@dataclass
+class FileDiff:
+    """Old/new contents of one changed file plus its change analysis."""
+
+    file_path: str
+    old_content: str
+    new_content: str
+    spec: Optional["DiffSpec"] = None
+    analysis: Optional[FileChangeAnalysis] = None
+
+
 IMPORTANT_TYPES = frozenset(
     {
         ChangeType.API_SIGNATURE_CHANGED,
         ChangeType.NEW_COMPONENT,
         ChangeType.REMOVED_COMPONENT,
         ChangeType.CODE_BODY_CHANGED,
+    }
+)
+
+SEVERE_TYPES = frozenset(
+    {
+        ChangeType.API_SIGNATURE_CHANGED,
+        ChangeType.NEW_COMPONENT,
+        ChangeType.REMOVED_COMPONENT,
     }
 )
 
@@ -130,6 +180,20 @@ def _is_test_file(file_path: str) -> bool:
         or "tests" in dirs
         or "test" in dirs
     )
+
+
+def _component_id(file_path: str, name: str) -> str:
+    """Component id for a change: <module.path>.<name> (mirrors analyzer ids)."""
+    module_path = file_path
+    for ext in (
+        ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java", ".cs",
+        ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".php", ".go", ".rs",
+        ".phtml", ".inc", ".hxx",
+    ):
+        if module_path.endswith(ext):
+            module_path = module_path[: -len(ext)]
+            break
+    return f"{module_path.replace('/', '.')}.{name}"
 
 
 def analyze_diff(
@@ -263,398 +327,278 @@ def analyze_diff(
     return analysis
 
 
+def _detect_renames(
+    repo_path: str, base_commit: Optional[str] = None
+) -> dict[str, str]:
+    """Detect renamed files (new path -> old path) from git."""
+    cmd = (
+        ["git", "diff", "--name-status", "--find-renames", base_commit]
+        if base_commit
+        else ["git", "diff", "--name-status", "--find-renames", "HEAD"]
+    )
+    try:
+        result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
+    except Exception as e:
+        logger.debug("git rename detection failed: %s", e)
+        return {}
+    if result.returncode != 0:
+        return {}
+    renames: dict[str, str] = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line or "\t" not in line:
+            continue
+        fields = line.split("\t")
+        if fields[0].startswith("R") and len(fields) >= 3:
+            renames[fields[2]] = fields[1]
+    return renames
+
+
+def _git_show(repo_path: str, file_path: str, commit: str | None) -> str:
+    """File content at a commit ('' when the file did not exist there)."""
+    ref = commit or "HEAD"
+    try:
+        result = subprocess.run(
+            ["git", "show", f"{ref}:{file_path}"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout if result.returncode == 0 else ""
+    except Exception as e:
+        logger.warning("git show %s:%s failed: %s", ref, file_path, e)
+        return ""
+
+
+def _read_working_tree(repo_path: str, file_path: str) -> str:
+    """Working-tree content of a file ('' when deleted)."""
+    full_path = Path(repo_path) / file_path
+    if not full_path.exists():
+        return ""
+    try:
+        return full_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
 def analyze_git_diff(
     repo_path: str,
     base_commit: Optional[str] = None,
     include_tests: bool = False,
-) -> dict[str, FileChangeAnalysis]:
-    """Analyze git diff to find important code changes.
+) -> tuple[dict[str, FileDiff], dict[str, str]]:
+    """Analyze git diff to find code changes (old vs working tree per file).
 
-    Args:
-        repo_path: Path to the repository
-        base_commit: Base commit to compare against
-        include_tests: Whether to include test files in analysis (default: False)
-    """
+    Deleted files ARE included (old content comes from `git show`), so
+    component removals are detected instead of being skipped. Untracked new
+    files are scanned explicitly (`git diff` is blind to them).
+
+    Returns (diffs, renames): diffs is file_path -> FileDiff; renames maps
+    new path -> old path for detected renames (old content of a renamed file
+    is read from the OLD path at the base commit)."""
     cmd = (
-        ["git", "diff", "--name-only", base_commit]
+        ["git", "diff", "--name-status", "--find-renames", base_commit]
         if base_commit
-        else ["git", "diff", "--name-only", "HEAD"]
+        else ["git", "diff", "--name-status", "--find-renames", "HEAD"]
     )
     result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
     if result.returncode != 0:
         logger.warning("git diff failed: %s", result.stderr.strip())
-        return {}
-    changed_files = [f for f in result.stdout.strip().split("\n") if f]
+        return {}, {}
+    changed_files: list[str] = []
+    renames: dict[str, str] = {}
+    for line in result.stdout.strip().split("\n"):
+        if not line or "\t" not in line:
+            continue
+        fields = line.split("\t")
+        status = fields[0]
+        if status.startswith("R") and len(fields) >= 3:
+            renames[fields[2]] = fields[1]
+            changed_files.append(fields[2])
+        elif status.startswith("R"):
+            changed_files.append(fields[-1])
+        else:
+            changed_files.append(fields[1])
+
+    # Untracked (new) files are invisible to `git diff`; scan them explicitly
+    # so brand-new source files are detected as additions.
+    try:
+        untracked = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if untracked.returncode == 0:
+            changed_files.extend(
+                f for f in untracked.stdout.strip().split("\n") if f
+            )
+    except Exception as e:
+        logger.debug("git ls-files failed: %s", e)
 
     if not include_tests:
         changed_files = [f for f in changed_files if not _is_test_file(f)]
 
-    analyses: dict[str, FileChangeAnalysis] = {}
+    diffs: dict[str, FileDiff] = {}
 
     for file_path in changed_files:
-        full_path = Path(repo_path) / file_path
-        if not full_path.exists():
-            # Deleted files: the component removal cannot be detected without
-            # the old content — skip (documented limitation)
-            continue
-
-        try:
-            new_content = full_path.read_text()
-        except Exception:
-            continue
-
-        show_cmd = ["git", "show", f"{base_commit or 'HEAD'}:{file_path}"]
-        result = subprocess.run(
-            show_cmd, cwd=repo_path, capture_output=True, text=True
-        )
-        old_content = result.stdout if result.returncode == 0 else ""
-
         spec = get_diff_spec(file_path)
         if spec is None:
             # Non-code file (md, json, ...) — does not affect API docs
             continue
 
-        analyses[file_path] = analyze_diff(file_path, old_content, new_content, spec)
+        old_path = renames.get(file_path, file_path)
+        old_content = _git_show(repo_path, old_path, base_commit)
+        new_content = _read_working_tree(repo_path, file_path)
 
-    return analyses
+        # A pure rename (identical content) must still be processed: its
+        # components keep their identity but change ids, so the graph and the
+        # docs have to be migrated (skipping it would leave the old path's
+        # nodes and docs in place forever).
+        if old_content == new_content and file_path not in renames:
+            continue
+
+        diffs[file_path] = FileDiff(
+            file_path=file_path,
+            old_content=old_content,
+            new_content=new_content,
+            spec=spec,
+            analysis=analyze_diff(file_path, old_content, new_content, spec),
+        )
+
+    return diffs, renames
 
 
 def filter_important_changes(
-    analyses: dict[str, FileChangeAnalysis],
-) -> dict[str, FileChangeAnalysis]:
+    diffs: dict[str, FileDiff],
+) -> dict[str, FileDiff]:
     """Filter to only files with important API-affecting changes."""
     return {
-        file_path: analysis
-        for file_path, analysis in analyses.items()
-        if analysis.has_important_changes
+        file_path: fd
+        for file_path, fd in diffs.items()
+        if fd.analysis and fd.analysis.has_important_changes
     }
 
 
-def build_change_map(
-    analyses: dict[str, FileChangeAnalysis],
-) -> dict[str, ComponentChange]:
-    """Map knowledge-graph component ids -> ComponentChange for important
-    changes (module.path.name style ids, mirroring analyzer ids)."""
-    change_map: dict[str, ComponentChange] = {}
-    for file_path, analysis in analyses.items():
-        for change in analysis.changes:
-            if change.change_type not in (
-                ChangeType.NEW_COMPONENT,
-                ChangeType.API_SIGNATURE_CHANGED,
-                ChangeType.REMOVED_COMPONENT,
-            ):
-                continue
-            module_path = change.file_path
-            for ext in (
-                ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".cs",
-                ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".php",
-            ):
-                if module_path.endswith(ext):
-                    module_path = module_path[: -len(ext)]
-                    break
-            component_id = f"{module_path.replace('/', '.')}.{change.name}"
-            change_map[component_id] = change
-    return change_map
+def _code_diff(old_content: str, new_content: str, file_path: str) -> str:
+    """Unified diff of old vs new content (pure difflib, no git dependency)."""
+    if not old_content and not new_content:
+        return ""
+    diff = difflib.unified_diff(
+        old_content.splitlines(keepends=True),
+        new_content.splitlines(keepends=True),
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+    )
+    return "".join(diff)
 
 
 # ---------------------------------------------------------------------------
-# Impact computation
+# Layered impact computation
 # ---------------------------------------------------------------------------
 
 
 class IncrementalUpdater:
-    """Finds affected components for changed files via the knowledge graph.
+    """Layered impact analysis over the knowledge graph.
 
     Graph edge convention: caller -> callee (REL_CALLS). A change to X
-    affects the components that CALL X, i.e. X's predecessors.
+    affects the components that CALL X, i.e. X's predecessors. Propagation
+    is bounded by max_hops and gated by change severity:
+    - layer 0: the changed components themselves (their docs always update)
+    - layer 1: transitive callers of SEVERE changes (signature/new/removed),
+      up to max_hops; body/docstring changes do not propagate outward
+    - layer 2: modules containing any layer-0/1 component (module docs)
+    - layer 3: the overview README (when any module doc is affected)
     """
 
     def __init__(self, graph: HeterogeneousGraph, config: Any):
         self.graph = graph
         self.config = config
-        self._impact_cache: dict[str, set[str]] = {}
 
-    def _find_components_in_file(self, file_path: str) -> set[str]:
-        """Find all components defined in a file (by graph node file_path)."""
-        components: set[str] = set()
-        path = Path(file_path).as_posix()
-
-        for node_id, node_attrs in self.graph.nodes(data=True):
-            node_data = node_attrs.get("data", {})
-            source_file = node_data.get("file_path", "")
-            if source_file and self._paths_match(source_file, path):
-                components.add(node_id)
-
-        if not components:
-            components = self._find_components_by_relative_path(file_path)
-        return components
-
-    def _find_components_by_relative_path(self, file_path: str) -> set[str]:
-        """Match by relative path structure (filename + at least one dir)."""
-        components: set[str] = set()
-        try:
-            current_path = Path(file_path)
-            current_name = current_path.name
-            current_parts = current_path.parts
-            current_len = len(current_parts)
-
-            for node_id, node_attrs in self.graph.nodes(data=True):
-                node_data = node_attrs.get("data", {})
-                source_file = node_data.get("file_path", "")
-                if not source_file:
-                    continue
-
-                source_path = Path(source_file)
-                source_parts = source_path.parts
-                source_len = len(source_parts)
-
-                if source_path.name != current_name:
-                    continue
-
-                # Need at least 2 matching parts (filename + 1 directory)
-                min_match = 2
-                match_count = 0
-                src_idx, tgt_idx = source_len - 1, current_len - 1
-                while (
-                    src_idx >= 0 and tgt_idx >= 0 and match_count < min_match
-                ):
-                    if source_parts[src_idx] == current_parts[tgt_idx]:
-                        match_count += 1
-                    else:
-                        break
-                    src_idx -= 1
-                    tgt_idx -= 1
-
-                if match_count >= min_match:
-                    components.add(node_id)
-        except Exception as e:
-            logger.debug(f"Error in relative path matching: {e}")
-        return components
-
-    def _paths_match(self, source: str, target: str) -> bool:
-        try:
-            return Path(source).resolve() == Path(target).resolve()
-        except Exception:
-            return source == target
-
-    def _get_downstream_components(self, components: set[str]) -> set[str]:
-        """Components affected by a change to the given ones = their CALLERS
-        (predecessors in the caller -> callee graph)."""
-        downstream: set[str] = set()
-        to_process = list(components)
-        visited: set[str] = set()
-
-        while to_process:
-            component = to_process.pop()
-            if component in visited:
-                continue
-            visited.add(component)
-
-            for pred in self.graph.predecessors(component):
-                edge_data = self.graph.get_edge_data(pred, component)
-                if edge_data and edge_data.get("relation_type") == REL_CALLS:
-                    downstream.add(pred)
-                    to_process.append(pred)
-        return downstream
-
-    def get_upstream_dependencies(self, component: str) -> set[str]:
-        """Components this component depends on = its callees (successors)."""
-        if component in self._impact_cache:
-            return self._impact_cache[component]
-
-        dependencies: set[str] = set()
-        to_process = [component]
-        visited: set[str] = set()
-
-        while to_process:
-            comp = to_process.pop()
-            if comp in visited:
-                continue
-            visited.add(comp)
-
-            for succ in self.graph.successors(comp):
-                edge_data = self.graph.get_edge_data(comp, succ)
-                if edge_data and edge_data.get("relation_type") == REL_CALLS:
-                    dependencies.add(succ)
-                    to_process.append(succ)
-
-        self._impact_cache[component] = dependencies
-        return dependencies
-
-    def compute_impact_graph(
-        self,
-        changed_files: list[str],
-        module_tree: Optional[dict[str, Any]] = None,
-        change_map: Optional[dict[str, ComponentChange]] = None,
-    ) -> dict[str, Any]:
-        """Compute a complete impact analysis for changed files.
-
-        Returns a structured result with:
-        - changed_files / changed_components / affected_components
-        - new_components: components detected as NEW via diff analysis that
-          are not in the knowledge graph
-        - not_in_module_tree / impact_order / total_affected
-        """
-        changed_components: set[str] = set()
-        for f in changed_files:
-            changed_components.update(self._find_components_in_file(f))
-
-        all_affected = self.get_affected_components(changed_files)
-
-        module_tree_components: set[str] = set()
-        if module_tree:
-            for mod_info in module_tree.values():
-                module_tree_components.update(mod_info.get("components", []))
-
-        graph_components: set[str] = set()
-        for node_id, _attrs in self.graph.nodes(data=True):
-            if isinstance(node_id, str):
-                graph_components.add(node_id)
-
-        if module_tree:
-            filtered_affected = all_affected & module_tree_components
-            not_in_module_tree = all_affected - module_tree_components
-        else:
-            filtered_affected = all_affected
-            not_in_module_tree = set()
-
-        # New components: derived from diff analysis (NEW_COMPONENT changes
-        # whose ids are absent from the knowledge graph). The old
-        # "changed - graph" computation was always empty.
-        new_components: set[str] = set()
-        if change_map:
-            new_components = {
-                cid
-                for cid, change in change_map.items()
-                if change.change_type == ChangeType.NEW_COMPONENT
-                and cid not in graph_components
-            }
-
-        impact_order = self._compute_topological_order(filtered_affected)
-
-        return {
-            "changed_files": changed_files,
-            "changed_components": list(changed_components),
-            "affected_components": list(filtered_affected),
-            "new_components": list(new_components),
-            "not_in_module_tree": list(not_in_module_tree),
-            "impact_order": impact_order,
-            "total_affected": len(filtered_affected),
-        }
-
-    def get_affected_components(self, changed_files: list[str]) -> set[str]:
-        """All components affected by the given file changes (changed + downstream)."""
+    def _bounded_callers(self, seeds: set[str], max_hops: int) -> set[str]:
+        """Callers reachable from seeds within max_hops via REL_CALLS
+        predecessors (excludes the seeds themselves)."""
         affected: set[str] = set()
-        for file_path in changed_files:
-            components = self._find_components_in_file(file_path)
-            affected.update(components)
-            affected.update(self._get_downstream_components(components))
+        frontier: list[tuple[str, int]] = [(s, 0) for s in seeds]
+        visited: set[str] = set(seeds)
+
+        while frontier:
+            component, depth = frontier.pop(0)
+            if depth >= max_hops:
+                continue
+            for pred in self.graph.predecessors(component):
+                if pred in visited:
+                    continue
+                edge_data = self.graph.get_edge_data(pred, component)
+                if not (edge_data and edge_data.get("relation_type") == REL_CALLS):
+                    continue
+                visited.add(pred)
+                affected.add(pred)
+                frontier.append((pred, depth + 1))
         return affected
 
-    def _compute_topological_order(self, components: set[str]) -> list[str]:
-        """Processing order: dependencies first (deps = callees/successors)."""
-        order: list[str] = []
-        remaining = set(components)
-        visited: set[str] = set()
+    def compute_layered_impact(
+        self,
+        changed_components: list[str],
+        severe_components: set[str],
+        propagate: str = "sig",
+        max_hops: int = 3,
+        caller_seeds: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Compute the layered update scope for the given changed components.
 
-        while remaining:
-            ready = []
-            for comp in remaining:
-                deps = self.get_upstream_dependencies(comp)
-                if deps.issubset(visited):
-                    ready.append(comp)
+        Args:
+            changed_components: ids mutated in this update (added + updated).
+            severe_components: ids whose change is signature/new/removed.
+            propagate: "sig" (only severe changes propagate to callers) or
+                "all" (every changed component propagates).
+            max_hops: max caller-propagation depth (0 disables propagation).
+            caller_seeds: components treated as changed on top of the seeds
+                (e.g. callers of REMOVED components, snapshotted before the
+                removal — their docs reference a component that is gone).
 
-            if not ready:
-                # Cycle or dependencies outside the affected set — pick one
-                ready = [remaining.pop()]
-            else:
-                for r in ready:
-                    remaining.discard(r)
+        Returns:
+            Dict with components_to_doc, modules_to_doc, update_overview,
+            severe_components, total_components and the layer breakdown.
+        """
+        layer0 = [c for c in changed_components if self.graph.has_node(c)]
 
-            order.extend(ready)
-            visited.update(ready)
+        seeds = (
+            layer0
+            if propagate == "all"
+            else [c for c in layer0 if c in severe_components]
+        )
+        # Callers of REMOVED components: the component itself is gone from the
+        # graph, so these arrive as explicit extra seeds.
+        extra_seeds = set(caller_seeds or set())
+        seeds = list(set(seeds) | extra_seeds)
+        layer1 = self._bounded_callers(set(seeds), max_hops) if seeds else set()
+        # ...and they are affected themselves: their docs describe a component
+        # that no longer exists.
+        layer1 |= {c for c in extra_seeds if self.graph.has_node(c)}
+        layer1 -= set(layer0)
 
-        return order
+        components_to_doc = sorted(set(layer0) | layer1)
+        modules_to_doc = sorted(
+            {
+                m
+                for c in components_to_doc
+                for m in component_module_ids(self.graph, c)
+            }
+        )
+        update_overview = bool(modules_to_doc)
 
-
-# ---------------------------------------------------------------------------
-# Git code extraction (Python-only by design)
-# ---------------------------------------------------------------------------
-
-
-class GitCodeExtractor:
-    """Extract code components from specific git commits.
-
-    NOTE: extraction uses the stdlib `ast` module, so it only supports Python
-    files. For other languages, regeneration falls back to the working tree.
-    """
-
-    def __init__(self, repo_path: str) -> None:
-        self.repo_path = os.path.abspath(repo_path)
-
-    def get_file_content_at_commit(self, file_path: str, commit: str) -> Optional[str]:
-        """Get file content at a specific commit (None if not present)."""
-        try:
-            if os.path.isabs(file_path):
-                file_path = os.path.relpath(file_path, self.repo_path)
-            result = subprocess.run(
-                ["git", "show", f"{commit}:{file_path}"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            return result.stdout if result.returncode == 0 else None
-        except Exception as e:
-            logger.warning(f"Failed to get file content at {commit}: {e}")
-            return None
-
-    def extract_component_at_commit(
-        self, file_path: str, component_name: str, commit: str
-    ) -> Optional[dict[str, Any]]:
-        """Extract a Python component's code at a given commit."""
-        content = self.get_file_content_at_commit(file_path, commit)
-        if not content:
-            return None
-
-        try:
-            import ast
-
-            tree = ast.parse(content)
-        except SyntaxError:
-            logger.warning(f"Failed to parse {file_path} at {commit}")
-            return None
-
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                if node.name != component_name:
-                    continue
-                source_code = ast.get_source_segment(content, node)
-                if source_code is None:
-                    lines = content.split("\n")
-                    source_code = "\n".join(
-                        lines[node.lineno - 1 : node.end_lineno]
-                    )
-                params = []
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    if getattr(node, "args", None):
-                        params = [arg.arg for arg in node.args.args]
-                        params.extend(arg.arg for arg in node.args.kwonlyargs)
-                return {
-                    "source_code": source_code or "",
-                    "docstring": ast.get_docstring(node) or "",
-                    "parameters": params,
-                    "start_line": node.lineno,
-                    "end_line": node.end_lineno,
-                    "component_type": (
-                        "class" if isinstance(node, ast.ClassDef) else "function"
-                    ),
-                }
-        return None
+        return {
+            "changed_components": layer0,
+            "severe_components": sorted(severe_components),
+            "caller_components": sorted(layer1),
+            "components_to_doc": components_to_doc,
+            "modules_to_doc": modules_to_doc,
+            "update_overview": update_overview,
+            "total_components": len(components_to_doc),
+        }
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator
+# Graph + asset loading
 # ---------------------------------------------------------------------------
 
 
@@ -715,17 +659,281 @@ def _build_pipeline_from_graph(graph: HeterogeneousGraph, config: Config) -> Doc
     return pipeline
 
 
-def _find_module_name(module_tree: dict, node_id: str) -> Optional[str]:
-    """Find the module a component belongs to (recursive)."""
-    for mod_name, mod_info in module_tree.items():
-        if node_id in mod_info.get("components", []):
-            return mod_name
-        children = mod_info.get("children", {})
-        if children:
-            found = _find_module_name(children, node_id)
-            if found:
-                return found
-    return None
+def _graph_save_path(config: Config, project_name: str) -> str:
+    return os.path.join(
+        config.output_dir, "data", f"{project_name}_knowledge_graph.json"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Doc path helpers
+# ---------------------------------------------------------------------------
+
+
+def _module_doc_path(config: Config, module_id: str) -> str:
+    """Module doc file for a module node id ('net/http' -> docs/net/http.md)."""
+    return os.path.join(config.docs_dir, f"{module_id}.md")
+
+
+def _component_doc_path(docs_dir: str, chain: list[str], name: str) -> str:
+    return os.path.join(docs_dir, *chain, f"{name}.md")
+
+
+def _sync_doc_node(
+    graph: HeterogeneousGraph,
+    pipeline: DocPipeline,
+    fpath: str,
+    content: str,
+    target_id: Optional[str] = None,
+    stale: bool = False,
+) -> None:
+    """Attach/refresh the DocNode for a written doc (keeps the graph current)."""
+    doc_id = pipeline._doc_id_from_path(fpath)
+    graph.add_doc_node(
+        DocNode(
+            id=doc_id,
+            content=content,
+            format="markdown",
+            file_path=fpath,
+            stale=stale,
+        )
+    )
+    if target_id and graph.has_node(target_id) and not graph.has_edge(doc_id, target_id):
+        graph.add_edge(doc_id, target_id, REL_DESCRIBES, 1.0)
+
+
+def _mark_doc_stale(
+    graph: HeterogeneousGraph, pipeline: DocPipeline, doc_path: str, stale: bool = True
+) -> None:
+    """Set/clear the stale flag on a doc node (skipped manual edits retry)."""
+    doc_id = pipeline._doc_id_from_path(doc_path)
+    node = graph.get_node(doc_id)
+    if isinstance(node, DocNode):
+        graph.add_doc_node(
+            DocNode(
+                id=node.id,
+                content=node.content,
+                format=node.format,
+                file_path=node.file_path,
+                version=node.version,
+                stale=stale,
+            )
+        )
+
+
+def _stale_doc_targets(
+    graph: HeterogeneousGraph,
+) -> tuple[set[str], set[str], bool]:
+    """Components/modules/overview whose docs were skipped (stale flag set).
+
+    These stay on the update list across runs until their docs are refreshed
+    (or deleted with the component), so a manually edited doc is retried on
+    every update instead of silently falling off the schedule."""
+    components: set[str] = set()
+    modules: set[str] = set()
+    overview = False
+    for s, t, rt, _w in graph.edges(REL_DESCRIBES):
+        d = graph.get_node(s)
+        if not (isinstance(d, DocNode) and d.stale):
+            continue
+        target = graph.get_node(t)
+        if isinstance(target, ModuleNode):
+            modules.add(t)
+        else:
+            components.add(t)
+    ov = graph.get_node("overview")
+    if isinstance(ov, DocNode) and ov.stale:
+        overview = True
+    return components, modules, overview
+
+
+# ---------------------------------------------------------------------------
+# Doc update strategies (Plan A: minimal-edit; full regen fallback)
+# ---------------------------------------------------------------------------
+
+
+def should_partial_update(existing_doc: str, code_diff: str) -> bool:
+    """Decide between minimal-edit update and full regeneration.
+
+    Full regeneration when: no existing doc, or the doc is short AND the
+    change is large (embedding the old doc would cost more than rewriting,
+    and a big diff leaves few sections untouched to preserve)."""
+    if not existing_doc:
+        return False
+    if len(existing_doc) < 1000 and len(code_diff) > 2000:
+        return False
+    return True
+
+
+def _safe_read(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _user_edited_doc(
+    graph: HeterogeneousGraph, pipeline: DocPipeline, doc_path: str, file_content: str
+) -> bool:
+    """True when the doc file differs from the graph's DocNode content.
+
+    The graph DocNode records the last content WE wrote; a mismatch means a
+    human (or another tool) modified the file — never overwrite it silently."""
+    doc_id = pipeline._doc_id_from_path(doc_path)
+    node = graph.get_node(doc_id)
+    if not isinstance(node, DocNode):
+        return False
+    return (node.content or "") != file_content
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+
+async def _run_jobs_with_retry(jobs: list, run_fn: Callable, label: str) -> list:
+    """Run doc jobs with a shared semaphore and failure-driven retries that
+    explicitly lower concurrency each round (mirrors generate.py)."""
+    from repodoc.llm import _LIMITER
+
+    sem = asyncio.Semaphore(16)
+
+    async def _one(job):
+        async with sem:
+            return await run_fn(job)
+
+    results = await asyncio.gather(*(_one(j) for j in jobs), return_exceptions=True)
+    for _round in range(4):
+        failed = [
+            j
+            for j, r in zip(jobs, results)
+            if isinstance(r, Exception)
+            or (r is not None and not getattr(r, "success", False))
+        ]
+        if not failed:
+            break
+        if _LIMITER.permits > _LIMITER.min_permits:
+            _LIMITER.force_decrease()
+        print(
+            f"Concurrency {_LIMITER.permits}, retrying {len(failed)} {label} "
+            f"(round {_round + 1})..."
+        )
+        retry = await asyncio.gather(*(_one(j) for j in failed), return_exceptions=True)
+        retry_iter = iter(retry)
+        results = [
+            next(retry_iter)
+            if (
+                isinstance(r, Exception)
+                or (r is not None and not getattr(r, "success", False))
+            )
+            else r
+            for r in results
+        ]
+        if _LIMITER.permits <= _LIMITER.min_permits:
+            break
+    return results
+
+
+def _remove_component_docs(
+    graph: HeterogeneousGraph,
+    pipeline: DocPipeline,
+    removed: list[str],
+    pre_mutation_modules: dict[str, list[str]],
+) -> int:
+    """Delete doc files + doc nodes for removed components. Returns count."""
+    removed_count = 0
+    for node_id in removed:
+        chain = pre_mutation_modules.get(node_id, [])
+        node = pipeline.components.get(node_id)
+        name = node.name if node else node_id.split(".")[-1]
+        doc_path = _component_doc_path(pipeline.config.docs_dir, chain, name)
+        if os.path.exists(doc_path):
+            try:
+                os.remove(doc_path)
+                removed_count += 1
+                print(f"  Removed doc: {os.path.relpath(doc_path, pipeline.config.docs_dir)}")
+            except OSError as e:
+                logger.warning("Failed to remove doc %s: %s", doc_path, e)
+        doc_id = pipeline._doc_id_from_path(doc_path)
+        if graph.has_node(doc_id):
+            graph.remove_node(doc_id)  # drops describes edges too
+    return removed_count
+
+
+def _migrate_renamed_docs(
+    graph: HeterogeneousGraph,
+    pipeline: DocPipeline,
+    renamed_pairs: list[tuple[str, str]],
+    pre_mutation_modules: dict[str, list[str]],
+    post_mutation_modules: dict[str, list[str]],
+) -> int:
+    """Move docs + transfer doc nodes/describes edges for renamed components.
+
+    A rename deletes the old component id and adds a new one; the existing
+    doc (file + DocNode + describes edge) is migrated to the new id so the
+    next update only edits the doc instead of losing it. Returns count."""
+    migrated = 0
+    docs_dir = pipeline.config.docs_dir
+    for old_id, new_id in renamed_pairs:
+        name = new_id.split(".")[-1]
+        old_chain = pre_mutation_modules.get(old_id, [])
+        new_chain = post_mutation_modules.get(new_id, [])
+        # Tolerate a single module-id string in place of a chain
+        if isinstance(old_chain, str):
+            old_chain = [old_chain]
+        if isinstance(new_chain, str):
+            new_chain = [new_chain]
+        old_doc_path = _component_doc_path(docs_dir, old_chain, name)
+        new_doc_path = _component_doc_path(docs_dir, new_chain, name)
+
+        moved = False
+        if os.path.exists(old_doc_path):
+            try:
+                os.makedirs(os.path.dirname(new_doc_path), exist_ok=True)
+                shutil.move(old_doc_path, new_doc_path)
+                moved = True
+            except OSError as e:
+                logger.warning("Failed to move doc %s -> %s: %s", old_doc_path, new_doc_path, e)
+
+        old_doc_id = pipeline._doc_id_from_path(old_doc_path)
+        new_doc_id = pipeline._doc_id_from_path(new_doc_path)
+        if graph.has_node(old_doc_id):
+            old_doc = graph.get_node(old_doc_id)
+            graph.remove_node(old_doc_id)
+            graph.add_doc_node(
+                DocNode(
+                    id=new_doc_id,
+                    content=old_doc.content if old_doc else "",
+                    format="markdown",
+                    file_path=new_doc_path,
+                )
+            )
+            if graph.has_node(new_id):
+                graph.add_edge(new_doc_id, new_id, REL_DESCRIBES, 1.0)
+            migrated += 1
+            print(
+                f"  Migrated doc: {os.path.relpath(old_doc_path, docs_dir)} -> "
+                f"{os.path.relpath(new_doc_path, docs_dir)}"
+            )
+        elif moved:
+            migrated += 1
+    return migrated
+
+
+def _cleanup_empty_dirs(docs_dir: str) -> int:
+    """Remove empty directories under docs_dir (bottom-up). Returns count."""
+    removed = 0
+    for root, _dirs, _files in os.walk(docs_dir, topdown=False):
+        if root == docs_dir:
+            continue
+        try:
+            if not os.listdir(root):
+                os.rmdir(root)
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 async def run_update(
@@ -736,6 +944,9 @@ async def run_update(
     include_tests: bool = False,
     confirm: Optional[Callable[[str], bool]] = None,
     verbose: bool = False,
+    propagate: str = "sig",
+    max_hops: int = 3,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Update documentation incrementally for changed files.
 
@@ -749,6 +960,10 @@ async def run_update(
         include_tests: Include test files in analysis.
         confirm: Optional callable(message) -> bool; called before regenerating.
         verbose: Enable debug logging.
+        propagate: "sig" (only signature/new/removed changes propagate to
+            callers) or "all" (every changed component propagates).
+        max_hops: Max caller-propagation depth (0 disables propagation).
+        force: Overwrite docs that were manually edited since the last update.
 
     Returns:
         Dict with status, impact analysis, and result counts.
@@ -783,149 +998,425 @@ async def run_update(
     if current_commit:
         print(f"Current commit: {current_commit[:8]}")
 
-    # --- Change analysis ---
-    analyses: Optional[dict[str, FileChangeAnalysis]] = None
+    # --- Stage 1: change analysis ---
+    diffs: dict[str, FileDiff] = {}
+    renames: dict[str, str] = {}
+    doc_diffs: dict[str, FileDiff] = {}
     if analyze_changes and not changed_files:
         print("\nAnalyzing git changes...")
-        analyses = analyze_git_diff(config.repo_path, base_commit, include_tests)
-        if not analyses:
+        diffs, renames = analyze_git_diff(config.repo_path, base_commit, include_tests)
+        if not diffs:
             print("No changes detected")
             return {"status": "no_changes", "impact": None}
 
-        important = filter_important_changes(analyses)
-        if not important:
-            print(
-                "\nNo important API changes detected. Documentation update not needed."
+        doc_diffs = filter_important_changes(diffs)
+        if doc_diffs:
+            print(f"\nFiles with important changes: {len(doc_diffs)}")
+    elif changed_files:
+        # Explicit file list: rename info is not available from auto-detection,
+        # so query git for the rename pairs explicitly.
+        renames = _detect_renames(config.repo_path, base_commit)
+        for f in changed_files:
+            spec = get_diff_spec(f)
+            if spec is None:
+                continue
+            old_path = renames.get(f, f)
+            old_content = _git_show(config.repo_path, old_path, base_commit)
+            new_content = _read_working_tree(config.repo_path, f)
+            if old_content == new_content and f not in renames:
+                continue
+            diffs[f] = FileDiff(
+                file_path=f,
+                old_content=old_content,
+                new_content=new_content,
+                spec=spec,
+                analysis=analyze_diff(f, old_content, new_content, spec),
             )
-            return {"status": "no_important_changes", "impact": None}
-
-        changed_files = tuple(important.keys())
-        print(f"\nFiles with important changes: {len(changed_files)}")
-
-    if not changed_files:
+        if not diffs:
+            print("No changed files to process")
+            return {"status": "no_changes", "impact": None}
+        doc_diffs = diffs
+    else:
         print("Detecting changed files via git...")
-        try:
-            diff_base = base_commit or "HEAD"
-            result = subprocess.run(
-                ["git", "diff", "--name-only", diff_base],
-                cwd=config.repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            changed_files = tuple(f for f in result.stdout.strip().split("\n") if f)
-        except Exception as e:
-            print(f"Error detecting changes: {e}")
-            return {"status": "error", "impact": None}
+        diffs, renames = analyze_git_diff(
+            config.repo_path, base_commit, include_tests
+        )
+        if not diffs:
+            print("No changed files to process")
+            return {"status": "no_changes", "impact": None}
+        doc_diffs = diffs
 
-    if not changed_files:
-        print("No changed files to process")
-        return {"status": "no_changes", "impact": None}
-
-    # --- Load knowledge graph + module tree ---
+    # --- Stage 2: load graph + mutate it ---
     try:
         graph, module_tree = _load_graph_and_assets(config, project_name)
     except FileNotFoundError as e:
         print(e)
         return {"status": "error", "impact": None}
-    print(f"Loaded knowledge graph: {graph.node_count()} nodes, {graph.edge_count()} edges")
+    print(
+        f"Loaded knowledge graph: {graph.node_count()} nodes, {graph.edge_count()} edges"
+    )
 
-    # Recompute analyses for change mapping if not already available
-    if analyses is None:
-        try:
-            analyses = analyze_git_diff(config.repo_path, base_commit, include_tests)
-        except Exception:
-            analyses = {}
+    # Pre-mutation components: needed to pair renamed components (old id -> new id).
+    from repodoc.graph.builder import graph_to_components, graph_to_module_tree
 
-    change_map = build_change_map(analyses)
+    pre_components = graph_to_components(graph)
 
-    # --- Impact ---
+    pre_mutation_modules = _collect_component_modules(
+        graph_to_module_tree(graph)
+    )
+
+    # Pre-mutation caller snapshot: REMOVED components lose their incoming
+    # calls edges during mutation, so their callers must be snapshotted
+    # BEFORE the removal to remain reachable for impact propagation.
+    pre_callers: dict[str, set[str]] = {}
+    for nid, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "code":
+            continue
+        callers = set()
+        for pred in graph.predecessors(nid):
+            ed = graph.get_edge_data(pred, nid)
+            if ed and ed.get("relation_type") == REL_CALLS:
+                callers.add(pred)
+        pre_callers[nid] = callers
+
+    print(f"\nMutating knowledge graph ({len(diffs)} file(s))...")
+    mutation = GraphMutationResult()
+    per_file_diffs: dict[str, str] = {}
+    for fd in doc_diffs.values():
+        per_file_diffs[fd.file_path] = _code_diff(
+            fd.old_content, fd.new_content, fd.file_path
+        )
+    for fd in diffs.values():
+        r = apply_file_changes_to_graph(
+            graph,
+            fd.file_path,
+            fd.new_content,
+            config.repo_path,
+            old_file_path=renames.get(fd.file_path),
+        )
+        mutation.added.extend(r.added)
+        mutation.updated.extend(r.updated)
+        mutation.removed.extend(r.removed)
+        mutation.added_edges.extend(r.added_edges)
+        mutation.removed_edges.extend(r.removed_edges)
+        mutation.modules_added.extend(r.modules_added)
+    mutation.added = sorted(set(mutation.added))
+    mutation.updated = sorted(set(mutation.updated))
+    mutation.removed = sorted(set(mutation.removed))
+
+    graph.save(_graph_save_path(config, project_name))
+    print(
+        f"  Added: {len(mutation.added)}, updated: {len(mutation.updated)}, "
+        f"removed: {len(mutation.removed)} component(s); "
+        f"edges +{len(mutation.added_edges)}/-{len(mutation.removed_edges)}"
+    )
+
+    # Rename pairs (old component id -> new component id), matched by the
+    # file rename plus the component name. Resolved BEFORE the impact stage:
+    # a renamed component keeps its identity under a new id, so its callers
+    # (whose files were not re-analyzed) must follow it, and its old id must
+    # not count as a removal — that would delete the doc we want to migrate.
+    renamed_pairs: list[tuple[str, str]] = []
+    for new_path, old_path in renames.items():
+        old_ids = {
+            cid
+            for cid, n in pre_components.items()
+            if n.relative_path == old_path
+        }
+        old_by_name = {pre_components[cid].name: cid for cid in old_ids}
+        for cid in mutation.added:
+            if not graph.has_node(cid):
+                continue
+            node = graph.get_node(cid)
+            if (
+                getattr(node, "relative_path", None) == new_path
+                and node.name in old_by_name
+            ):
+                renamed_pairs.append((old_by_name[node.name], cid))
+    renamed_old_ids = {old for old, _new in renamed_pairs}
+    if renamed_old_ids:
+        mutation.removed = [r for r in mutation.removed if r not in renamed_old_ids]
+
+    # Callers follow the rename: re-point their calls edges and stored
+    # depends_on entries from the old id to the new one (pre_callers was
+    # snapshotted before the mutation, when the old id still existed).
+    followed = 0
+    for old_id, new_id in renamed_pairs:
+        for pred in sorted(pre_callers.get(old_id, set())):
+            if not (graph.has_node(pred) and graph.has_node(new_id)):
+                continue
+            pred_node = graph.get_node(pred)
+            deps = set(getattr(pred_node, "depends_on", None) or [])
+            # The removal pass already detached the old id from the caller; the
+            # new id must be attached either way (that is the rename following
+            # through), so compare against the desired set, not just presence.
+            new_deps = (deps - {old_id}) | {new_id}
+            if new_deps != deps:
+                data = pred_node.model_dump()
+                data["depends_on"] = sorted(new_deps)
+                graph.add_code_node(CodeNode.model_validate(data))
+            if not graph.has_edge(pred, new_id):
+                graph.add_edge(pred, new_id, REL_CALLS, 1.0)
+                followed += 1
+    if followed:
+        print(f"  Re-pointed {followed} caller edge(s) to renamed component id(s)")
+        graph.save(_graph_save_path(config, project_name))
+
+    if not doc_diffs and not renamed_pairs:
+        print(
+            "\nNo important API changes detected — documentation update not "
+            "needed (knowledge graph synced to the working tree)."
+        )
+        return {"status": "no_important_changes", "impact": None}
+
+    # Severe ids: signature / new / removed changes drive caller propagation
+    severe_components: set[str] = set()
+    for fd in doc_diffs.values():
+        for change in (fd.analysis.changes if fd.analysis else []):
+            if change.change_type in SEVERE_TYPES:
+                severe_components.add(_component_id(fd.file_path, change.name))
+    severe_components &= set(mutation.changed) | set(mutation.removed)
+
+    # Callers of REMOVED components (snapshotted pre-mutation): their docs
+    # reference the now-deleted component and need refreshing.
+    removed_caller_seeds = {
+        c
+        for nid in mutation.removed
+        for c in pre_callers.get(nid, set())
+    }
+
+    # Modules that lost members: their docs must drop the removed components.
+    removed_module_ids = sorted(
+        {
+            "/".join(pre_mutation_modules.get(nid, []))
+            for nid in mutation.removed
+            if pre_mutation_modules.get(nid)
+        }
+    )
+
+    # --- Stage 3: layered impact ---
+    module_tree = graph_to_module_tree(graph)
+    pipeline = _build_pipeline_from_graph(graph, config)
     updater = IncrementalUpdater(graph, config)
-    normalized_files = [
-        f if f.startswith("/") else os.path.abspath(os.path.join(config.repo_path, f))
-        for f in changed_files
+    # Doc scope: only components whose file has an IMPORTANT change get their
+    # docs refreshed (the graph itself was already fully reconciled above).
+    doc_file_paths = {fd.file_path for fd in doc_diffs.values()}
+    doc_scope_components = [
+        cid
+        for cid in mutation.changed
+        if graph.has_node(cid)
+        and graph.get_node(cid).relative_path in doc_file_paths
     ]
-    print(f"\nAnalyzing impact of {len(normalized_files)} changed files...")
-    impact = updater.compute_impact_graph(normalized_files, module_tree, change_map)
+    impact = updater.compute_layered_impact(
+        doc_scope_components,
+        severe_components,
+        propagate=propagate,
+        max_hops=max_hops,
+        caller_seeds=removed_caller_seeds,
+    )
+    impact["modules_to_doc"] = sorted(
+        set(impact["modules_to_doc"]) | set(removed_module_ids)
+    )
+    if removed_module_ids:
+        impact["update_overview"] = True
 
-    print(f"  Changed files: {impact['changed_files'] and len(normalized_files)}")
+    # Docs skipped by manual-edit detection stay on the schedule (stale flag)
+    stale_components, stale_modules, stale_overview = _stale_doc_targets(graph)
+    impact["components_to_doc"] = sorted(
+        set(impact["components_to_doc"]) | stale_components
+    )
+    # A retried component doc is rewritten in the context of its module, so the
+    # modules owning stale components must be refreshed as well.
+    stale_component_modules = {
+        m for cid in stale_components for m in component_module_ids(graph, cid)
+    }
+    impact["modules_to_doc"] = sorted(
+        set(impact["modules_to_doc"]) | stale_modules | stale_component_modules
+    )
+    if stale_overview or stale_modules or stale_component_modules:
+        impact["update_overview"] = True
+    impact["total_components"] = len(impact["components_to_doc"])
+
+    print(f"\nImpact analysis (propagate={propagate}, max_hops={max_hops}):")
     print(f"  Changed components: {len(impact['changed_components'])}")
-    print(f"  Total affected (in module_tree): {impact['total_affected']}")
+    if impact["caller_components"]:
+        print(f"  Affected callers: {len(impact['caller_components'])}")
+    print(f"  Components to document: {len(impact['components_to_doc'])}")
+    print(f"  Modules to update: {len(impact['modules_to_doc'])}")
+    if impact["update_overview"]:
+        print("  README overview: update")
 
-    if impact.get("new_components"):
-        print("\n  New components (not in knowledge graph):")
-        for comp in impact["new_components"][:10]:
-            print(f"    + {comp}")
-        print("  ⚠️  Run 'repodoc generate' to include them in the full build.")
-
-    if impact["total_affected"] == 0:
+    if (
+        not impact["components_to_doc"]
+        and not impact["modules_to_doc"]
+        and not mutation.removed
+        and not renamed_pairs
+    ):
         print("\nNo documentation updates needed")
         return {"status": "no_updates_needed", "impact": impact}
 
+    docs_dir = config.docs_dir
+    comp_modules = _collect_component_modules(module_tree)
+
+    # --- Rehome module-less components (generate only clusters leaf nodes:
+    # functions in class-heavy repos never got a module home). Place them
+    # heuristically so their docs land in a proper module directory, and
+    # migrate any existing root-level docs into the new home. ---
+    from repodoc.graph.mutation import _place_new_component
+
+    rehome_pairs: list[tuple[str, str]] = []
+    newly_placed: set[str] = set()
+    for cid in impact["components_to_doc"]:
+        if component_module_ids(graph, cid):
+            continue
+        node = pipeline.components.get(cid)
+        if not node:
+            continue
+        _place_new_component(graph, node)
+        newly_placed.add(cid)
+        root_doc = _component_doc_path(docs_dir, [], node.name)
+        if os.path.exists(root_doc):
+            rehome_pairs.append((cid, cid))
+    if rehome_pairs:
+        print(
+            f"\nRehoming {len(rehome_pairs)} component doc(s) into module "
+            "directories..."
+        )
+        _migrate_renamed_docs(
+            graph,
+            pipeline,
+            rehome_pairs,
+            {c: [] for c, _new in rehome_pairs},
+            {c: component_module_ids(graph, c)[0] for c, _new in rehome_pairs},
+        )
+    if newly_placed:
+        # refresh tree/maps so the new homes are visible downstream
+        module_tree = graph_to_module_tree(graph)
+        comp_modules = _collect_component_modules(module_tree)
+        new_modules = {
+            component_module_ids(graph, cid)[0] for cid in newly_placed
+        }
+        impact["modules_to_doc"] = sorted(
+            set(impact["modules_to_doc"]) | new_modules
+        )
+        impact["update_overview"] = True
+        print(
+            f"  Placed {len(newly_placed)} module-less component(s) into "
+            f"{sorted(new_modules)}"
+        )
+
+    # --- Rename migration: move the existing docs to the new ids. The pairs
+    # were computed before the impact stage (the old ids are already excluded
+    # from mutation.removed, so this must run BEFORE removal cleanup below) ---
+    migrated_docs = 0
+    if renamed_pairs:
+        print(f"\nMigrating docs for {len(renamed_pairs)} renamed component(s)...")
+        migrated_docs = _migrate_renamed_docs(
+            graph,
+            pipeline,
+            renamed_pairs,
+            pre_mutation_modules,
+            comp_modules,
+        )
+
+    removed_docs = 0
+    if mutation.removed:
+        print(f"\nCleaning up docs for {len(mutation.removed)} removed component(s)...")
+        removed_docs = _remove_component_docs(
+            graph, pipeline, mutation.removed, pre_mutation_modules
+        )
+
+    cleaned_dirs = _cleanup_empty_dirs(docs_dir)
+    if cleaned_dirs:
+        print(f"  Removed {cleaned_dirs} empty doc directorie(s)")
+
     if confirm and not confirm(
-        f"\nThis will update documentation for {impact['total_affected']} component(s). Continue?"
+        f"\nThis will update {impact['total_components']} component doc(s), "
+        f"{len(impact['modules_to_doc'])} module doc(s)"
+        + (" and the README" if impact["update_overview"] else "")
+        + f" ({removed_docs} removed doc(s) cleaned). Continue?"
     ):
-        print("Aborted")
         return {"status": "aborted", "impact": impact}
 
-    # --- Regenerate affected components ---
-    print("\nRegenerating documentation for affected components...")
-    pipeline = _build_pipeline_from_graph(graph, config)
-    module_tree = pipeline.module_tree
-    docs_dir = config.docs_dir
-    code_extractor = GitCodeExtractor(config.repo_path)
+    # Module dependency map: computed once from the FINAL module tree (the
+    # rehome/rename steps above may have moved components) and shared by the
+    # module docs and the README regeneration below — the README path reads it
+    # even when no module doc is due, so it must not live inside that branch.
+    module_deps, module_dependents = _build_module_dependencies(
+        pipeline.components, module_tree
+    )
 
-    async def regenerate_component(node_id: str):
+    # --- Stage 4: regenerate docs, bottom-up (components -> modules -> README) ---
+    print(f"\nUpdating {len(impact['components_to_doc'])} component doc(s)...")
+    component_results = []
+
+    def _component_jobs() -> list[tuple[str, str, str]]:
+        jobs = []
+        for node_id in impact["components_to_doc"]:
+            node = pipeline.components.get(node_id)
+            if not node:
+                continue
+            chain = comp_modules.get(node_id, [])
+            doc_path = _component_doc_path(docs_dir, chain, node.name)
+            existing_doc = _safe_read(doc_path)
+            # Diff of the file this component lives in ('' when none)
+            code_diff = per_file_diffs.get(node.relative_path, "")
+            jobs.append((node_id, doc_path, existing_doc))
+        return jobs
+
+    component_jobs = _component_jobs()
+
+    async def _update_component(job):
+        node_id, doc_path, existing_doc = job
         node = pipeline.components.get(node_id)
         if not node:
             return None
-        module_name = _find_module_name(module_tree, node_id)
-        if not module_name:
+        if existing_doc and not force and _user_edited_doc(
+            graph, pipeline, doc_path, existing_doc
+        ):
+            print(
+                f"  SKIP {os.path.relpath(doc_path, docs_dir)}: "
+                "manually edited since last update "
+                "(use --force to overwrite; retried on next update)"
+            )
+            _mark_doc_stale(graph, pipeline, doc_path)
             return None
+        chain = comp_modules.get(node_id, [])
+        module_name = ".".join(chain)
+        code_diff = per_file_diffs.get(node.relative_path, "")
 
-        module_dir = os.path.join(docs_dir, module_name)
-        file_manager.ensure_directory(module_dir)
-        output_path = os.path.join(module_dir, f"{node.name}.md")
-
-        source_code = node.source_code or ""
-        docstring = node.docstring or ""
-        parameters = node.parameters or []
-
-        change_info = change_map.get(node_id)
-        if change_info and current_commit:
-            if change_info.change_type in (
-                ChangeType.NEW_COMPONENT,
-                ChangeType.API_SIGNATURE_CHANGED,
-            ):
-                extracted = code_extractor.extract_component_at_commit(
-                    change_info.file_path, change_info.name, current_commit
-                )
-                if extracted:
-                    source_code = extracted.get("source_code", source_code)
-                    docstring = extracted.get("docstring", docstring)
-                    parameters = extracted.get("parameters", parameters)
-            elif change_info.change_type == ChangeType.REMOVED_COMPONENT:
-                docstring = f"⚠️ DEPRECATED: This component was removed.\n\n{docstring}"
-        else:
-            # Downstream component — use current working tree
-            if node.file_path:
-                full_path = os.path.join(config.repo_path, node.file_path)
-                if os.path.exists(full_path):
-                    try:
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            source_code = f.read()
-                    except Exception:
-                        pass
-
+        predecessors = [
+            cid
+            for cid, n in pipeline.components.items()
+            if node_id in getattr(n, "depends_on", set())
+        ]
         component = {
             "name": node.name,
             "component_type": node.component_type,
             "file_path": node.file_path,
             "relative_path": node.relative_path,
-            "docstring": docstring,
-            "source_code": source_code or "",
+            "docstring": node.docstring,
+            "source_code": node.source_code or "",
             "depends_on": list(node.depends_on) if node.depends_on else [],
         }
+
+        if should_partial_update(existing_doc, code_diff):
+            return await pipeline.agent.execute(
+                {
+                    "type": "write_doc",
+                    "config": config,
+                    "input": {
+                        "type": "update_component",
+                        "component": component,
+                        "predecessors": predecessors,
+                        "module_name": module_name,
+                        "existing_doc": existing_doc,
+                        "code_diff": code_diff,
+                        "output_path": doc_path,
+                    },
+                }
+            )
+        # Full regeneration (new doc, missing doc, or large change)
         return await pipeline.agent.execute(
             {
                 "type": "write_doc",
@@ -933,29 +1424,218 @@ async def run_update(
                 "input": {
                     "type": "component",
                     "component": component,
-                    "output_path": output_path,
+                    "predecessors": predecessors,
+                    "module_name": module_name,
+                    "output_path": doc_path,
                 },
             }
         )
 
-    sem = asyncio.Semaphore(16)
-
-    async def _run(node_id: str):
-        async with sem:
-            return await regenerate_component(node_id)
-
-    results = await asyncio.gather(
-        *(_run(cid) for cid in impact["affected_components"]),
-        return_exceptions=True,
+    component_results = await _run_jobs_with_retry(
+        component_jobs, _update_component, "component docs"
     )
+
+    # Module docs (layer 2): refresh modules whose members changed
+    module_results = []
+    module_jobs: list[tuple[str, str, dict, str]] = []
+    if impact["modules_to_doc"]:
+        print(f"\nUpdating {len(impact['modules_to_doc'])} module doc(s)...")
+
+        def _module_info(module_id: str) -> tuple[str, dict]:
+            parts = module_id.split("/")
+            info: Any = module_tree
+            for i, p in enumerate(parts):
+                if not isinstance(info, dict) or info.get(p) is None or not isinstance(info[p], dict):
+                    return parts[-1], {"components": [], "children": {}, "path": ""}
+                info = info[p]
+                if i < len(parts) - 1:
+                    info = info.get("children", {})
+            return parts[-1], info
+
+        for module_id in impact["modules_to_doc"]:
+            module_name, module_info = _module_info(module_id)
+            module_dir = _module_doc_path(config, module_id)
+            module_jobs.append((module_id, module_name, module_info, module_dir))
+
+        async def _update_module(job):
+            module_id, module_name, module_info, doc_path = job
+            existing_doc = _safe_read(doc_path)
+            if existing_doc and not force and _user_edited_doc(
+                graph, pipeline, doc_path, existing_doc
+            ):
+                print(
+                    f"  SKIP {os.path.relpath(doc_path, docs_dir)}: "
+                    "manually edited since last update "
+                    "(use --force to overwrite; retried on next update)"
+                )
+                _mark_doc_stale(graph, pipeline, doc_path)
+                return None
+
+            component_docs_content = {}
+            for comp_id in module_info.get("components", []):
+                node = pipeline.components.get(comp_id)
+                if not (node and node.name):
+                    continue
+                chain = comp_modules.get(comp_id, [module_name])
+                comp_doc_path = _component_doc_path(docs_dir, chain, node.name)
+                content = _safe_read(comp_doc_path)
+                if content:
+                    component_docs_content[node.name] = content[:3000]
+
+            child_docs_content = {}
+            children = module_info.get("children", {})
+            for child_name in children.keys():
+                child_doc_path = os.path.join(
+                    docs_dir, module_id, f"{child_name}.md"
+                )
+                content = _safe_read(child_doc_path)
+                if content:
+                    child_docs_content[child_name] = content[:2000]
+
+            path_parts = module_id.split("/")
+            parent_module = path_parts[-2] if len(path_parts) > 1 else ""
+
+            if should_partial_update(existing_doc, ""):
+                return await pipeline.agent.execute(
+                    {
+                        "type": "write_doc",
+                        "config": config,
+                        "input": {
+                            "type": "update_module",
+                            "module_name": module_name,
+                            "module_path": module_info.get("path", module_id),
+                            "parent_module": parent_module,
+                            "sibling_modules": [],
+                            "module_dependencies": sorted(
+                                module_deps.get(module_id, set())
+                            ),
+                            "dependent_modules": sorted(
+                                module_dependents.get(module_id, set())
+                            ),
+                            "sub_modules": list(children.keys()),
+                            "component_docs": component_docs_content,
+                            "children_docs": child_docs_content,
+                            "existing_doc": existing_doc,
+                            "output_path": doc_path,
+                        },
+                    }
+                )
+            return await pipeline.agent.execute(
+                {
+                    "type": "write_doc",
+                    "config": config,
+                    "input": {
+                        "type": "module",
+                        "module_name": module_name,
+                        "module_path": module_info.get("path", module_id),
+                        "parent_module": parent_module,
+                        "sibling_modules": [],
+                        "module_dependencies": sorted(
+                            module_deps.get(module_id, set())
+                        ),
+                        "dependent_modules": sorted(
+                            module_dependents.get(module_id, set())
+                        ),
+                        "sub_modules": list(children.keys()),
+                        "component_docs": component_docs_content,
+                        "children_docs": child_docs_content,
+                        "output_path": doc_path,
+                    },
+                }
+            )
+
+        module_results = await _run_jobs_with_retry(
+            module_jobs, _update_module, "module docs"
+        )
+
+    # Overview (layer 3)
+    overview_result = None
+    if impact["update_overview"]:
+        print("\nUpdating README overview...")
+        readme_path = os.path.join(docs_dir, "README.md")
+        existing_doc = _safe_read(readme_path)
+        if existing_doc and not force and _user_edited_doc(
+            graph, pipeline, readme_path, existing_doc
+        ):
+            print(
+                f"  SKIP {os.path.relpath(readme_path, docs_dir)}: "
+                "manually edited since last update "
+                "(use --force to overwrite; retried on next update)"
+            )
+            _mark_doc_stale(graph, pipeline, readme_path)
+        else:
+            module_docs_summary = {}
+            for name in module_tree.keys():
+                content = _safe_read(os.path.join(docs_dir, f"{name}.md"))
+                if content:
+                    module_docs_summary[name] = content[:2500]
+
+            overview_input = {
+                "type": "update_overview",
+                "repo_name": os.path.basename(config.repo_path),
+                "component_count": len(pipeline.components),
+                "module_count": len(module_tree),
+                "module_dependencies": {
+                    m: sorted(ds) for m, ds in module_deps.items()
+                },
+                "module_docs_summary": module_docs_summary,
+                "existing_doc": existing_doc,
+                "output_path": readme_path,
+            }
+            if should_partial_update(existing_doc, ""):
+                overview_result = await pipeline.agent.execute(
+                    {"type": "write_doc", "config": config, "input": overview_input}
+                )
+            else:
+                overview_result = await pipeline.agent.execute(
+                    {
+                        "type": "write_doc",
+                        "config": config,
+                        "input": {
+                            "type": "overview",
+                            "repo_name": overview_input["repo_name"],
+                            "component_count": overview_input["component_count"],
+                            "module_count": overview_input["module_count"],
+                            "module_dependencies": overview_input["module_dependencies"],
+                            "module_docs_summary": overview_input["module_docs_summary"],
+                            "output_path": readme_path,
+                        },
+                    }
+                )
+
+    # --- Sync graph doc nodes + persist ---
+    for job, result in zip(component_jobs, component_results):
+        node_id, doc_path, _existing = job
+        if result is not None and getattr(result, "success", False) and result.output:
+            _sync_doc_node(graph, pipeline, doc_path, result.output.get("content", ""), target_id=node_id)
+    for job, result in zip(module_jobs, module_results):
+        module_id, _name, _info, doc_path = job
+        if result is not None and getattr(result, "success", False) and result.output:
+            _sync_doc_node(graph, pipeline, doc_path, result.output.get("content", ""), target_id=module_id)
+    if overview_result is not None and getattr(overview_result, "success", False) and overview_result.output:
+        _sync_doc_node(graph, pipeline, readme_path, overview_result.output.get("content", ""))
+
+    # --- Link / mermaid validation ---
+    print("\nValidating links and mermaid diagrams...")
+    link_results = validate_and_fix_links(docs_dir)
+    # The validator rewrites files AFTER the snapshots above were taken; adopt
+    # those rewrites so the next run does not mistake them for manual edits.
+    refreshed = refresh_doc_snapshots(
+        graph,
+        [os.path.join(docs_dir, rel) for rel in link_results.get("fixed", [])],
+    )
+    if refreshed:
+        print(f"  Refreshed {refreshed} doc snapshot(s) after link/mermaid fixes")
+    graph.save(_graph_save_path(config, project_name))
 
     def is_successful_result(r) -> bool:
         return not isinstance(r, Exception) and bool(r) and getattr(r, "success", False)
 
-    success_count = sum(1 for r in results if is_successful_result(r))
-    print(
-        f"\nSuccessfully regenerated {success_count}/{len(results)} component(s)"
-    )
+    success_count = sum(1 for r in component_results if is_successful_result(r))
+    module_success = sum(1 for r in module_results if is_successful_result(r))
+    print(f"\nSuccessfully updated {success_count}/{len(component_results)} component doc(s), "
+          f"{module_success}/{len(module_results)} module doc(s)"
+          + (", README" if overview_result is not None and getattr(overview_result, "success", False) else ""))
 
     duration = time.time() - start_time
 
@@ -974,9 +1654,25 @@ async def run_update(
         prompt_tokens=usage["prompt"],
         completion_tokens=usage["completion"],
         llm_calls=usage["llm_calls"],
-        components_processed=len(impact["affected_components"]),
+        components_processed=len(impact["components_to_doc"]),
         components_updated=success_count,
         status="success",
+        metadata={
+            "graph_mutation": {
+                "added": len(mutation.added),
+                "updated": len(mutation.updated),
+                "removed": len(mutation.removed),
+                "edges_added": len(mutation.added_edges),
+                "edges_removed": len(mutation.removed_edges),
+            },
+            "modules_updated": module_success,
+            "overview_updated": bool(
+                overview_result is not None
+                and getattr(overview_result, "success", False)
+            ),
+            "docs_removed": removed_docs,
+            "docs_migrated": migrated_docs,
+        },
     )
 
     if current_commit and os.path.exists(metadata_path):
@@ -990,7 +1686,7 @@ async def run_update(
                 metadata["update_info"]["last_base_commit"] = base_commit
                 metadata["update_info"]["components_updated"] = success_count
                 metadata["update_info"]["affected_components"] = impact[
-                    "affected_components"
+                    "components_to_doc"
                 ]
                 metadata["generation_info"]["timestamp"] = datetime.now().isoformat()
                 file_manager.save_json(metadata, metadata_path)
@@ -1002,5 +1698,7 @@ async def run_update(
         "status": "success",
         "impact": impact,
         "updated": success_count,
-        "total": len(results),
+        "total": len(component_results),
+        "modules_updated": module_success,
+        "removed_docs": removed_docs,
     }
