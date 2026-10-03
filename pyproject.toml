@@ -26,6 +26,13 @@ dependencies = [
 [project.scripts]
 repodoc = "repodoc.cli:cli"
 
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
