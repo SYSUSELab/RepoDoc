@@ -51,13 +51,29 @@ Requirements:
 Return ONLY the Markdown document content, no extra explanation."""
 
 
+def validate_llm_output(content: str, min_chars: int = 20) -> str | None:
+    """Return an error message when LLM output is unusable, else None.
+
+    Guards the pipeline against empty / truncated generations (observed in
+    practice: 0-byte docs recorded as successful). An odd number of code
+    fences is the cheapest reliable truncation signal."""
+    if not content or not content.strip():
+        return "empty LLM output"
+    stripped = content.strip()
+    if len(stripped) < min_chars:
+        return f"LLM output too short ({len(stripped)} chars)"
+    if stripped.count("```") % 2 != 0:
+        return "unbalanced code fences (truncated output?)"
+    return None
+
+
 class DocAgent:
     """Documentation agent: generates overview/module/component/architecture docs."""
 
     def __init__(self, config: Config):
         self.config = config
         self.tools = {
-            "file_writer": FileWriterTool(),
+            "file_writer": FileWriterTool(root=config.docs_dir),
             "llm_caller": LLMTool(config),
         }
 
@@ -102,15 +118,19 @@ class DocAgent:
         self, llm_tool, system_prompt: str, user_prompt: str, *, temperature=0.3, max_tokens=8192
     ) -> SkillResult:
         result = await llm_tool.execute(
-            prompt=f"{system_prompt}\n\n{user_prompt}",
+            prompt=user_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
+            system_prompt=system_prompt or None,
         )
         if not result.success:
             return SkillResult(success=False, error=result.error)
         return SkillResult(success=True, output=result.output)
 
     async def _write_result(self, output_path: str, content: str, doc_type: str, file_tool) -> SkillResult:
+        validation_error = validate_llm_output(content)
+        if validation_error:
+            return SkillResult(success=False, error=validation_error)
         write_result = await file_tool.execute(file_path=output_path, content=content)
         if not write_result.success:
             return SkillResult(success=False, error=write_result.error)

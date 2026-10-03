@@ -21,30 +21,38 @@ class ToolResult:
         return f"ToolResult(success=False, error={self.error})"
 
 
-class FileReaderTool:
-    name = "file_reader"
-    description = "Read file content from the repository"
-
-    async def execute(self, file_path: str, **kwargs) -> ToolResult:
-        try:
-            if not os.path.exists(file_path):
-                return ToolResult(success=False, error=f"File not found: {file_path}")
-
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-
-            return ToolResult(success=True, output=content)
-        except Exception as e:
-            return ToolResult(success=False, error=str(e))
-
-
 class FileWriterTool:
+    """Writes generated docs, constrained to a root directory.
+
+    LLM output (e.g. module names) flows into output paths, so a hostile or
+    buggy generation could otherwise escape the docs directory (`../../x`).
+    All writes are rejected unless the resolved path stays under `root`."""
+
     name = "file_writer"
     description = "Write content to a file in the repository"
 
+    def __init__(self, root: str | None = None):
+        self.root = os.path.realpath(root) if root else None
+
+    def _is_within_root(self, file_path: str) -> bool:
+        if self.root is None:
+            return True
+        real = os.path.realpath(file_path)
+        try:
+            return os.path.commonpath([self.root, real]) == self.root
+        except ValueError:
+            return False
+
     async def execute(self, file_path: str, content: str, **kwargs) -> ToolResult:
         try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            if not self._is_within_root(file_path):
+                return ToolResult(
+                    success=False,
+                    error=f"Refusing to write outside {self.root}: {file_path}",
+                )
+            directory = os.path.dirname(file_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(content)
             return ToolResult(success=True, output=f"Written to {file_path}")
@@ -70,6 +78,7 @@ class LLMTool:
         model: str = None,
         temperature: float = 0.0,
         max_tokens: int = 8192,
+        system_prompt: str | None = None,
         **kwargs,
     ) -> ToolResult:
         try:
@@ -79,6 +88,7 @@ class LLMTool:
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                system_prompt=system_prompt,
             )
             return ToolResult(success=True, output=result)
         except Exception as e:

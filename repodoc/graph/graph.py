@@ -5,6 +5,8 @@ Backed by NetworkX DiGraph; supports add/query nodes and edges, and JSON save/lo
 """
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
@@ -211,8 +213,25 @@ class HeterogeneousGraph:
                 }
             )
         doc = {"nodes": nodes_payload, "edges": edges_payload}
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=2, ensure_ascii=False)
+        # Atomic write: a crash mid-save leaves the previous graph intact
+        # instead of a truncated JSON that the next run cannot load.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".repodoc-graph-"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            # mkstemp creates 0600; keep the graph group/world readable.
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     @classmethod
     def load(cls, path: str | Path) -> "HeterogeneousGraph":

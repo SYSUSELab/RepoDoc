@@ -6,6 +6,10 @@ import os
 # Token limit for clustering: skip LLM cluster when content is under this (CodeWiki default)
 MAX_TOKEN_PER_MODULE = 36_369
 
+# Source files larger than this are skipped during analysis (generated /
+# minified files only bloat the graph and the LLM prompts).
+MAX_SOURCE_FILE_BYTES = 1_500_000
+
 # The OpenAI SDK always appends "/chat/completions" to base_url, so a
 # configured URL that already ends with it must be stripped (otherwise the
 # request hits ".../chat/completions/chat/completions" -> 404).

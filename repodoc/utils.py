@@ -3,10 +3,12 @@
 import os
 import json
 import re
-import glob
+import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import unquote
 
 # Lazy-loaded for count_tokens to avoid import cost when not clustering
 _tiktoken_enc = None
@@ -25,116 +27,72 @@ def count_tokens(text: str) -> int:
     return len(_tiktoken_enc.encode(text))
 
 
+# Diagram header keywords (first significant line of a Mermaid block).
+MERMAID_DIAGRAM_TYPES = {
+    "flowchart", "graph", "sequenceDiagram", "classDiagram",
+    "stateDiagram", "stateDiagram-v2", "erDiagram", "gantt", "gitGraph",
+    "journey", "pie", "mindmap", "timeline", "quadrantChart",
+    "requirementDiagram", "C4Context", "C4Container", "C4Component",
+    "sankey-beta", "xychart-beta", "block-beta", "packet-beta",
+    "architecture-beta", "kanban", "zenuml",
+}
+
+
 def extract_mermaid_diagrams(content: str) -> list[str]:
-    """Extract all Mermaid code blocks from markdown content."""
-    pattern = r"```mermaid\n(.*?)```"
+    """Extract all Mermaid code blocks from markdown content (tolerant of
+    trailing spaces after the fence tag and CRLF line endings)."""
+    pattern = r"```mermaid[ \t]*\r?\n(.*?)```"
     matches = re.findall(pattern, content, re.DOTALL)
     return [m.strip() for m in matches]
 
 
+def _first_significant_mermaid_line(code: str) -> str:
+    """First non-empty line that is not a Mermaid directive/comment."""
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("%%"):
+            continue
+        return stripped
+    return ""
+
+
 def validate_mermaid_syntax(diagram_code: str) -> tuple[bool, str]:
-    """Validate Mermaid diagram syntax.
+    """Validate a Mermaid diagram by its header.
+
+    Deliberately conservative: without a real Mermaid parser, deeper checks
+    produced false alarms and destructive "fixes" (sequence diagrams were
+    rebuilt as flowcharts and deleted). Only an unknown/missing diagram type
+    is reported here; anything else is left untouched.
 
     Returns:
         (is_valid, error_message) - tuple of validity and error message
     """
-    if not diagram_code:
+    if not diagram_code or not diagram_code.strip():
         return False, "Empty diagram code"
 
-    diagram_type = diagram_code.split()[0] if diagram_code.split() else ""
+    first_line = _first_significant_mermaid_line(diagram_code)
+    if not first_line:
+        return False, "Empty diagram code"
 
-    valid_types = [
-        "flowchart",
-        "graph",
-        "pie",
-        "sequenceDiagram",
-        "classDiagram",
-        "stateDiagram",
-        "stateDiagram-v2",
-        "erDiagram",
-        "gantt",
-        "gitGraph",
-        "journey",
-    ]
-
-    if diagram_type not in valid_types:
+    diagram_type = first_line.split()[0].rstrip(";,")
+    base_type = diagram_type.split("-")[0]
+    if (
+        diagram_type not in MERMAID_DIAGRAM_TYPES
+        and base_type not in MERMAID_DIAGRAM_TYPES
+    ):
         return False, f"Unknown diagram type: {diagram_type}"
 
-    if diagram_type in ("flowchart", "graph"):
-        return _validate_flowchart(diagram_code)
-    elif diagram_type == "sequenceDiagram":
-        return _validate_sequence(diagram_code)
-    elif diagram_type == "classDiagram":
-        return _validate_class(diagram_code)
-
-    return True, "Valid"
-
-
-def _validate_flowchart(code: str) -> tuple[bool, str]:
-    """Validate flowchart/graph syntax."""
-    if " --> " not in code and " --- " not in code:
-        return False, "No edges found in flowchart"
-    return True, "Valid"
-
-
-def _validate_sequence(code: str) -> tuple[bool, str]:
-    """Validate sequence diagram syntax."""
-    lines = code.split("\n")
-    participants = set()
-    for line in lines:
-        line = line.strip()
-        if "->>" in line:
-            parts = re.split(r"[->>]+", line)
-            participants.update([p.strip() for p in parts if p.strip()])
-    if not participants:
-        return False, "No participants in sequence diagram"
-    return True, "Valid"
-
-
-def _validate_class(code: str) -> tuple[bool, str]:
-    """Validate class diagram syntax."""
-    if "class " not in code:
-        return False, "No class definitions found"
     return True, "Valid"
 
 
 def fix_invalid_mermaid(content: str) -> str:
-    """Fix or remove invalid Mermaid diagrams in markdown content.
+    """Never rewrite or delete Mermaid blocks.
 
-    Returns:
-        Content with invalid Mermaid diagrams fixed or removed.
-    """
-    pattern = r"(```mermaid\n)(.*?)(```)"
-
-    def replace_diagram(match):
-        diagram_code = match.group(2).strip()
-        is_valid, _ = validate_mermaid_syntax(diagram_code)
-
-        if is_valid:
-            return match.group(0)
-
-        # Try to create a simple valid flowchart
-        lines = diagram_code.split("\n")
-        valid_lines = []
-        for line in lines:
-            line = line.strip()
-            if not line or line.startswith("#") or line.startswith("//"):
-                continue
-            # Keep lines that look like valid mermaid syntax
-            if any(x in line for x in ["-->", "---", "--", "==", "|", "+", "}", "{"]):
-                valid_lines.append(line)
-
-        if valid_lines:
-            return (
-                "```mermaid\nflowchart TD\n    "
-                + "\n    ".join(valid_lines[:10])
-                + "\n```"
-            )
-
-        # Remove the entire block if it can't be fixed
-        return ""
-
-    return re.sub(pattern, replace_diagram, content, flags=re.DOTALL)
+    The previous implementation rebuilt "invalid" blocks with regexes and
+    deleted anything it could not salvage — it corrupted valid diagrams
+    (e.g. sequenceDiagram) because the validator itself was too strict.
+    Invalid blocks are now reported and left for the next LLM/human pass."""
+    return content
 
 
 class FileManager:
@@ -147,9 +105,10 @@ class FileManager:
 
     @staticmethod
     def save_json(data: Any, filepath: str) -> None:
-        """Save data as JSON to file."""
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        """Save data as JSON to file (atomically: temp file + rename)."""
+        FileManager.save_text(
+            json.dumps(data, indent=2, ensure_ascii=False), filepath
+        )
 
     @staticmethod
     def load_json(filepath: str) -> Optional[dict[str, Any]]:
@@ -161,9 +120,28 @@ class FileManager:
 
     @staticmethod
     def save_text(content: str, filepath: str) -> None:
-        """Save text content to file."""
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
+        """Save text content to file atomically (temp file + rename).
+
+        A crash mid-write never leaves a truncated file behind: readers see
+        either the old or the new content, never a partial one."""
+        directory = os.path.dirname(os.path.abspath(filepath))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".repodoc-tmp-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            # mkstemp creates 0600 files; os.replace keeps that mode. Generated
+            # artifacts are not secrets and should stay group/world readable.
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, filepath)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def load_text(filepath: str) -> str:
@@ -175,15 +153,129 @@ class FileManager:
 file_manager = FileManager()
 
 
+class FileLock:
+    """Exclusive advisory lock for a single writer across processes.
+
+    Used by `repodoc update` so two concurrent runs cannot interleave graph
+    mutation and doc writes. POSIX flock semantics: the lock dies with the
+    process (no stale lock files to clean up)."""
+
+    def __init__(self, path: str, timeout: float = 0.0):
+        self.path = path
+        self.timeout = timeout
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> "FileLock":
+        try:
+            import fcntl
+        except ImportError:  # pragma: no cover - non-POSIX fallback
+            fcntl = None
+
+        self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o644)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    os.close(self._fd)
+                    self._fd = None
+                    raise TimeoutError(
+                        f"Another RepoDoc update is already running "
+                        f"(lock: {self.path})"
+                    )
+                time.sleep(0.2)
+        os.ftruncate(self._fd, 0)
+        os.write(self._fd, str(os.getpid()).encode("ascii"))
+        return self
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except Exception:
+            pass
+        os.close(self._fd)
+        self._fd = None
+
+    def __enter__(self) -> "FileLock":
+        return self.acquire()
+
+    def __exit__(self, *exc_info) -> None:
+        self.release()
+
+
 def get_all_markdown_files(directory: str) -> set[str]:
-    """Get all markdown files in directory (relative paths)."""
+    """Get all markdown files in directory (relative, '/'-separated paths)."""
     md_files = set()
     for root, _, files in os.walk(directory):
         for f in files:
             if f.endswith(".md"):
                 rel_path = os.path.relpath(os.path.join(root, f), directory)
-                md_files.add(rel_path)
+                md_files.add(rel_path.replace(os.sep, "/"))
     return md_files
+
+
+def summarize_markdown(content: str, budget: int = 2000) -> str:
+    """Structural summary of a generated doc for the parent layer's prompt.
+
+    Keeps the title, the opening paragraph, the section outline, and the
+    leading bullets of the document. Unlike a raw `content[:budget]` cut this
+    preserves *what the doc covers* even when the body is long, and never
+    ends mid-sentence (it truncates on a line boundary)."""
+    if not content:
+        return ""
+    text = content.strip()
+    if len(text) <= budget:
+        return text
+
+    lines = text.splitlines()
+    title = ""
+    first_para: list[str] = []
+    headings: list[str] = []
+    bullets: list[str] = []
+    in_para = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if not title and stripped.startswith("# "):
+                title = stripped[:200]
+            headings.append(stripped[:120])
+            in_para = False
+            continue
+        if not stripped:
+            in_para = False
+            continue
+        if stripped.startswith(("- ", "* ")) and len(bullets) < 12:
+            bullets.append(stripped[:200])
+            continue
+        if not first_para and not in_para:
+            first_para.append(stripped[:400])
+            in_para = True
+        elif in_para and len(first_para) < 4:
+            first_para.append(stripped[:400])
+
+    outline = [h for h in headings if h != title][:20]
+    parts: list[str] = []
+    if title:
+        parts.append(title)
+    if first_para:
+        parts.append("\n".join(first_para))
+    if outline:
+        parts.append("Sections:\n" + "\n".join(f"- {h}" for h in outline))
+    if bullets:
+        parts.append("Key points:\n" + "\n".join(bullets))
+
+    summary = "\n\n".join(parts)
+    if len(summary) > budget:
+        cut = summary.rfind("\n", 0, budget)
+        summary = summary[: cut if cut > 0 else budget]
+    return summary or text[:budget]
 
 
 def extract_markdown_links(content: str) -> list[tuple[str, str]]:
@@ -197,55 +289,86 @@ def extract_markdown_links(content: str) -> list[tuple[str, str]]:
     return matches
 
 
+_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\(([^\)]+)\)")
+# Capturing group so re.split KEEPS the fenced blocks in the segment list.
+_FENCED_BLOCK_PATTERN = re.compile(r"(```.*?```)", re.DOTALL)
+_EXTERNAL_PREFIXES = (
+    "http://", "https://", "mailto:", "tel:", "data:", "ftp://", "//", "#",
+)
+
+
+def _link_target_resolves(
+    link_target: str, rel_path: str, available_files: set[str]
+) -> bool:
+    """True when a relative link resolves to an existing generated doc.
+
+    Resolution is relative to the linking file's directory (a link like
+    `Model.md` inside `core/A.md` means `core/Model.md`), with site-absolute
+    links (`/core/Model.md`) resolved from the docs root."""
+    clean = unquote(link_target.split("#")[0].split("?")[0]).strip()
+    if not clean:
+        return True  # pure anchor/query link
+    if clean.startswith("/"):
+        resolved = clean.lstrip("/")
+    else:
+        base_dir = os.path.dirname(rel_path)
+        resolved = os.path.normpath(os.path.join(base_dir, clean))
+    resolved = resolved.replace(os.sep, "/").replace("\\", "/")
+    return resolved in available_files
+
+
 def validate_and_fix_links(
     docs_dir: str, remove_broken: bool = True, fix_mermaid: bool = True
 ) -> dict[str, list[str]]:
-    """Validate and optionally fix broken links and Mermaid diagrams in markdown files.
+    """Validate and optionally fix broken links in markdown files.
+
+    Mermaid blocks are never rewritten (see fix_invalid_mermaid). Broken
+    links are removed only outside fenced code blocks, and a link counts as
+    valid only when it resolves relative to the linking file.
 
     Args:
         docs_dir: Root directory containing markdown files
         remove_broken: If True, remove broken links; if False, keep them
-        fix_mermaid: If True, fix invalid Mermaid diagrams; if False, remove them
+        fix_mermaid: Kept for API compatibility (no-op).
 
     Returns:
         Dict with 'fixed', 'skipped', 'removed', and 'mermaid_fixed' lists
     """
     available_files = get_all_markdown_files(docs_dir)
-    available_basenames = {os.path.splitext(f)[0] for f in available_files}
 
     results = {"fixed": [], "skipped": [], "removed": [], "mermaid_fixed": []}
 
-    for md_file in glob.glob(os.path.join(docs_dir, "**/*.md"), recursive=True):
-        rel_path = os.path.relpath(md_file, docs_dir)
-        with open(md_file, "r", encoding="utf-8") as f:
-            content = f.read()
+    for rel_path in sorted(available_files):
+        md_file = os.path.join(docs_dir, rel_path)
+        try:
+            with open(md_file, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            results["skipped"].append(f"{rel_path}: {e}")
+            continue
 
         original_content = content
 
-        links = extract_markdown_links(content)
+        # Split into text / fenced-code segments (capture group keeps the
+        # fences); only the text segments are link-checked and rewritten.
+        segments = _FENCED_BLOCK_PATTERN.split(content)
+        for i in range(0, len(segments), 2):
 
-        for link_text, link_target in links:
-            if link_target.startswith(("http", "https", "mailto:", "#")):
-                continue
+            def _replace(match, _rel=rel_path):
+                link_text, link_target = match.group(1), match.group(2)
+                if link_target.startswith(_EXTERNAL_PREFIXES):
+                    return match.group(0)
+                if _link_target_resolves(link_target, _rel, available_files):
+                    return match.group(0)
+                broken = f"[{link_text}]({link_target})"
+                results["removed"].append(f"{_rel}: {broken}")
+                if not remove_broken:
+                    return match.group(0)
+                return link_text
 
-            link_target_clean = link_target.split("#")[0].split("?")[0]
-            if not link_target_clean:
-                continue
+            segments[i] = _LINK_PATTERN.sub(_replace, segments[i])
 
-            target_basename = os.path.splitext(os.path.basename(link_target_clean))[0]
-
-            if link_target_clean in available_files:
-                continue
-
-            if target_basename in available_basenames:
-                continue
-
-            if not remove_broken:
-                continue
-
-            broken_link = f"[{link_text}]({link_target})"
-            content = content.replace(broken_link, link_text)
-            results["removed"].append(f"{rel_path}: {broken_link}")
+        content = "".join(segments)
 
         if fix_mermaid:
             mermaid_fixed = fix_invalid_mermaid(content)
@@ -254,8 +377,7 @@ def validate_and_fix_links(
                 results["mermaid_fixed"].append(rel_path)
 
         if content != original_content:
-            with open(md_file, "w", encoding="utf-8") as f:
-                f.write(content)
+            file_manager.save_text(content, md_file)
             results["fixed"].append(rel_path)
 
     return results

@@ -146,6 +146,22 @@ class LLMClient:
             headers["x-opencode-session"] = "repodoc"
         return headers
 
+    @staticmethod
+    def build_messages(
+        prompt: str, system_prompt: str | None = None
+    ) -> list[dict[str, str]]:
+        """Chat messages with the instructions in the system role.
+
+        Keeping the system prompt in its own role (instead of concatenating
+        it into the user message) preserves instruction priority and makes
+        untrusted repository content in the user message less able to
+        override the task."""
+        messages: list[dict[str, str]] = []
+        if system_prompt and system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
     async def complete(
         self,
         prompt: str,
@@ -153,12 +169,14 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 8192,
         response_format: str | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[str, TokenUsage]:
         """Call the LLM and record token usage into self.history.
 
         response_format: OpenAI-compatible structured output mode, e.g.
         "json_object" (None = default free-form output). Endpoints that do
         not support it fail with APIError and fall back automatically.
+        system_prompt: optional system-role instructions.
         """
         from openai import AsyncOpenAI
         from openai import APIError
@@ -176,15 +194,21 @@ class LLMClient:
         client = AsyncOpenAI(**openai_kwargs)
 
         if len(prompt) > _MAX_PROMPT_CHARS:
+            # Cut on a line boundary (never mid-line): keeps code fences and
+            # unified diffs readable for the model even when truncated.
+            cut = prompt.rfind("\n", 0, _MAX_PROMPT_CHARS)
+            prompt = prompt[: cut if cut > 0 else _MAX_PROMPT_CHARS]
             logger.warning(
-                f"Prompt too long ({len(prompt)} chars), truncating to 60K"
+                "Prompt too long (%d chars), truncated to %d chars at a line "
+                "boundary (tail dropped)",
+                len(prompt),
+                _MAX_PROMPT_CHARS,
             )
-            prompt = prompt[:_MAX_PROMPT_CHARS]
 
         def _create(mt: int, rf: str | None):
             kwargs = dict(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=self.build_messages(prompt, system_prompt),
                 temperature=temperature,
                 max_tokens=mt,
             )
@@ -264,6 +288,7 @@ class LLMClient:
         temperature: float = 0.0,
         max_tokens: int = 8192,
         response_format: str | None = None,
+        system_prompt: str | None = None,
     ) -> tuple[str, TokenUsage]:
         """Synchronous wrapper. Only call outside a running event loop."""
         return asyncio.run(
@@ -273,6 +298,7 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 response_format=response_format,
+                system_prompt=system_prompt,
             )
         )
 
@@ -297,6 +323,7 @@ def call_llm(
     temperature: float = 0.0,
     max_tokens: int = 8192,
     response_format: str | None = None,
+    system_prompt: str | None = None,
 ) -> tuple[str, TokenUsage]:
     """Call LLM with the given prompt (OpenAI-compatible chat API).
 
@@ -307,6 +334,7 @@ def call_llm(
         temperature: Sampling temperature.
         max_tokens: Max response tokens.
         response_format: Optional structured output mode (e.g. "json_object").
+        system_prompt: Optional system-role instructions.
 
     Returns:
         Tuple of (assistant message content, token usage dict).
@@ -319,6 +347,7 @@ def call_llm(
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            system_prompt=system_prompt,
         )
     except Exception:
         _LIMITER.release(False)
@@ -334,6 +363,7 @@ async def call_llm_async(
     temperature: float = 0.0,
     max_tokens: int = 8192,
     response_format: str | None = None,
+    system_prompt: str | None = None,
 ) -> tuple[str, TokenUsage]:
     """Async version of call_llm with OpenAI-compatible async chat API."""
     await _LIMITER.acquire_async()
@@ -344,6 +374,7 @@ async def call_llm_async(
             temperature=temperature,
             max_tokens=max_tokens,
             response_format=response_format,
+            system_prompt=system_prompt,
         )
     except Exception:
         _LIMITER.release(False)
