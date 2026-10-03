@@ -20,17 +20,45 @@ repodoc config show            # Show current configuration
 `repodoc update` works in four stages:
 
 1. **Change analysis** — git diff (old commit vs working tree, incl. deleted and
-   untracked files) is re-analyzed per file; changes are classified by severity.
+   untracked files) is re-analyzed per file; changes are classified by severity
+   and keyed by exact component id (methods included). Files outside the
+   generation include/ignore rules are skipped, and an unreadable or empty file
+   is never mistaken for a deletion.
 2. **Graph mutation** — the knowledge graph is updated in place: new components
    are added (with module placement), modified components overwritten (with
-   calls-edge diffs), removed components deleted with all incident edges.
-3. **Layered impact** — changes propagate over calls edges to affected callers
-   (bounded by `--max-hops`, gated by severity), then to module docs and the
-   README overview.
+   calls/implements edge diffs), removed components deleted with all incident
+   edges. Inheritance/interface relations are stored as `implements` edges,
+   separate from `calls`.
+3. **Layered impact** — changes propagate over calls and implements edges to
+   affected callers/subclasses (bounded by `--max-hops`, gated by severity),
+   then to module docs and the README overview.
 4. **Doc update** — existing docs are updated minimally (old doc embedded as
    the format anchor; only affected sections change). Docs you edited by hand
    are skipped with a warning (`--force` overwrites them); removed components
    have their docs cleaned up; renamed files migrate their docs.
+
+Updates are crash-safe: the knowledge graph is written atomically, a lock
+prevents concurrent runs, and docs that fail (or that a crash left unfinished)
+are journaled in `{data}/{project}_pending_updates.json`. The git watermark in
+the metadata only advances once nothing is pending, so the next
+`repodoc update` resumes exactly those docs.
+
+Generation is also guarded: empty or truncated LLM outputs (unbalanced code
+fences) are rejected instead of written as zero-byte docs, all doc writes are
+confined to the docs directory, and generated stats land in
+`metadata.doc_generation`. Link validation resolves targets relative to the
+linking file, never rewrites fenced code blocks, and never edits Mermaid
+diagrams (invalid ones are reported only). Dependency/build trees such as
+`node_modules`, `vendor`, `dist` and `target` are excluded, and oversized
+source files are skipped.
+
+Prompting and clustering are reproducible and budget-aware: instructions go
+in the system role (with an explicit untrusted-data guard), each layer
+receives structural summaries (title, opening paragraph, section outline) of
+its children's docs instead of raw character cuts, and clustering responses
+are cached by prompt + model in `{data}/clustering_cache.json` so reruns and
+ablations reuse the same module tree. Cluster quality stats (module count,
+depth, empty modules, largest module) are printed after clustering.
 
 ## Configuration
 
