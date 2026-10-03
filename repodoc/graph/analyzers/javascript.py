@@ -9,9 +9,22 @@ from tree_sitter import Parser, Language
 import tree_sitter_javascript
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
+
+_JS_LANGUAGE = None
+_JS_PARSER = None
+
+
+def _get_js_parser():
+    """Process-wide JavaScript parser (parsing is single-threaded; creating a
+    Language/Parser per file is pure overhead)."""
+    global _JS_LANGUAGE, _JS_PARSER
+    if _JS_PARSER is None:
+        _JS_LANGUAGE = Language(tree_sitter_javascript.language())
+        _JS_PARSER = Parser(_JS_LANGUAGE)
+    return _JS_PARSER
 
 
 class TreeSitterJSAnalyzer(BaseAnalyzer):
@@ -21,9 +34,8 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
         super().__init__(file_path, content, repo_path)
 
         try:
-            language_capsule = tree_sitter_javascript.language()
-            self.js_language = Language(language_capsule)
-            self.parser = Parser(self.js_language)
+            self.parser = _get_js_parser()
+            self.js_language = _JS_LANGUAGE
         except Exception as e:
             logger.error(f"Failed to initialize JavaScript parser: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -360,6 +372,7 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
                                 caller=caller_id,
                                 callee=callee_id,
                                 call_line=node.start_point[0] + 1,
+                                relation_type=REL_IMPLEMENTS,
                             )
 
         elif node.type == "function_declaration":

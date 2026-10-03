@@ -13,10 +13,16 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from repodoc.config import Config
+from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph.analyzers import EXTENSION_MAP, analyze_file
 from repodoc.graph.graph import HeterogeneousGraph
-from repodoc.graph.models import REL_CALLS, CallRelationship, CodeNode, Node
+from repodoc.graph.models import (
+    REL_CALLS,
+    REL_IMPLEMENTS,
+    CallRelationship,
+    CodeNode,
+    Node,
+)
 from repodoc.utils import file_manager, safe_open_text
 
 logger = logging.getLogger(__name__)
@@ -27,14 +33,20 @@ logger = logging.getLogger(__name__)
 
 
 def _should_exclude_path(path: str, filename: str, exclude_patterns: Set[str]) -> bool:
+    parts = path.split("/") if path else []
     for pattern in exclude_patterns:
         if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(filename, pattern):
             return True
-        if pattern.endswith("/") and path.startswith(pattern.rstrip("/")):
+        if pattern.endswith("/"):
+            # Directory pattern: match a whole path segment ("bin/" excludes
+            # bin/x.py but not bindings/x.py).
+            segment = pattern.rstrip("/")
+            if segment and segment in parts:
+                return True
+            continue
+        if path == pattern or pattern in parts:
             return True
-        if path.startswith(pattern + "/") or path == pattern:
-            return True
-        if pattern in path.split("/"):
+        if path.startswith(pattern + "/"):
             return True
     return False
 
@@ -89,6 +101,16 @@ def _collect_code_files(
             ext = Path(fname).suffix.lower()
             if ext not in EXTENSION_MAP:
                 continue
+            try:
+                if (root_path / fname).stat().st_size > MAX_SOURCE_FILE_BYTES:
+                    logger.debug(
+                        "Skipping oversized file (%d bytes): %s",
+                        (root_path / fname).stat().st_size,
+                        rel_path,
+                    )
+                    continue
+            except OSError:
+                continue
             code_files.append({"path": rel_path, "language": EXTENSION_MAP[ext]})
     return code_files
 
@@ -140,8 +162,18 @@ def _assemble_components(
                     callee_id = comp.id
                     break
         if caller_id and caller_id in components and callee_id:
-            components[caller_id].depends_on.add(callee_id)
+            if rel.relation_type == REL_IMPLEMENTS:
+                components[caller_id].implements.add(callee_id)
+            else:
+                components[caller_id].depends_on.add(callee_id)
     return components
+
+
+def component_dependencies(node: Node) -> Set[str]:
+    """All components a node points at (calls + inheritance)."""
+    return set(getattr(node, "depends_on", set()) or set()) | set(
+        getattr(node, "implements", set()) or set()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +321,7 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             end_line=node.end_line,
             docstring=node.docstring or "",
             depends_on=sorted(node.depends_on),
+            implements=sorted(node.implements),
             parameters=node.parameters,
             receiver=node.receiver,
         )
@@ -297,6 +330,9 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
         for callee_id in node.depends_on:
             if callee_id in components:
                 graph.add_edge(nid, callee_id, REL_CALLS, 1.0)
+        for base_id in node.implements:
+            if base_id in components:
+                graph.add_edge(nid, base_id, REL_IMPLEMENTS, 1.0)
     return graph
 
 
@@ -318,6 +354,7 @@ def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
             file_path=d.get("file_path", ""),
             relative_path=d.get("relative_path", ""),
             depends_on=set(d.get("depends_on", [])),
+            implements=set(d.get("implements", [])),
             source_code=d.get("source_code"),
             start_line=d.get("start_line", 0),
             end_line=d.get("end_line", 0),
@@ -415,7 +452,7 @@ def attach_module_tree_to_graph(
         m = comp_module.get(cid)
         if m is None or not graph.has_node(m):
             continue
-        for dep_id in getattr(node, "depends_on", []):
+        for dep_id in component_dependencies(node):
             dm = comp_module.get(dep_id)
             if dm and dm != m and graph.has_node(dm):
                 graph.add_edge(m, dm, REL_DEPENDS_ON, 1.0)
@@ -479,6 +516,8 @@ class DependencyGraphBuilder:
             d = component.model_dump()
             if isinstance(d.get("depends_on"), set):
                 d["depends_on"] = list(d["depends_on"])
+            if isinstance(d.get("implements"), set):
+                d["implements"] = list(d["implements"])
             result[cid] = d
         os.makedirs(os.path.dirname(dependency_graph_path), exist_ok=True)
         with open(dependency_graph_path, "w", encoding="utf-8") as f:

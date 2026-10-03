@@ -5,6 +5,7 @@ Two strategies (config.cluster_strategy):
 - "heuristic": deterministic grouping by top-level directory segment.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from typing import Any, Dict, List, Tuple
 from repodoc.config import Config, MAX_TOKEN_PER_MODULE
 from repodoc.graph.models import Node
 from repodoc.llm import call_llm
-from repodoc.utils import count_tokens
+from repodoc.utils import count_tokens, file_manager
 
 logger = logging.getLogger(__name__)
 
@@ -238,10 +239,12 @@ def _parse_llm_response(response: str) -> Dict[str, Any]:
             "</GROUPED_COMPONENTS>"
         )[0].strip()
         if inner.startswith("```"):
-            inner = inner.split("```")[1]
-            if inner.startswith("json"):
-                inner = inner[4:]
-            inner = inner.strip()
+            fence_parts = inner.split("```")
+            if len(fence_parts) >= 2:
+                inner = fence_parts[1]
+                if inner.startswith("json"):
+                    inner = inner[4:]
+                inner = inner.strip()
         try:
             tree = json.loads(inner)
             if isinstance(tree, dict):
@@ -253,13 +256,76 @@ def _parse_llm_response(response: str) -> Dict[str, Any]:
 
 
 def _sanitize_module_tree(tree: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop non-dict module entries. LLMs occasionally emit malformed shapes
-    ({"module_name": "string"} or {"error": "..."}) that crash downstream
-    .get() calls; only keep {name: {path/components/children}} modules."""
+    """Normalize the LLM-produced module tree in place.
+
+    LLMs occasionally emit malformed shapes ({"module_name": "string"},
+    {"error": "..."} or components as a bare string) that crash downstream
+    .get() calls. Only {name: {path: str, components: [str], children: {}}}
+    entries survive; unknown component refs are left to _normalize_module_tree
+    (which has the component map) and backfill."""
     for name in [k for k, v in tree.items() if not isinstance(v, dict)]:
         logger.warning("Dropping non-dict module value for '%s'", name)
         del tree[name]
+    for name, info in tree.items():
+        comps = info.get("components", [])
+        if isinstance(comps, str):
+            comps = [comps]
+        if not isinstance(comps, list):
+            logger.warning("Module '%s': components is not a list; reset", name)
+            comps = []
+        info["components"] = [
+            c for c in comps if isinstance(c, str) and c.strip()
+        ]
+        if not isinstance(info.get("path"), str):
+            info["path"] = ""
+        children = info.get("children")
+        if isinstance(children, dict):
+            _sanitize_module_tree(children)
+        elif "children" in info:
+            info.pop("children", None)
     return tree
+
+
+# ---------------------------------------------------------------------------
+# Clustering response cache: same (prompt, model) -> same module tree.
+# Reproducibility for reruns/ablations, and no token spend on identical work.
+# ---------------------------------------------------------------------------
+
+_CLUSTER_CACHE_LOCK = threading.RLock()
+_cluster_cache_mem: Dict[str, str] | None = None
+
+
+def _cluster_cache_path(config: Config) -> str:
+    return os.path.join(config.dependency_graph_dir, "clustering_cache.json")
+
+
+def _cache_key(prompt: str, config: Config) -> str:
+    digest = hashlib.sha256()
+    digest.update(prompt.encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update((config.cluster_model or config.main_model or "").encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _load_cluster_cache(config: Config) -> Dict[str, str]:
+    global _cluster_cache_mem
+    with _CLUSTER_CACHE_LOCK:
+        if _cluster_cache_mem is None:
+            path = _cluster_cache_path(config)
+            data = file_manager.load_json(path) if os.path.exists(path) else None
+            _cluster_cache_mem = data if isinstance(data, dict) else {}
+        return _cluster_cache_mem
+
+
+def _store_cluster_cache(config: Config, key: str, response: str) -> None:
+    global _cluster_cache_mem
+    with _CLUSTER_CACHE_LOCK:
+        cache = _load_cluster_cache(config)
+        cache[key] = response
+        try:
+            file_manager.save_json(cache, _cluster_cache_path(config))
+        except OSError as e:  # cache is best-effort, never fail the run
+            logger.warning("Could not persist clustering cache: %s", e)
 
 
 def _call_llm_with_retry(
@@ -284,6 +350,22 @@ def _call_llm_with_retry_locked(
     max_retries: int = 2,
 ) -> Tuple[str, Dict[str, Any]]:
     """Internal: the retry loop, run under the global LLM semaphore."""
+    cache_key = _cache_key(prompt, config)
+    cached = _load_cluster_cache(config).get(cache_key)
+    if cached is not None:
+        try:
+            cached_tree = _parse_llm_response(cached)
+            logger.info(
+                "Clustering cache hit (%d modules, key %s)",
+                len(cached_tree),
+                cache_key[:12],
+            )
+            return cached, cached_tree
+        except Exception:
+            logger.warning(
+                "Discarding corrupt clustering cache entry %s", cache_key[:12]
+            )
+
     last_error = None
     last_response = ""
 
@@ -303,6 +385,7 @@ def _call_llm_with_retry_locked(
             )
 
             module_tree = _parse_llm_response(last_response)
+            _store_cluster_cache(config, cache_key, last_response)
             return last_response, module_tree
 
         except Exception as e:
@@ -875,6 +958,43 @@ def _cluster_heuristic(
         )
         info["components"].append(ln)
     return modules
+
+
+def module_tree_stats(tree: Dict[str, Any]) -> Dict[str, Any]:
+    """Structural quality stats of the clustering result (for metadata/logs):
+    module count, depth, empty modules, largest module, leaf coverage."""
+    module_count = 0
+    max_depth = 0
+    empty = 0
+    largest = 0
+    leaf_components: set[str] = set()
+
+    def walk(nodes: Dict[str, Any], depth: int) -> None:
+        nonlocal module_count, max_depth, empty, largest
+        for info in nodes.values():
+            if not isinstance(info, dict):
+                continue
+            module_count += 1
+            max_depth = max(max_depth, depth)
+            comps = info.get("components", [])
+            largest = max(largest, len(comps))
+            children = info.get("children")
+            has_children = isinstance(children, dict) and bool(children)
+            if not comps and not has_children:
+                empty += 1
+            if has_children:
+                walk(children, depth + 1)
+            else:
+                leaf_components.update(comps)
+
+    walk(tree, 1)
+    return {
+        "modules": module_count,
+        "max_depth": max_depth,
+        "empty_modules": empty,
+        "largest_module_components": largest,
+        "leaf_components": len(leaf_components),
+    }
 
 
 def cluster_modules(

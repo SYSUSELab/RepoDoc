@@ -58,7 +58,14 @@ DEFAULT_IGNORE_PATTERNS = {
     ".svn", ".hg",
     "*.svg", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.pdf",
     "*.mov", "*.mp4", "*.mp3", "*.wav",
-    "venv", ".venv", "env", ".env", "virtualenv",
+    "venv", ".venv", "env", ".env", "virtualenv", "site-packages",
+    # Dependency / build output trees: parsing vendored code explodes the
+    # graph (and LLM cost) by 10-100x on typical JS/C++ repos.
+    "node_modules", "bower_components", "jspm_packages",
+    "vendor", "third_party", "thirdparty", "external",
+    "dist", "build", "out", "target", "coverage",
+    ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+    "Pods", "Carthage", ".dart_tool",
     "*.swo", "*.swn", "*.sublime-*", "*.log", "*.bak", "*.swp", "*.tmp",
     "*.temp", ".cache", ".sass-cache", ".DS_Store", "Thumbs.db",
     "desktop.ini", "*.egg-info", "*.egg", "*.whl", "*.so",
@@ -83,6 +90,8 @@ DEFAULT_IGNORE_PATTERNS = {
 DEFAULT_INCLUDE_PATTERNS = [
     "*.py", "*.js", "*.ts", "*.jsx", "*.tsx", "*.java", "*.cpp", "*.c",
     "*.h", "*.cs", "*.go", "*.rs", "*.php",
+    # Keep in sync with EXTENSION_MAP: these were silently unreachable before.
+    "*.mjs", "*.cjs", "*.cc", "*.cxx", "*.hpp", "*.hxx", "*.phtml", "*.inc",
 ]
 
 _ANALYZER_REGISTRY: Optional[dict[str, type]] = None

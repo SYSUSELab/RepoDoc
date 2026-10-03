@@ -10,7 +10,12 @@ from repodoc.config import Config
 from repodoc.graph import DependencyGraphBuilder
 from repodoc.graph.builder import build_graph_from_analysis
 from repodoc.agent.agent import DocAgent
-from repodoc.utils import file_manager, validate_and_fix_links, log_operation
+from repodoc.utils import (
+    file_manager,
+    log_operation,
+    summarize_markdown,
+    validate_and_fix_links,
+)
 
 
 def flatten_module_tree_leaf_first(
@@ -121,7 +126,10 @@ def _build_module_dependencies(
         m = module_of(cid)
         if m is None:
             continue
-        for dep_id in getattr(node, "depends_on", []):
+        targets = set(getattr(node, "depends_on", []) or []) | set(
+            getattr(node, "implements", []) or []
+        )
+        for dep_id in targets:
             dm = module_of(dep_id)
             if dm and dm != m:
                 deps.setdefault(m, set()).add(dm)
@@ -386,7 +394,9 @@ class DocPipeline:
             if os.path.exists(md_path):
                 try:
                     with open(md_path, "r") as f:
-                        module_docs_summary[name] = f.read()[:2500]
+                        module_docs_summary[name] = summarize_markdown(
+                            f.read(), budget=2000
+                        )
                 except Exception:
                     pass
 
@@ -534,7 +544,9 @@ class DocPipeline:
             if os.path.exists(child_doc_path):
                 try:
                     with open(child_doc_path, "r") as f:
-                        child_docs_content[child_name] = f.read()[:2000]
+                        child_docs_content[child_name] = summarize_markdown(
+                            f.read(), budget=1500
+                        )
                 except Exception:
                     pass
 
@@ -551,7 +563,9 @@ class DocPipeline:
             if os.path.exists(comp_doc_path):
                 try:
                     with open(comp_doc_path, "r") as f:
-                        component_docs_content[node.name] = f.read()[:3000]
+                        component_docs_content[node.name] = summarize_markdown(
+                            f.read(), budget=2000
+                        )
                 except Exception:
                     pass
 
@@ -602,12 +616,13 @@ class DocPipeline:
         if not node:
             return None
 
-        # Reverse dependencies: which components call this one (its role in
-        # flows). Computed from the full component map.
+        # Reverse dependencies: which components call this one or derive from
+        # it (its role in flows / type hierarchy), from the full component map.
         predecessors = [
             cid
             for cid, n in self.components.items()
             if node_id in getattr(n, "depends_on", set())
+            or node_id in getattr(n, "implements", set())
         ]
 
         component = {
@@ -807,8 +822,37 @@ class DocPipeline:
         token_usage = self._collect_token_usage()
         git_commit = self._get_git_commit()
 
+        def _failed(results) -> int:
+            return sum(1 for r in results if not getattr(r, "success", False))
+
+        generation_quality = {
+            "component_docs_done": len(component_results),
+            "component_docs_failed": _failed(component_results),
+            "module_docs_done": len(module_results),
+            "module_docs_failed": _failed(module_results),
+            "overview_failed": not (
+                overview_result is not None
+                and getattr(overview_result, "success", False)
+            ),
+        }
+        if generation_quality["component_docs_failed"] or generation_quality[
+            "module_docs_failed"
+        ]:
+            print(
+                "WARNING: some docs failed permanently: "
+                f"{generation_quality['component_docs_failed']} component, "
+                f"{generation_quality['module_docs_failed']} module "
+                f"(see metadata doc_generation stats)"
+            )
+
         self._save_and_log_metadata(
-            data_dir, all_files, total_duration, token_usage, git_commit, link_results
+            data_dir,
+            all_files,
+            total_duration,
+            token_usage,
+            git_commit,
+            link_results,
+            generation_quality,
         )
 
         return {
@@ -856,6 +900,7 @@ class DocPipeline:
         token_usage: dict[str, Any],
         git_commit: str | None,
         link_results: dict[str, Any],
+        generation_quality: dict[str, Any] | None = None,
     ) -> None:
         """Save metadata to JSON and log operation."""
         metadata = {
@@ -869,7 +914,10 @@ class DocPipeline:
             },
             "statistics": {
                 "total_components": len(self.components),
-                "leaf_nodes": len(self.leaf_nodes),
+                # When the graph was restored (no fresh analysis) leaf_nodes is
+                # empty; report the components actually assigned to modules.
+                "leaf_nodes": len(self.leaf_nodes)
+                or len(_collect_component_modules(self.module_tree)),
                 "total_files": len(all_files),
             },
             "token_usage": {
@@ -884,6 +932,7 @@ class DocPipeline:
                 "files_fixed": len(link_results.get("fixed", [])),
                 "broken_links_removed": len(link_results.get("removed", [])),
             },
+            "doc_generation": generation_quality or {},
         }
         project_name = self.get_project_name()
         file_manager.save_json(

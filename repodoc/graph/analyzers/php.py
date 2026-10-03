@@ -13,7 +13,7 @@ from tree_sitter import Parser, Language
 import tree_sitter_php
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +328,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                         caller=self._get_component_id(class_name),
                         callee=resolved_base.replace("\\", "."),
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_IMPLEMENTS,
                     )
 
         # 3. Interface implementation (implements)
@@ -346,6 +347,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                                 caller=self._get_component_id(implementer_name),
                                 callee=resolved_interface.replace("\\", "."),
                                 call_line=node.start_point[0] + 1,
+                                relation_type=REL_IMPLEMENTS,
                             )
 
         # 4. Object creation (new)

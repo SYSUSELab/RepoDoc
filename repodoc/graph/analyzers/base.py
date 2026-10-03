@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_CALLS, CallRelationship, Node
 
 
 class BaseAnalyzer:
@@ -80,9 +80,11 @@ class BaseAnalyzer:
         callee: str,
         call_line: Optional[int] = None,
         is_resolved: bool = False,
+        relation_type: str = REL_CALLS,
     ) -> bool:
-        """Append a relationship, deduplicating on (caller, callee, call_line)."""
-        key = (caller, callee, call_line)
+        """Append a relationship, deduplicating on
+        (caller, callee, call_line, relation_type)."""
+        key = (caller, callee, call_line, relation_type)
         if key in self._seen_relationships:
             return False
         self._seen_relationships.add(key)
@@ -92,6 +94,7 @@ class BaseAnalyzer:
                 callee=callee,
                 call_line=call_line,
                 is_resolved=is_resolved,
+                relation_type=relation_type,
             )
         )
         return True

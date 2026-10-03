@@ -6,7 +6,7 @@ import warnings
 from typing import List, Optional, Tuple
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +23,7 @@ PYTHON_BUILTINS = {
 
 
 class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
-    EXTENSIONS = (".py", ".pyx")
+    EXTENSIONS = (".py",)
 
     def __init__(self, file_path: str, content: str, repo_path: Optional[str] = None):
         super().__init__(file_path, content, repo_path)
@@ -69,6 +69,7 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
                     callee=f"{self._get_module_path()}.{base_name}",
                     call_line=node.lineno,
                     is_resolved=True,
+                    relation_type=REL_IMPLEMENTS,
                 )
         self.current_class_name = node.name
         self.generic_visit(node)

@@ -12,6 +12,19 @@ from repodoc.graph.models import CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
+_GO_LANGUAGE = None
+_GO_PARSER = None
+
+
+def _get_go_parser():
+    """Process-wide Go parser (parsing is single-threaded; creating a
+    Language/Parser per file is pure overhead)."""
+    global _GO_LANGUAGE, _GO_PARSER
+    if _GO_PARSER is None:
+        _GO_LANGUAGE = Language(tree_sitter_go.language())
+        _GO_PARSER = Parser(_GO_LANGUAGE)
+    return _GO_PARSER
+
 
 class GoASTAnalyzer(BaseAnalyzer):
     EXTENSIONS = (".go",)
@@ -22,9 +35,8 @@ class GoASTAnalyzer(BaseAnalyzer):
         self.current_struct = None
 
         try:
-            language_capsule = tree_sitter_go.language()
-            self.go_language = Language(language_capsule)
-            self.parser = Parser(self.go_language)
+            self.parser = _get_go_parser()
+            self.go_language = _GO_LANGUAGE
         except Exception as e:
             logger.error(f"Failed to initialize Go parser: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")

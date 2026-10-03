@@ -8,7 +8,7 @@ from tree_sitter import Parser, Language
 import tree_sitter_typescript
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +28,35 @@ TS_BUILTIN_FUNCTIONS = {
 }
 
 
+_TS_LANGUAGES: dict[bool, object] = {}
+_TS_PARSERS: dict[bool, object] = {}
+
+
+def _get_ts_parser(tsx: bool):
+    """Process-wide TS/TSX parser (parsing is single-threaded; creating a
+    Language/Parser per file is pure overhead)."""
+    if tsx not in _TS_PARSERS:
+        # .tsx needs the dedicated TSX grammar: JSX syntax is a syntax error
+        # under the plain TypeScript grammar (components vanish).
+        capsule = (
+            tree_sitter_typescript.language_tsx()
+            if tsx
+            else tree_sitter_typescript.language_typescript()
+        )
+        _TS_LANGUAGES[tsx] = Language(capsule)
+        _TS_PARSERS[tsx] = Parser(_TS_LANGUAGES[tsx])
+    return _TS_PARSERS[tsx], _TS_LANGUAGES[tsx]
+
+
 class TreeSitterTSAnalyzer(BaseAnalyzer):
-    EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+    EXTENSIONS = (".ts", ".tsx")
 
     def __init__(self, file_path: str, content: str, repo_path: str = None):
         super().__init__(file_path, content, repo_path)
 
         try:
-            language_capsule = tree_sitter_typescript.language_typescript()
-            self.ts_language = Language(language_capsule)
-            self.parser = Parser(self.ts_language)
+            is_tsx = str(self.file_path).lower().endswith(".tsx")
+            self.parser, self.ts_language = _get_ts_parser(is_tsx)
         except Exception as e:
             logger.error(f"Failed to initialize TypeScript parser: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
@@ -271,18 +290,43 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                 }
         return None
 
+    def _containing_type_name(self, node) -> Optional[str]:
+        """Nearest enclosing class/interface name (None outside a type)."""
+        current = node.parent
+        while current:
+            if current.type in (
+                "class_declaration",
+                "abstract_class_declaration",
+                "interface_declaration",
+            ):
+                name_node = self._find_child_by_type(
+                    current, "type_identifier"
+                ) or self._find_child_by_type(current, "identifier")
+                return self._get_node_text(name_node) if name_node else None
+            if current.type in ("program", "source_file"):
+                return None
+            current = current.parent
+        return None
+
     def _extract_method_entity(self, node, depth: int) -> dict:
-        """Extract method entity (at any depth)."""
+        """Extract method entity, qualified by its class (A.save).
+
+        Bare method names made ids collide across classes: two classes with a
+        `save` method produced a single `m.save` node (last one won)."""
         name_node = self._find_child_by_type(node, "property_identifier")
         if not name_node:
             return None
 
         method_name = self._get_node_text(name_node)
+        containing = self._containing_type_name(node)
+        qualified_name = (
+            f"{containing}.{method_name}" if containing else method_name
+        )
         parameters = self._extract_parameters(node)
         code_snippet = self._get_node_text(node)
 
         return {
-            "name": method_name,
+            "name": qualified_name,
             "type": "function",
             "subtype": "method",
             "parameters": parameters,
@@ -571,7 +615,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
         if node.component_type == "variable":
             return False
 
-        return node.name.lower() not in excluded_names
+        return node.name.split(".")[-1].lower() not in excluded_names
 
     def _extract_constructor_dependencies(self, class_node, class_name: str) -> None:
         """Extract dependencies from constructor parameters."""
@@ -956,6 +1000,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                                 caller=f"{self._get_module_path()}.{caller_name}",
                                 callee=f"{self._get_module_path()}.{target_name}",
                                 call_line=call_line,
+                                relation_type=REL_IMPLEMENTS,
                             )
         except Exception as e:
             logger.debug(f"Error extracting inheritance relationship: {e}")

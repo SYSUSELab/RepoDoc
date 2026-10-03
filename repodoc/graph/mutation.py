@@ -23,6 +23,7 @@ from repodoc.graph.models import (
     REL_CALLS,
     REL_CONTAINS,
     REL_DEPENDS_ON,
+    REL_IMPLEMENTS,
     CodeNode,
     ModuleNode,
     Node,
@@ -81,14 +82,16 @@ def _build_lookup(
 
 def _resolve_dependencies(
     graph: HeterogeneousGraph, new_nodes: List[Node], relationships: list
-) -> Dict[str, Set[str]]:
-    """Resolve call relationships into {node_id: set(callee ids)}.
+) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
+    """Resolve relationships into ({node_id: call targets}, {node_id: base ids}).
 
-    Only callees that exist in the graph (or among the new nodes) become
-    edges — unresolved external references are kept on the node's depends_on
-    list but never added as graph edges."""
+    Only targets that exist in the graph (or among the new nodes) become
+    edges — unresolved external references are dropped (there is no node to
+    point at). Inheritance/implements relations are kept in a separate map
+    so they become REL_IMPLEMENTS edges instead of REL_CALLS."""
     lookup = _build_lookup(graph, new_nodes)
     deps: Dict[str, Set[str]] = {n.id: set() for n in new_nodes}
+    impls: Dict[str, Set[str]] = {n.id: set() for n in new_nodes}
     for rel in relationships:
         caller = lookup.get(rel.caller)
         if caller is None or caller not in deps:
@@ -96,9 +99,13 @@ def _resolve_dependencies(
         callee = lookup.get(rel.callee)
         if callee is None and "." in rel.callee:
             callee = lookup.get(rel.callee.split(".")[-1])
-        if callee is not None and (callee in deps or graph.has_node(callee)):
+        if callee is None or not (callee in deps or graph.has_node(callee)):
+            continue
+        if getattr(rel, "relation_type", REL_CALLS) == REL_IMPLEMENTS:
+            impls[caller].add(callee)
+        else:
             deps[caller].add(callee)
-    return deps
+    return deps, impls
 
 
 # ---------------------------------------------------------------------------
@@ -226,27 +233,32 @@ def _place_new_component(graph: HeterogeneousGraph, node: Node) -> Optional[str]
     return module_name
 
 
-def _detach_callers(graph: HeterogeneousGraph, node_id: str) -> List[str]:
-    """Drop a going-away node from its callers' stored depends_on lists.
+def _detach_references(graph: HeterogeneousGraph, node_id: str) -> List[str]:
+    """Drop a going-away node from its callers'/implementors' stored lists.
 
-    Removing the node drops its incident calls edges, but the CALLERS (usually
-    in files that were not re-analyzed) keep it in their depends_on list — a
-    ghost reference that would otherwise leak into their prompts and docs.
-    Returns the caller ids that were rewritten."""
-    callers = [
-        s for s, t, rt, _w in graph.edges(REL_CALLS) if t == node_id and s != node_id
-    ]
-    for cid in callers:
+    Removing the node drops its incident edges, but the referencing nodes
+    (usually in files that were not re-analyzed) keep it in depends_on or
+    implements — a ghost reference that would otherwise leak into their
+    prompts and docs. Returns the referrer ids that were rewritten."""
+    callers = {
+        s
+        for s, t, rt, _w in graph.edges()
+        if t == node_id and s != node_id and rt in (REL_CALLS, REL_IMPLEMENTS)
+    }
+    for cid in sorted(callers):
         node = graph.get_node(cid)
         if not isinstance(node, CodeNode):
             continue
         deps = node.depends_on or []
-        kept = [d for d in deps if d != node_id]
-        if len(kept) != len(deps):
+        impls = node.implements or []
+        kept_deps = [d for d in deps if d != node_id]
+        kept_impls = [b for b in impls if b != node_id]
+        if len(kept_deps) != len(deps) or len(kept_impls) != len(impls):
             data = node.model_dump()
-            data["depends_on"] = kept
+            data["depends_on"] = kept_deps
+            data["implements"] = kept_impls
             graph.add_code_node(CodeNode.model_validate(data))
-    return callers
+    return sorted(callers)
 
 
 def _remove_component_from_modules(graph: HeterogeneousGraph, node_id: str) -> None:
@@ -289,7 +301,9 @@ def rebuild_cross_module_edges(graph: HeterogeneousGraph) -> int:
         m = comp_module.get(nid)
         if m is None or not graph.has_node(m):
             continue
-        for dep_id in attrs.get("data", {}).get("depends_on", []):
+        data = attrs.get("data", {})
+        targets = set(data.get("depends_on", [])) | set(data.get("implements", []))
+        for dep_id in targets:
             dm = comp_module.get(dep_id)
             if dm and dm != m and graph.has_node(dm) and not graph.has_edge(m, dm):
                 graph.add_edge(m, dm, REL_DEPENDS_ON, 1.0)
@@ -305,7 +319,7 @@ def rebuild_cross_module_edges(graph: HeterogeneousGraph) -> int:
 def apply_file_changes_to_graph(
     graph: HeterogeneousGraph,
     file_path: str,
-    new_content: str,
+    new_content: Optional[str],
     repo_path: str,
     old_file_path: Optional[str] = None,
 ) -> GraphMutationResult:
@@ -321,7 +335,9 @@ def apply_file_changes_to_graph(
     Args:
         graph: The knowledge graph to mutate (in place).
         file_path: Repo-relative (or absolute) path of the changed file.
-        new_content: Working-tree file content ("" for deleted files).
+        new_content: Working-tree file content; None means the file was
+            deleted (its graph nodes are removed). "" is an existing empty
+            file — never treated as a deletion.
         repo_path: Repository root (used for analyzer relative paths).
         old_file_path: Pre-rename path of the file (renames): graph nodes of
             the old path are also in scope and get removed; the old content
@@ -339,7 +355,15 @@ def apply_file_changes_to_graph(
 
     new_nodes: List[Node] = []
     new_rels: list = []
-    if new_content:
+    if new_content is not None:
+        if not new_content.strip():
+            # Empty/whitespace-only file: never a deletion. The analysis has
+            # nothing to reconcile, and removing the components would turn a
+            # transient truncation into permanent graph loss.
+            logger.warning(
+                "Skipping graph reconciliation for %s: file is empty", file_path
+            )
+            return result
         try:
             new_nodes, new_rels = analyze_file(analyze_path, new_content, repo_path)
         except Exception as e:
@@ -370,18 +394,17 @@ def apply_file_changes_to_graph(
     new_ids = {n.id for n in new_nodes if n.id}
 
     # Resolve dependencies ONCE against the whole graph: analyzer nodes carry
-    # empty depends_on (builder fills them repo-wide), so the resolved map is
-    # what gets persisted on the mutated CodeNodes.
-    deps = _resolve_dependencies(graph, new_nodes, new_rels)
+    # empty depends_on (builder fills them repo-wide), so the resolved maps
+    # are what gets persisted on the mutated CodeNodes.
+    deps, impls = _resolve_dependencies(graph, new_nodes, new_rels)
 
     # --- Removed: in the graph for this file, not in the new analysis ---
     for nid in sorted(set(graph_nodes) - new_ids):
         for s, t, rt, _w in list(graph.edges()):
-            if rt != REL_CALLS:
-                continue
-            if s == nid or t == nid:
-                result.removed_edges.append((s, t))
-        _detach_callers(graph, nid)
+            if rt in (REL_CALLS, REL_IMPLEMENTS):
+                if s == nid or t == nid:
+                    result.removed_edges.append((s, t))
+        _detach_references(graph, nid)
         _remove_component_from_modules(graph, nid)
         if graph.remove_node(nid):
             result.removed.append(nid)
@@ -392,36 +415,48 @@ def apply_file_changes_to_graph(
         if node.id in graph_nodes:
             continue
         node.depends_on = deps.get(node.id, set())
+        node.implements = impls.get(node.id, set())
         _add_component_node(graph, node)
         for callee in sorted(node.depends_on - {node.id}):
             if graph.has_node(callee):
                 graph.add_edge(node.id, callee, REL_CALLS, 1.0)
                 result.added_edges.append((node.id, callee))
+        for base in sorted(node.implements - {node.id}):
+            if graph.has_node(base):
+                graph.add_edge(node.id, base, REL_IMPLEMENTS, 1.0)
+                result.added_edges.append((node.id, base))
         result.added.append(node.id)
         logger.info("Added component %s", node.id)
 
-    # --- Updated: present in both, content differs ---
+    # --- Updated: present in both, content OR resolved edges differ ---
     for node in new_nodes:
         if node.id not in graph_nodes:
             continue
+        # Resolve first: a new/changed definition elsewhere in the same file
+        # can change this node's edges even when its own source is identical.
+        node.depends_on = deps.get(node.id, set())
+        node.implements = impls.get(node.id, set())
         existing = graph.get_node(node.id)
         if isinstance(existing, CodeNode) and _same_component(existing, node):
             continue  # re-analysis is identical to the graph: nothing changed
-        node.depends_on = deps.get(node.id, set())
         _add_component_node(graph, node)
         result.updated.append(node.id)
-        # Edge diff: remove stale calls edges, add missing ones
-        wanted = deps.get(node.id, set()) - {node.id}
-        existing_edges = {
-            t for t, rt, _w in graph.get_out_edges(node.id) if rt == REL_CALLS
-        }
-        for t in sorted(existing_edges - wanted):
-            if graph.remove_edge(node.id, t):
-                result.removed_edges.append((node.id, t))
-        for t in sorted(wanted - existing_edges):
-            if graph.has_node(t):
-                graph.add_edge(node.id, t, REL_CALLS, 1.0)
-                result.added_edges.append((node.id, t))
+        # Edge diff per relation type: remove stale edges, add missing ones.
+        for relation, wanted_set in (
+            (REL_CALLS, deps.get(node.id, set())),
+            (REL_IMPLEMENTS, impls.get(node.id, set())),
+        ):
+            wanted = wanted_set - {node.id}
+            existing_edges = {
+                t for t, rt, _w in graph.get_out_edges(node.id) if rt == relation
+            }
+            for t in sorted(existing_edges - wanted):
+                if graph.remove_edge(node.id, t):
+                    result.removed_edges.append((node.id, t))
+            for t in sorted(wanted - existing_edges):
+                if graph.has_node(t):
+                    graph.add_edge(node.id, t, relation, 1.0)
+                    result.added_edges.append((node.id, t))
         logger.debug("Updated component %s", node.id)
 
     # --- Module placement for new components ---
@@ -451,6 +486,7 @@ def _add_component_node(graph: HeterogeneousGraph, node: Node) -> None:
             end_line=node.end_line,
             docstring=node.docstring or "",
             depends_on=sorted(node.depends_on),
+            implements=sorted(node.implements),
             parameters=node.parameters,
             receiver=node.receiver,
         )
@@ -468,4 +504,6 @@ def _same_component(existing: CodeNode, node: Node) -> bool:
         and existing.parameters == node.parameters
         and existing.receiver == node.receiver
         and existing.relative_path == node.relative_path
+        and sorted(existing.implements or []) == sorted(node.implements or set())
+        and sorted(existing.depends_on or []) == sorted(node.depends_on or set())
     )

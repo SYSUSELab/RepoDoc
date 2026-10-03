@@ -7,13 +7,13 @@ from tree_sitter import Parser, Language
 import tree_sitter_cpp
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
 
 class TreeSitterCppAnalyzer(BaseAnalyzer):
-    EXTENSIONS = (".cpp", ".cc", ".cxx", ".hpp", ".h")
+    EXTENSIONS = (".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".h")
 
     def analyze(self) -> None:
         language_capsule = tree_sitter_cpp.language()
@@ -200,6 +200,7 @@ class TreeSitterCppAnalyzer(BaseAnalyzer):
                             caller=containing_class_id,
                             callee=base_class,
                             call_line=node.start_point[0] + 1,
+                            relation_type=REL_IMPLEMENTS,
                         )
 
         elif node.type == "new_expression":

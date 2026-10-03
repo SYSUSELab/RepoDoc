@@ -15,43 +15,10 @@ from typing import List, Optional, Set
 
 from pydantic import BaseModel
 
-
 # ---------------------------------------------------------------------------
-# Analysis models
-# ---------------------------------------------------------------------------
-
-
-class Node(BaseModel):
-    """A code component (function/class/struct/...) extracted by an analyzer."""
-
-    id: str
-    name: str
-    component_type: str
-    file_path: str
-    relative_path: str
-    depends_on: Set[str] = set()
-    source_code: Optional[str] = None
-    start_line: int = 0
-    end_line: int = 0
-    docstring: str = ""
-    parameters: Optional[List[str]] = None
-    # Go/Rust method receiver type (e.g. "User" in func (u *User) Name()); None for others
-    receiver: Optional[str] = None
-
-
-class CallRelationship(BaseModel):
-    caller: str
-    callee: str
-    call_line: Optional[int] = None
-    is_resolved: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Knowledge graph models
-# ---------------------------------------------------------------------------
-
 # Relation type constants for graph edges
 # (design: calls, implements, describes + module structure).
+# ---------------------------------------------------------------------------
 REL_CALLS = "calls"
 REL_IMPLEMENTS = "implements"
 REL_DESCRIBES = "describes"
@@ -67,6 +34,46 @@ RELATION_TYPES = (
     REL_CONTAINS,
     REL_DEPENDS_ON,
 )
+
+
+# ---------------------------------------------------------------------------
+# Analysis models
+# ---------------------------------------------------------------------------
+
+
+class Node(BaseModel):
+    """A code component (function/class/struct/...) extracted by an analyzer."""
+
+    id: str
+    name: str
+    component_type: str
+    file_path: str
+    relative_path: str
+    depends_on: Set[str] = set()
+    # Base classes / implemented interfaces (resolved component ids). Kept
+    # separate from depends_on so the graph can carry REL_IMPLEMENTS edges.
+    implements: Set[str] = set()
+    source_code: Optional[str] = None
+    start_line: int = 0
+    end_line: int = 0
+    docstring: str = ""
+    parameters: Optional[List[str]] = None
+    # Go/Rust method receiver type (e.g. "User" in func (u *User) Name()); None for others
+    receiver: Optional[str] = None
+
+
+class CallRelationship(BaseModel):
+    caller: str
+    callee: str
+    call_line: Optional[int] = None
+    is_resolved: bool = False
+    # "calls" (default) or "implements" (extends/implements clauses).
+    relation_type: str = REL_CALLS
+
+
+# ---------------------------------------------------------------------------
+# Knowledge graph models
+# ---------------------------------------------------------------------------
 
 
 class CodeNode(BaseModel):
@@ -87,6 +94,7 @@ class CodeNode(BaseModel):
     end_line: int = 0
     docstring: str = ""
     depends_on: List[str] = []  # full dependency list (incl. unresolved targets)
+    implements: List[str] = []  # resolved base-class / interface component ids
     parameters: Optional[List[str]] = None
     receiver: Optional[str] = None  # Go/Rust method receiver type
 
