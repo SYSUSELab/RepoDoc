@@ -12,9 +12,9 @@ load_dotenv()
 
 from repodoc.config import Config
 from repodoc.graph import DependencyGraphBuilder
-from repodoc.graph.cluster import cluster_modules
+from repodoc.graph.cluster import cluster_modules, module_tree_stats
 from repodoc.agent.generate import run_pipeline
-from repodoc.utils import file_manager
+from repodoc.utils import FileLock, file_manager
 
 
 def make_config(
@@ -97,7 +97,13 @@ def _ensure_knowledge_graph(config: Config, data_dir: str, project_name: str) ->
     module_tree = cluster_modules(leaf_nodes, components, config)
     tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
     file_manager.save_json(module_tree, tree_path)
-    click.echo(f"  Modules: {len(module_tree)}")
+    stats = module_tree_stats(module_tree)
+    click.echo(f"  Modules: {len(module_tree)} top-level")
+    click.echo(
+        f"  Cluster stats: {stats['modules']} total, depth {stats['max_depth']}, "
+        f"{stats['leaf_components']} leaf components, "
+        f"{stats['empty_modules']} empty, largest {stats['largest_module_components']}"
+    )
 
     _build_and_save_graph(components, module_tree, data_dir, project_name)
     click.echo(f"  Knowledge graph saved: {kg_path}")
@@ -161,8 +167,11 @@ def analyze(
             module_tree = cluster_modules(leaf_nodes, components, config)
             tree_path = os.path.join(data_dir, f"{project_name}_module_tree.json")
             file_manager.save_json(module_tree, tree_path)
+            stats = module_tree_stats(module_tree)
             click.echo(
-                f"Module tree saved: {tree_path} ({len(module_tree)} top-level module(s))"
+                f"Module tree saved: {tree_path} ({len(module_tree)} top-level; "
+                f"{stats['modules']} total, depth {stats['max_depth']}, "
+                f"{stats['empty_modules']} empty)"
             )
             # Merge the clustering blueprint into the knowledge graph and
             # persist: the graph is the single integrated asset.
@@ -478,7 +487,17 @@ def update(
             force=force,
         )
 
-    result = asyncio.run(_run())
+    # Single-writer guard: concurrent updates would interleave graph mutation
+    # and doc writes (last writer wins, docs and graph diverge).
+    project_name = get_project_name(repo_path)
+    lock_path = os.path.join(output_dir, "data", f"{project_name}_update.lock")
+    file_manager.ensure_directory(os.path.dirname(lock_path))
+    try:
+        with FileLock(lock_path):
+            result = asyncio.run(_run())
+    except TimeoutError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise click.Abort()
     if result.get("status") == "error":
         raise click.Abort()
 

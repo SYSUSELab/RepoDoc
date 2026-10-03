@@ -38,12 +38,13 @@ from repodoc.agent.generate import (
     _collect_component_modules,
     refresh_doc_snapshots,
 )
-from repodoc.config import Config
+from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph.analyzers import get_analyzer
 from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import (
     REL_CALLS,
     REL_DESCRIBES,
+    REL_IMPLEMENTS,
     CodeNode,
     DocNode,
     ModuleNode,
@@ -54,7 +55,12 @@ from repodoc.graph.mutation import (
     apply_file_changes_to_graph,
     component_module_ids,
 )
-from repodoc.utils import file_manager, log_operation, validate_and_fix_links
+from repodoc.utils import (
+    file_manager,
+    log_operation,
+    summarize_markdown,
+    validate_and_fix_links,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +87,9 @@ class ComponentChange:
     old_signature: Optional[str] = None
     new_signature: Optional[str] = None
     details: str = ""
+    # Analyzer component id (exact graph node id, incl. methods); "" when the
+    # analyzer could not supply one (then callers fall back to name-based id).
+    component_id: str = ""
 
 
 @dataclass
@@ -93,11 +102,14 @@ class FileChangeAnalysis:
 
 @dataclass
 class FileDiff:
-    """Old/new contents of one changed file plus its change analysis."""
+    """Old/new contents of one changed file plus its change analysis.
+
+    None content means the file does not exist on that side (added/deleted);
+    "" is an existing but empty file."""
 
     file_path: str
-    old_content: str
-    new_content: str
+    old_content: Optional[str]
+    new_content: Optional[str]
     spec: Optional["DiffSpec"] = None
     analysis: Optional[FileChangeAnalysis] = None
 
@@ -126,11 +138,11 @@ class DiffSpec:
 
     - supports_docstring: whether docstrings can be compared (C analyzers
       never extract them, so skip the branch).
-    - compare_source: compare whole source_code instead of signature/docstring
-      (Go/Rust historically; their analyzers do not reliably produce either).
+    - compare_source: force whole-source comparison instead of
+      signature/docstring comparison (off for every bundled language; Go/Rust
+      now expose parameters so they no longer need it).
     - important_types: change types that make a file "important" (all four
-      for every language — fixes the old C/Rust bug that never treated body
-      changes as important).
+      for every language).
     """
 
     language: str
@@ -155,9 +167,15 @@ LANGUAGE_DIFF_TABLE: dict[str, DiffSpec] = {
     ".cc": DiffSpec("cpp", supports_docstring=False),
     ".cxx": DiffSpec("cpp", supports_docstring=False),
     ".hpp": DiffSpec("cpp", supports_docstring=False),
+    ".hxx": DiffSpec("cpp", supports_docstring=False),
     ".php": DiffSpec("php"),
-    ".go": DiffSpec("go", compare_source=True),
-    ".rs": DiffSpec("rust", compare_source=True),
+    ".phtml": DiffSpec("php"),
+    ".inc": DiffSpec("php"),
+    # Go/Rust analyzers extract parameters + docstrings, so the generic
+    # signature comparison applies; compare_source made every edit a body
+    # change, which disabled --propagate sig for both languages.
+    ".go": DiffSpec("go"),
+    ".rs": DiffSpec("rust"),
 }
 
 
@@ -183,36 +201,46 @@ def _is_test_file(file_path: str) -> bool:
 
 
 def _component_id(file_path: str, name: str) -> str:
-    """Component id for a change: <module.path>.<name> (mirrors analyzer ids)."""
-    module_path = file_path
-    for ext in (
-        ".py", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".java", ".cs",
-        ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".php", ".go", ".rs",
-        ".phtml", ".inc", ".hxx",
-    ):
-        if module_path.endswith(ext):
-            module_path = module_path[: -len(ext)]
-            break
-    return f"{module_path.replace('/', '.')}.{name}"
+    """Fallback component id: <module.path>.<name>.
+
+    Mirrors analyzer ids (module path = repo-relative path minus the file
+    extension, separators become dots). Only used when a change carries no
+    analyzer id (e.g. analyzer unavailable); analyze_diff sets component_id
+    from the analyzer itself for every normal change."""
+    suffix = Path(file_path).suffix
+    module_path = file_path[: -len(suffix)] if suffix else file_path
+    return f"{module_path.replace(os.sep, '.').replace('/', '.')}.{name}"
 
 
 def analyze_diff(
-    file_path: str, old_content: str, new_content: str, spec: DiffSpec
+    file_path: str,
+    old_content: Optional[str],
+    new_content: Optional[str],
+    spec: DiffSpec,
 ) -> FileChangeAnalysis:
-    """Compare two versions of a file via its language analyzer (generic)."""
+    """Compare two versions of a file via its language analyzer (generic).
+
+    None content means the file did not exist on that side; it is compared as
+    an empty document (new file -> all components NEW, deletion -> all
+    REMOVED)."""
     analysis = FileChangeAnalysis(file_path=file_path, language=spec.language)
+    old_content = old_content or ""
+    new_content = new_content or ""
 
     if old_content == new_content:
         return analysis
 
     analyzer_cls = get_analyzer(spec.language)
     if analyzer_cls is None:
+        # No analyzer: the file content changed but no component can be
+        # attributed, so mark it important without a (bogus) severe id —
+        # propagation has nothing concrete to seed from.
         analysis.has_important_changes = old_content != new_content
         if old_content != new_content:
             analysis.changes.append(
                 ComponentChange(
                     name="<file_changed>",
-                    change_type=ChangeType.API_SIGNATURE_CHANGED,
+                    change_type=ChangeType.CODE_BODY_CHANGED,
                     file_path=file_path,
                     details=f"{spec.language} analyzer not available",
                 )
@@ -231,48 +259,82 @@ def analyze_diff(
     except Exception:
         pass
 
-    old_components = {n.name: n for n in old_analyzer.nodes if n.name}
-    new_components = {n.name: n for n in new_analyzer.nodes if n.name}
+    # Key by analyzer component ID, not name: name keying silently collapses
+    # same-named methods/overloads from different classes into one entry.
+    old_components = {n.id: n for n in old_analyzer.nodes if n.id}
+    new_components = {n.id: n for n in new_analyzer.nodes if n.id}
 
-    old_names = set(old_components.keys())
-    new_names = set(new_components.keys())
+    def _impl_map(analyzer) -> dict[str, set[str]]:
+        """Base classes/interfaces per component id, from the raw analyzer
+        relationships (Node.implements is only filled during graph assembly)."""
+        out: dict[str, set[str]] = {}
+        for rel in analyzer.call_relationships:
+            if getattr(rel, "relation_type", REL_CALLS) == REL_IMPLEMENTS:
+                out.setdefault(rel.caller, set()).add(rel.callee)
+        return out
 
-    for name in sorted(new_names - old_names):
-        node = new_components[name]
+    old_impls = _impl_map(old_analyzer)
+    new_impls = _impl_map(new_analyzer)
+
+    old_ids = set(old_components.keys())
+    new_ids = set(new_components.keys())
+
+    for cid in sorted(new_ids - old_ids):
+        node = new_components[cid]
         analysis.changes.append(
             ComponentChange(
-                name=name,
+                name=node.name,
+                component_id=cid,
                 change_type=ChangeType.NEW_COMPONENT,
                 file_path=file_path,
                 details=f"New {node.component_type} added",
+                line_number=node.start_line,
             )
         )
 
-    for name in sorted(old_names - new_names):
-        node = old_components[name]
+    for cid in sorted(old_ids - new_ids):
+        node = old_components[cid]
         analysis.changes.append(
             ComponentChange(
-                name=name,
+                name=node.name,
+                component_id=cid,
                 change_type=ChangeType.REMOVED_COMPONENT,
                 file_path=file_path,
                 details=f"{node.component_type} removed",
             )
         )
 
-    for name in sorted(old_names & new_names):
-        old_node = old_components[name]
-        new_node = new_components[name]
+    for cid in sorted(old_ids & new_ids):
+        old_node = old_components[cid]
+        new_node = new_components[cid]
 
         if spec.compare_source:
             if old_node.source_code != new_node.source_code:
                 analysis.changes.append(
                     ComponentChange(
-                        name=name,
+                        name=new_node.name,
+                        component_id=cid,
                         change_type=ChangeType.CODE_BODY_CHANGED,
                         file_path=file_path,
                         details="Source code changed",
                     )
                 )
+            continue
+
+        old_bases = old_impls.get(old_node.id, set())
+        new_bases = new_impls.get(new_node.id, set())
+        if old_bases != new_bases:
+            analysis.changes.append(
+                ComponentChange(
+                    name=new_node.name,
+                    component_id=cid,
+                    change_type=ChangeType.API_SIGNATURE_CHANGED,
+                    file_path=file_path,
+                    old_signature=str(sorted(old_bases)),
+                    new_signature=str(sorted(new_bases)),
+                    details="Base classes / implemented interfaces changed",
+                )
+            )
             continue
 
         old_params = old_node.parameters or []
@@ -281,7 +343,8 @@ def analyze_diff(
         if old_params != new_params:
             analysis.changes.append(
                 ComponentChange(
-                    name=name,
+                    name=new_node.name,
+                    component_id=cid,
                     change_type=ChangeType.API_SIGNATURE_CHANGED,
                     file_path=file_path,
                     old_signature=str(old_params),
@@ -296,7 +359,8 @@ def analyze_diff(
             if old_node.docstring and new_node.docstring:
                 analysis.changes.append(
                     ComponentChange(
-                        name=name,
+                        name=new_node.name,
+                        component_id=cid,
                         change_type=ChangeType.DOCSTRING_CHANGED,
                         file_path=file_path,
                         details="Only docstring changed",
@@ -305,7 +369,8 @@ def analyze_diff(
             else:
                 analysis.changes.append(
                     ComponentChange(
-                        name=name,
+                        name=new_node.name,
+                        component_id=cid,
                         change_type=ChangeType.CODE_BODY_CHANGED,
                         file_path=file_path,
                         details="Code body or docstring changed",
@@ -314,7 +379,8 @@ def analyze_diff(
         else:
             analysis.changes.append(
                 ComponentChange(
-                    name=name,
+                    name=new_node.name,
+                    component_id=cid,
                     change_type=ChangeType.CODE_BODY_CHANGED,
                     file_path=file_path,
                     details="Only internal code changed",
@@ -353,8 +419,15 @@ def _detect_renames(
     return renames
 
 
-def _git_show(repo_path: str, file_path: str, commit: str | None) -> str:
-    """File content at a commit ('' when the file did not exist there)."""
+class GitError(RuntimeError):
+    """A git command failed for reasons other than 'path does not exist'."""
+
+
+def _git_show(repo_path: str, file_path: str, commit: str | None) -> Optional[str]:
+    """File content at a commit; None when the file did not exist there.
+
+    Raises GitError when git itself failed (bad ref, broken repo) so a failed
+    read is never misread as a deletion."""
     ref = commit or "HEAD"
     try:
         result = subprocess.run(
@@ -362,22 +435,52 @@ def _git_show(repo_path: str, file_path: str, commit: str | None) -> str:
             cwd=repo_path,
             capture_output=True,
             text=True,
+            timeout=60,
         )
-        return result.stdout if result.returncode == 0 else ""
     except Exception as e:
-        logger.warning("git show %s:%s failed: %s", ref, file_path, e)
-        return ""
+        raise GitError(f"git show {ref}:{file_path} failed: {e}") from e
+    if result.returncode == 0:
+        return result.stdout
+    # Non-zero: either the path is absent at this ref (normal for new files)
+    # or the ref/repo is broken. Ask git directly to tell the two apart.
+    exists = subprocess.run(
+        ["git", "cat-file", "-e", f"{ref}:{file_path}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if exists.returncode != 0:
+        ref_ok = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", ref],
+            cwd=repo_path,
+            capture_output=True,
+            text=True,
+        )
+        if ref_ok.returncode != 0:
+            raise GitError(
+                f"base ref {ref!r} is not a valid commit; "
+                "run update with --base-commit or regenerate docs"
+            )
+        return None  # path absent at this ref
+    raise GitError(
+        f"git show {ref}:{file_path} failed: {result.stderr.strip()}"
+    )
 
 
-def _read_working_tree(repo_path: str, file_path: str) -> str:
-    """Working-tree content of a file ('' when deleted)."""
+def _read_working_tree(repo_path: str, file_path: str) -> Optional[str]:
+    """Working-tree content; None when the file does not exist (deleted).
+
+    Read errors propagate: a transient permission/lock failure must never be
+    mistaken for a deletion. "" is a real empty file. Oversized files are
+    skipped (raise) for the same reason generated files are skipped during
+    full analysis."""
     full_path = Path(repo_path) / file_path
     if not full_path.exists():
-        return ""
-    try:
-        return full_path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
+        return None
+    size = full_path.stat().st_size
+    if size > MAX_SOURCE_FILE_BYTES:
+        raise OSError(f"file too large to analyze ({size} bytes)")
+    return full_path.read_text(encoding="utf-8", errors="replace")
 
 
 def analyze_git_diff(
@@ -439,15 +542,39 @@ def analyze_git_diff(
 
     diffs: dict[str, FileDiff] = {}
 
+    # Generation walks only the include patterns and honours the ignore
+    # patterns; update must apply the SAME rules, otherwise a changed file in
+    # examples/, docs_src/, scripts/... enters the graph through the back door.
+    from repodoc.graph.analyzers import (
+        DEFAULT_IGNORE_PATTERNS,
+        DEFAULT_INCLUDE_PATTERNS,
+    )
+    from repodoc.graph.builder import _should_exclude_path, _should_include_file
+
+    ignore_patterns = set(DEFAULT_IGNORE_PATTERNS)
+
     for file_path in changed_files:
         spec = get_diff_spec(file_path)
         if spec is None:
             # Non-code file (md, json, ...) — does not affect API docs
             continue
+        fname = Path(file_path).name
+        if _should_exclude_path(file_path, fname, ignore_patterns):
+            logger.debug("Skipping ignored path: %s", file_path)
+            continue
+        if not _should_include_file(file_path, fname, DEFAULT_INCLUDE_PATTERNS):
+            logger.debug("Skipping non-included path: %s", file_path)
+            continue
 
         old_path = renames.get(file_path, file_path)
-        old_content = _git_show(repo_path, old_path, base_commit)
-        new_content = _read_working_tree(repo_path, file_path)
+        try:
+            old_content = _git_show(repo_path, old_path, base_commit)
+            new_content = _read_working_tree(repo_path, file_path)
+        except (GitError, OSError) as e:
+            # Never reconcile a file whose old/new content could not be read:
+            # a transient read failure must not be treated as a deletion.
+            logger.warning("Skipping %s: %s", file_path, e)
+            continue
 
         # A pure rename (identical content) must still be processed: its
         # components keep their identity but change ids, so the graph and the
@@ -478,8 +605,10 @@ def filter_important_changes(
     }
 
 
-def _code_diff(old_content: str, new_content: str, file_path: str) -> str:
+def _code_diff(old_content: Optional[str], new_content: Optional[str], file_path: str) -> str:
     """Unified diff of old vs new content (pure difflib, no git dependency)."""
+    old_content = old_content or ""
+    new_content = new_content or ""
     if not old_content and not new_content:
         return ""
     diff = difflib.unified_diff(
@@ -514,8 +643,12 @@ class IncrementalUpdater:
         self.config = config
 
     def _bounded_callers(self, seeds: set[str], max_hops: int) -> set[str]:
-        """Callers reachable from seeds within max_hops via REL_CALLS
-        predecessors (excludes the seeds themselves)."""
+        """Dependents reachable from seeds within max_hops via REL_CALLS or
+        REL_IMPLEMENTS predecessors (excludes the seeds themselves).
+
+        Both edges mean "this component depends on the changed one": callers
+        must follow API changes, and subclasses/implementors must follow base
+        class / interface changes."""
         affected: set[str] = set()
         frontier: list[tuple[str, int]] = [(s, 0) for s in seeds]
         visited: set[str] = set(seeds)
@@ -528,7 +661,10 @@ class IncrementalUpdater:
                 if pred in visited:
                     continue
                 edge_data = self.graph.get_edge_data(pred, component)
-                if not (edge_data and edge_data.get("relation_type") == REL_CALLS):
+                if not edge_data or edge_data.get("relation_type") not in (
+                    REL_CALLS,
+                    REL_IMPLEMENTS,
+                ):
                     continue
                 visited.add(pred)
                 affected.add(pred)
@@ -936,6 +1072,70 @@ def _cleanup_empty_dirs(docs_dir: str) -> int:
     return removed
 
 
+# ---------------------------------------------------------------------------
+# Pending-update journal (crash / failure recovery)
+# ---------------------------------------------------------------------------
+
+
+def _pending_updates_path(config: Config, project_name: str) -> str:
+    return os.path.join(
+        config.output_dir, "data", f"{project_name}_pending_updates.json"
+    )
+
+
+def _load_pending_updates(config: Config, project_name: str) -> dict[str, Any]:
+    """Docs left unfinished by an interrupted or partially failed run.
+
+    The graph is mutated before docs are written, so a crash or an LLM
+    failure can leave code nodes updated while their docs still describe the
+    old code. This journal keeps those docs scheduled until they succeed (or
+    their component disappears)."""
+    data = file_manager.load_json(_pending_updates_path(config, project_name))
+    if not isinstance(data, dict):
+        return {"components": [], "modules": [], "overview": False}
+    return {
+        "components": [c for c in data.get("components", []) if isinstance(c, str)],
+        "modules": [m for m in data.get("modules", []) if isinstance(m, str)],
+        "overview": bool(data.get("overview")),
+    }
+
+
+def _save_pending_updates(
+    config: Config, project_name: str, pending: dict[str, Any]
+) -> None:
+    """Persist (or clear) the pending-update journal atomically."""
+    path = _pending_updates_path(config, project_name)
+    if not (
+        pending.get("components")
+        or pending.get("modules")
+        or pending.get("overview")
+    ):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return
+    pending = dict(pending)
+    pending["updated_at"] = datetime.now().isoformat()
+    file_manager.save_json(pending, path)
+
+
+def _pending_is_empty(pending: dict[str, Any]) -> bool:
+    return not (
+        pending.get("components")
+        or pending.get("modules")
+        or pending.get("overview")
+    )
+
+
+def _job_failed(result: Any) -> bool:
+    """True when a doc job raised or the agent reported failure. A None
+    result is a deliberate skip (manual edit) and is not a failure."""
+    return isinstance(result, Exception) or (
+        result is not None and not getattr(result, "success", False)
+    )
+
+
 async def run_update(
     config: Config,
     changed_files: Optional[tuple[str, ...]] = None,
@@ -1021,8 +1221,12 @@ async def run_update(
             if spec is None:
                 continue
             old_path = renames.get(f, f)
-            old_content = _git_show(config.repo_path, old_path, base_commit)
-            new_content = _read_working_tree(config.repo_path, f)
+            try:
+                old_content = _git_show(config.repo_path, old_path, base_commit)
+                new_content = _read_working_tree(config.repo_path, f)
+            except (GitError, OSError) as e:
+                logger.warning("Skipping %s: %s", f, e)
+                continue
             if old_content == new_content and f not in renames:
                 continue
             diffs[f] = FileDiff(
@@ -1061,22 +1265,36 @@ async def run_update(
 
     pre_components = graph_to_components(graph)
 
+    # Docs left unfinished by a previous (crashed/partial) run stay on the
+    # schedule even when this run sees no new important changes.
+    pending_updates = _load_pending_updates(config, project_name)
+    if not _pending_is_empty(pending_updates):
+        print(
+            f"Resuming {len(pending_updates['components'])} component + "
+            f"{len(pending_updates['modules'])} module pending doc update(s) "
+            "from a previous run"
+        )
+
     pre_mutation_modules = _collect_component_modules(
         graph_to_module_tree(graph)
     )
 
-    # Pre-mutation caller snapshot: REMOVED components lose their incoming
-    # calls edges during mutation, so their callers must be snapshotted
-    # BEFORE the removal to remain reachable for impact propagation.
+    # Pre-mutation dependent snapshot: REMOVED components lose their incoming
+    # edges during mutation, so their callers/implementors must be snapshotted
+    # BEFORE the removal to remain reachable for impact propagation. The edge
+    # relation is recorded per (target, pred) pair so the rename follow-through
+    # can re-point the correct list (depends_on vs implements).
     pre_callers: dict[str, set[str]] = {}
+    pre_ref_types: dict[tuple[str, str], str] = {}
     for nid, attrs in graph.nodes(data=True):
         if attrs.get("node_type") != "code":
             continue
         callers = set()
         for pred in graph.predecessors(nid):
             ed = graph.get_edge_data(pred, nid)
-            if ed and ed.get("relation_type") == REL_CALLS:
+            if ed and ed.get("relation_type") in (REL_CALLS, REL_IMPLEMENTS):
                 callers.add(pred)
+                pre_ref_types[(nid, pred)] = ed["relation_type"]
         pre_callers[nid] = callers
 
     print(f"\nMutating knowledge graph ({len(diffs)} file(s))...")
@@ -1137,32 +1355,39 @@ async def run_update(
     if renamed_old_ids:
         mutation.removed = [r for r in mutation.removed if r not in renamed_old_ids]
 
-    # Callers follow the rename: re-point their calls edges and stored
-    # depends_on entries from the old id to the new one (pre_callers was
-    # snapshotted before the mutation, when the old id still existed).
+    # Callers/implementors follow the rename: re-point their edges and stored
+    # depends_on / implements entries from the old id to the new one
+    # (pre_ref_types was snapshotted before the mutation, when the old id
+    # still existed and its incoming relation was visible).
     followed = 0
     for old_id, new_id in renamed_pairs:
         for pred in sorted(pre_callers.get(old_id, set())):
             if not (graph.has_node(pred) and graph.has_node(new_id)):
                 continue
             pred_node = graph.get_node(pred)
-            deps = set(getattr(pred_node, "depends_on", None) or [])
-            # The removal pass already detached the old id from the caller; the
-            # new id must be attached either way (that is the rename following
-            # through), so compare against the desired set, not just presence.
-            new_deps = (deps - {old_id}) | {new_id}
-            if new_deps != deps:
+            relation = pre_ref_types.get((old_id, pred), REL_CALLS)
+            field = "implements" if relation == REL_IMPLEMENTS else "depends_on"
+            values = set(getattr(pred_node, field, None) or [])
+            # The removal pass already detached the old id; the new id must be
+            # attached either way (that is the rename following through), so
+            # compare against the desired set, not just presence.
+            new_values = (values - {old_id}) | {new_id}
+            if new_values != values:
                 data = pred_node.model_dump()
-                data["depends_on"] = sorted(new_deps)
+                data[field] = sorted(new_values)
                 graph.add_code_node(CodeNode.model_validate(data))
             if not graph.has_edge(pred, new_id):
-                graph.add_edge(pred, new_id, REL_CALLS, 1.0)
+                graph.add_edge(pred, new_id, relation, 1.0)
                 followed += 1
     if followed:
         print(f"  Re-pointed {followed} caller edge(s) to renamed component id(s)")
         graph.save(_graph_save_path(config, project_name))
 
-    if not doc_diffs and not renamed_pairs:
+    if (
+        not doc_diffs
+        and not renamed_pairs
+        and _pending_is_empty(pending_updates)
+    ):
         print(
             "\nNo important API changes detected — documentation update not "
             "needed (knowledge graph synced to the working tree)."
@@ -1174,7 +1399,10 @@ async def run_update(
     for fd in doc_diffs.values():
         for change in (fd.analysis.changes if fd.analysis else []):
             if change.change_type in SEVERE_TYPES:
-                severe_components.add(_component_id(fd.file_path, change.name))
+                severe_components.add(
+                    change.component_id
+                    or _component_id(fd.file_path, change.name)
+                )
     severe_components &= set(mutation.changed) | set(mutation.removed)
 
     # Callers of REMOVED components (snapshotted pre-mutation): their docs
@@ -1207,6 +1435,17 @@ async def run_update(
         if graph.has_node(cid)
         and graph.get_node(cid).relative_path in doc_file_paths
     ]
+    if not doc_scope_components and doc_file_paths:
+        # The graph may already be converged (a previous run synced it before
+        # crashing, or the changes cancel out): the code is current and only
+        # the docs are behind. Re-document the components of the changed files
+        # instead of concluding there is nothing to do.
+        doc_scope_components = [
+            nid
+            for nid, attrs in graph.nodes(data=True)
+            if attrs.get("node_type") == "code"
+            and attrs.get("data", {}).get("relative_path") in doc_file_paths
+        ]
     impact = updater.compute_layered_impact(
         doc_scope_components,
         severe_components,
@@ -1234,6 +1473,23 @@ async def run_update(
         set(impact["modules_to_doc"]) | stale_modules | stale_component_modules
     )
     if stale_overview or stale_modules or stale_component_modules:
+        impact["update_overview"] = True
+
+    # Unfinished docs from a previous run: resume them (skip ids whose
+    # component no longer exists — its doc was already cleaned up).
+    pending_components = [
+        c for c in pending_updates["components"] if graph.has_node(c)
+    ]
+    pending_modules = [
+        m for m in pending_updates["modules"] if graph.has_node(m)
+    ]
+    impact["components_to_doc"] = sorted(
+        set(impact["components_to_doc"]) | set(pending_components)
+    )
+    impact["modules_to_doc"] = sorted(
+        set(impact["modules_to_doc"]) | set(pending_modules)
+    )
+    if pending_updates["overview"]:
         impact["update_overview"] = True
     impact["total_components"] = len(impact["components_to_doc"])
 
@@ -1366,6 +1622,19 @@ async def run_update(
 
     component_jobs = _component_jobs()
 
+    # Journal the full intended scope BEFORE writing any doc: if the process
+    # dies mid-run, the next run resumes exactly these docs (at-least-once).
+    _save_pending_updates(
+        config,
+        project_name,
+        {
+            "components": [job[0] for job in component_jobs],
+            "modules": list(impact["modules_to_doc"]),
+            "overview": bool(impact["update_overview"]),
+            "base_commit": base_commit,
+        },
+    )
+
     async def _update_component(job):
         node_id, doc_path, existing_doc = job
         node = pipeline.components.get(node_id)
@@ -1389,6 +1658,7 @@ async def run_update(
             cid
             for cid, n in pipeline.components.items()
             if node_id in getattr(n, "depends_on", set())
+            or node_id in getattr(n, "implements", set())
         ]
         component = {
             "name": node.name,
@@ -1480,7 +1750,9 @@ async def run_update(
                 comp_doc_path = _component_doc_path(docs_dir, chain, node.name)
                 content = _safe_read(comp_doc_path)
                 if content:
-                    component_docs_content[node.name] = content[:3000]
+                    component_docs_content[node.name] = summarize_markdown(
+                        content, budget=2000
+                    )
 
             child_docs_content = {}
             children = module_info.get("children", {})
@@ -1490,7 +1762,9 @@ async def run_update(
                 )
                 content = _safe_read(child_doc_path)
                 if content:
-                    child_docs_content[child_name] = content[:2000]
+                    child_docs_content[child_name] = summarize_markdown(
+                        content, budget=1500
+                    )
 
             path_parts = module_id.split("/")
             parent_module = path_parts[-2] if len(path_parts) > 1 else ""
@@ -1568,7 +1842,9 @@ async def run_update(
             for name in module_tree.keys():
                 content = _safe_read(os.path.join(docs_dir, f"{name}.md"))
                 if content:
-                    module_docs_summary[name] = content[:2500]
+                    module_docs_summary[name] = summarize_markdown(
+                        content, budget=2000
+                    )
 
             overview_input = {
                 "type": "update_overview",
@@ -1582,26 +1858,32 @@ async def run_update(
                 "existing_doc": existing_doc,
                 "output_path": readme_path,
             }
-            if should_partial_update(existing_doc, ""):
-                overview_result = await pipeline.agent.execute(
-                    {"type": "write_doc", "config": config, "input": overview_input}
-                )
-            else:
-                overview_result = await pipeline.agent.execute(
-                    {
-                        "type": "write_doc",
-                        "config": config,
-                        "input": {
-                            "type": "overview",
-                            "repo_name": overview_input["repo_name"],
-                            "component_count": overview_input["component_count"],
-                            "module_count": overview_input["module_count"],
-                            "module_dependencies": overview_input["module_dependencies"],
-                            "module_docs_summary": overview_input["module_docs_summary"],
-                            "output_path": readme_path,
-                        },
-                    }
-                )
+            try:
+                if should_partial_update(existing_doc, ""):
+                    overview_result = await pipeline.agent.execute(
+                        {"type": "write_doc", "config": config, "input": overview_input}
+                    )
+                else:
+                    overview_result = await pipeline.agent.execute(
+                        {
+                            "type": "write_doc",
+                            "config": config,
+                            "input": {
+                                "type": "overview",
+                                "repo_name": overview_input["repo_name"],
+                                "component_count": overview_input["component_count"],
+                                "module_count": overview_input["module_count"],
+                                "module_dependencies": overview_input["module_dependencies"],
+                                "module_docs_summary": overview_input["module_docs_summary"],
+                                "output_path": readme_path,
+                            },
+                        }
+                    )
+            except Exception as e:
+                # Same failure contract as component/module docs: journal it,
+                # never abort the whole run over the README.
+                print(f"Warning: README update failed: {e}")
+                overview_result = False
 
     # --- Sync graph doc nodes + persist ---
     for job, result in zip(component_jobs, component_results):
@@ -1633,11 +1915,63 @@ async def run_update(
 
     success_count = sum(1 for r in component_results if is_successful_result(r))
     module_success = sum(1 for r in module_results if is_successful_result(r))
-    print(f"\nSuccessfully updated {success_count}/{len(component_results)} component doc(s), "
-          f"{module_success}/{len(module_results)} module doc(s)"
-          + (", README" if overview_result is not None and getattr(overview_result, "success", False) else ""))
+    overview_ok = is_successful_result(overview_result)
+
+    # --- Failure recovery: journal what did not make it ---
+    failed_component_ids = sorted(
+        {
+            job[0]
+            for job, r in zip(component_jobs, component_results)
+            if _job_failed(r)
+        }
+    )
+    failed_module_ids = sorted(
+        {
+            job[0]
+            for job, r in zip(module_jobs, module_results)
+            if _job_failed(r)
+        }
+    )
+    overview_failed = bool(impact["update_overview"]) and _job_failed(
+        overview_result
+    )
+    # Flag failed docs stale so their state is visible; the pending journal is
+    # the authoritative retry queue (a never-generated doc has no DocNode).
+    for job, r in zip(component_jobs, component_results):
+        if _job_failed(r):
+            _mark_doc_stale(graph, pipeline, job[1])
+    for job, r in zip(module_jobs, module_results):
+        if _job_failed(r):
+            _mark_doc_stale(graph, pipeline, job[3])
+    if overview_failed:
+        _mark_doc_stale(graph, pipeline, readme_path)
+
+    remaining_pending = {
+        "components": [c for c in failed_component_ids if graph.has_node(c)],
+        "modules": failed_module_ids,
+        "overview": overview_failed,
+    }
+    _save_pending_updates(config, project_name, remaining_pending)
+    pending_after = not _pending_is_empty(remaining_pending)
+    if pending_after:
+        # Persist the stale flags set above.
+        graph.save(_graph_save_path(config, project_name))
+
+    print(
+        f"\nSuccessfully updated {success_count}/{len(component_results)} "
+        f"component doc(s), {module_success}/{len(module_results)} module doc(s)"
+        + (", README" if overview_ok else "")
+    )
+    if pending_after:
+        print(
+            f"WARNING: {len(failed_component_ids)} component doc(s) and "
+            f"{len(failed_module_ids)} module doc(s) failed"
+            + (" (README included)" if overview_failed else "")
+            + "; they stay pending and the next `repodoc update` will retry them."
+        )
 
     duration = time.time() - start_time
+    status = "partial" if pending_after else "success"
 
     # --- Logging + metadata ---
     from repodoc.llm import total_token_usage
@@ -1656,7 +1990,7 @@ async def run_update(
         llm_calls=usage["llm_calls"],
         components_processed=len(impact["components_to_doc"]),
         components_updated=success_count,
-        status="success",
+        status=status,
         metadata={
             "graph_mutation": {
                 "added": len(mutation.added),
@@ -1666,28 +2000,37 @@ async def run_update(
                 "edges_removed": len(mutation.removed_edges),
             },
             "modules_updated": module_success,
-            "overview_updated": bool(
-                overview_result is not None
-                and getattr(overview_result, "success", False)
-            ),
+            "overview_updated": overview_ok,
             "docs_removed": removed_docs,
             "docs_migrated": migrated_docs,
+            "failed_components": failed_component_ids,
+            "failed_modules": failed_module_ids,
+            "pending": pending_after,
         },
     )
 
-    if current_commit and os.path.exists(metadata_path):
+    if os.path.exists(metadata_path):
         try:
             metadata = file_manager.load_json(metadata_path)
             if metadata:
-                metadata["generation_info"]["git_commit"] = current_commit
+                if "generation_info" not in metadata:
+                    metadata["generation_info"] = {}
                 if "update_info" not in metadata:
                     metadata["update_info"] = {}
-                metadata["update_info"]["last_update_commit"] = current_commit
+                # The watermark advances ONLY when no doc is left pending:
+                # otherwise the next run must resync from the old base.
+                if current_commit and not pending_after:
+                    metadata["generation_info"]["git_commit"] = current_commit
+                    metadata["update_info"]["last_update_commit"] = current_commit
+                metadata["update_info"]["last_attempt_commit"] = current_commit
                 metadata["update_info"]["last_base_commit"] = base_commit
                 metadata["update_info"]["components_updated"] = success_count
                 metadata["update_info"]["affected_components"] = impact[
                     "components_to_doc"
                 ]
+                metadata["update_info"]["pending_docs"] = (
+                    remaining_pending if pending_after else {}
+                )
                 metadata["generation_info"]["timestamp"] = datetime.now().isoformat()
                 file_manager.save_json(metadata, metadata_path)
         except Exception as e:
@@ -1695,10 +2038,11 @@ async def run_update(
 
     print("\nDocumentation update complete!")
     return {
-        "status": "success",
+        "status": status,
         "impact": impact,
         "updated": success_count,
         "total": len(component_results),
         "modules_updated": module_success,
         "removed_docs": removed_docs,
+        "pending": pending_after,
     }
