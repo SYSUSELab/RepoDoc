@@ -38,7 +38,10 @@ options:
    generation include/ignore rules are skipped, and an unreadable or empty file
    is never mistaken for a deletion. Reference resolution is scope-aware: a
    callee resolves in the caller's own file first, then by a globally unique
-   name; ambiguous bare names are dropped instead of guessed.
+   name; ambiguous bare names are dropped instead of guessed and kept on the
+   node as unresolved references. After the batch, unresolved references that
+   the new definitions made resolvable are wired into edges automatically, so
+   the call graph can grow as well as shrink.
 2. **Graph mutation** — the knowledge graph is updated in place: new components
    are added (with module placement), modified components overwritten (with
    typed edge diffs), removed components deleted with all incident edges.
@@ -74,8 +77,11 @@ in the system role (with an explicit untrusted-data guard), each layer
 receives structural summaries (title, opening paragraph, section outline) of
 its children's docs instead of raw character cuts, and clustering responses
 are cached by prompt + model in `{data}/clustering_cache.json` so reruns and
-ablations reuse the same module tree. Cluster quality stats (module count,
-depth, empty modules, largest module) are printed after clustering.
+ablations reuse the same module tree. The clustering prompt itself carries a
+semantic signal per component (type, docstring first line, parameters), falling
+back to name-only lists when the budget is exceeded; both strategies exclude
+private components. Cluster quality stats (module count, depth, empty modules,
+largest module) are printed after clustering.
 
 ## Configuration
 
