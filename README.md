@@ -14,7 +14,20 @@ repodoc update <repo_path>     # Incrementally update docs for changed files
                                #   --propagate sig|all   caller propagation scope
                                #   --max-hops N          max propagation depth (0 disables)
                                #   --force               overwrite manually edited docs
+                               #   --dry-run             preview scope/cost, change nothing
 repodoc config show            # Show current configuration
+```
+
+`analyze`, `docs` and `generate` share the analysis/documentation scope
+options:
+
+```bash
+  -I, --include GLOB     only analyze matching files (repeatable, e.g. 'src/*')
+  -X, --exclude GLOB     skip matching files/dirs (repeatable)
+  --max-file-size N      skip source files larger than N bytes
+  --doc-types T1,T2      component types to document (default: automatic)
+  --max-docs N           cap the number of documented components (ranked by
+                         dependents, then type; 0 = no cap)
 ```
 
 `repodoc update` works in four stages:
@@ -23,15 +36,19 @@ repodoc config show            # Show current configuration
    untracked files) is re-analyzed per file; changes are classified by severity
    and keyed by exact component id (methods included). Files outside the
    generation include/ignore rules are skipped, and an unreadable or empty file
-   is never mistaken for a deletion.
+   is never mistaken for a deletion. Reference resolution is scope-aware: a
+   callee resolves in the caller's own file first, then by a globally unique
+   name; ambiguous bare names are dropped instead of guessed.
 2. **Graph mutation** — the knowledge graph is updated in place: new components
    are added (with module placement), modified components overwritten (with
-   calls/implements edge diffs), removed components deleted with all incident
-   edges. Inheritance/interface relations are stored as `implements` edges,
-   separate from `calls`.
-3. **Layered impact** — changes propagate over calls and implements edges to
-   affected callers/subclasses (bounded by `--max-hops`, gated by severity),
-   then to module docs and the README overview.
+   typed edge diffs), removed components deleted with all incident edges.
+   Relations keep their semantics: `calls`, `implements` (extends/interface),
+   `uses` (field/property/parameter/type references), `instantiates`
+   (constructor calls) and `imports`.
+3. **Layered impact** — changes propagate over calls/implements/uses/
+   instantiates edges to affected callers, subclasses and type users (bounded
+   by `--max-hops`, gated by severity), then to module docs and the README
+   overview.
 4. **Doc update** — existing docs are updated minimally (old doc embedded as
    the format anchor; only affected sections change). Docs you edited by hand
    are skipped with a warning (`--force` overwrites them); removed components
