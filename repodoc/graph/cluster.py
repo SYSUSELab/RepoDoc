@@ -174,12 +174,40 @@ def _format_cluster_prompt(
 # ---------------------------------------------------------------------------
 
 
+# Per-component semantic signal budget in the cluster prompt (chars).
+_MAX_SIGNAL_DOC_CHARS = 160
+_MAX_SIGNAL_PARAM_CHARS = 120
+# Cluster prompts larger than this (tokens) fall back to name-only lists.
+MAX_CLUSTER_PROMPT_TOKENS = 24_000
+
+
+def _component_signal(node: Node) -> str:
+    """One-line semantic signal for clustering: component type, docstring
+    first line and parameters. Names alone carry little meaning for helpers
+    like `handle()`/`process()`; the docstring anchors them semantically."""
+    bits = [f"[{node.component_type}]"]
+    doc_lines = (node.docstring or "").strip().splitlines()
+    if doc_lines:
+        first = " ".join(doc_lines[0].split())[:_MAX_SIGNAL_DOC_CHARS]
+        if first:
+            bits.append(f"— {first}")
+    if node.parameters:
+        params = ", ".join(p for p in node.parameters[:6] if p)
+        if params:
+            bits.append(f"({params[:_MAX_SIGNAL_PARAM_CHARS]})")
+    return " ".join(bits)
+
+
 def _format_potential_core_components(
     leaf_nodes: List[str],
     components: Dict[str, Node],
     include_code: bool = False,
+    include_signals: bool = False,
 ) -> str:
-    """Format leaf components for the cluster prompt (with or without code)."""
+    """Format leaf components for the cluster prompt.
+
+    include_signals adds type/docstring/parameter hints (preferred);
+    include_code embeds a code snippet (used for the token estimate)."""
     valid_leaf_nodes = [n for n in leaf_nodes if n in components]
     for n in leaf_nodes:
         if n not in components:
@@ -195,7 +223,10 @@ def _format_potential_core_components(
     for file, nodes in sorted(by_file.items()):
         lines.append(f"# {file}")
         for n in nodes:
-            lines.append(f"  - {n}")
+            if include_signals:
+                lines.append(f"  - {n} {_component_signal(components[n])}")
+            else:
+                lines.append(f"  - {n}")
             if include_code:
                 code = components[n].source_code or ""
                 if code:
@@ -203,6 +234,23 @@ def _format_potential_core_components(
                     lines.append(f"    ```\n    {code[:500]}\n    ```")
 
     return "\n".join(lines)
+
+
+def _format_cluster_input(
+    leaf_nodes: List[str], components: Dict[str, Node]
+) -> str:
+    """Component list for clustering: semantic signals when they fit the
+    prompt budget, name-only otherwise."""
+    with_signals = _format_potential_core_components(
+        leaf_nodes, components, include_signals=True
+    )
+    if count_tokens(with_signals) <= MAX_CLUSTER_PROMPT_TOKENS:
+        return with_signals
+    logger.info(
+        "Cluster signals exceed %d tokens; falling back to name-only list",
+        MAX_CLUSTER_PROMPT_TOKENS,
+    )
+    return _format_potential_core_components(leaf_nodes, components)
 
 
 def _parse_llm_response(response: str) -> Dict[str, Any]:
@@ -647,9 +695,7 @@ def _cluster_one_batch(
     config: Config,
 ) -> Dict[str, Any]:
     """Process a single batch (used by parallel executor). Returns module_tree or fallback dict."""
-    potential = _format_potential_core_components(
-        batch, components, include_code=False
-    )
+    potential = _format_cluster_input(batch, components)
     prompt = _format_cluster_prompt(potential)
     try:
         _, module_tree = _call_llm_with_retry(prompt, config)
@@ -799,8 +845,10 @@ def _cluster_small_set(
     current_module_path: List[str],
 ) -> Dict[str, Any]:
     """Handle clustering for smaller sets (<= MAX_COMPONENTS_PER_BATCH)."""
-    potential = _format_potential_core_components(leaf_nodes, components, include_code=False)
-    potential_with_code = _format_potential_core_components(leaf_nodes, components, include_code=True)
+    potential = _format_cluster_input(leaf_nodes, components)
+    potential_with_code = _format_potential_core_components(
+        leaf_nodes, components, include_code=True
+    )
     token_count = count_tokens(potential_with_code)
 
     # Skip clustering for small content
@@ -1009,17 +1057,17 @@ def cluster_modules(
     Cluster leaf components into a module tree.
     Returns a dict: module_name -> { "path", "components", "children" }.
     """
-    if config.cluster_strategy == "heuristic":
-        return _cluster_heuristic(leaf_nodes, components)
-
     # Private components (leading underscore) are not useful in docs and
-    # never enter the tree; heuristic strategy and the dependency graph
-    # are unaffected (filtered by name, ids are dotted paths).
+    # never enter the tree — for BOTH strategies, so the ablation comparison
+    # (llm vs heuristic) sees the same component set.
     leaf_nodes = [
         n
         for n in leaf_nodes
         if n in components and not components[n].name.startswith("_")
     ]
+
+    if config.cluster_strategy == "heuristic":
+        return _cluster_heuristic(leaf_nodes, components)
 
     # Only the outermost call validates coverage; recursion passes the
     # current tree and is skipped.

@@ -11,7 +11,7 @@ kind of information ("function"/"class"/...) but are kept as separate fields —
 the mapping happens in graph/builder.py.
 """
 
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from pydantic import BaseModel
 
@@ -83,6 +83,11 @@ class Node(BaseModel):
     uses: Set[str] = set()
     instantiates: Set[str] = set()
     imports: Set[str] = set()
+    # References that could not be resolved when the file was analyzed,
+    # keyed by relation type ("calls", "uses", ...). They stay on the graph
+    # so a later update that introduces the missing definition can wire the
+    # edge instead of losing it forever.
+    unresolved: Dict[str, Set[str]] = {}
     source_code: Optional[str] = None
     start_line: int = 0
     end_line: int = 0
@@ -128,6 +133,9 @@ class CodeNode(BaseModel):
     uses: List[str] = []  # resolved type references
     instantiates: List[str] = []  # resolved constructor targets
     imports: List[str] = []  # resolved import targets
+    # Unresolved references by relation type; reconciled when the missing
+    # definition appears in a later update.
+    unresolved: Dict[str, List[str]] = {}
     parameters: Optional[List[str]] = None
     receiver: Optional[str] = None  # Go/Rust method receiver type
 

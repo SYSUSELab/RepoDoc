@@ -97,21 +97,25 @@ def _resolve_dependencies(
     point at). Each relation keeps its own field/edge type (calls,
     implements, uses, instantiates, imports)."""
     lookup = _build_lookup(graph, new_nodes)
-    new_ids = {n.id for n in new_nodes}
+    new_by_id = {n.id: n for n in new_nodes}
     resolved: Dict[str, Dict[str, Set[str]]] = {
         field: {n.id: set() for n in new_nodes}
         for field, _relation in _RELATION_FIELD_EDGES
     }
     for rel in relationships:
         caller = lookup.get(rel.caller)
-        if caller is None or caller not in new_ids:
+        if caller is None or caller not in new_by_id:
             continue
+        relation = getattr(rel, "relation_type", REL_CALLS)
         callee = lookup.get(rel.callee)
         if callee is None and "." in rel.callee:
             callee = lookup.get(rel.callee.split(".")[-1])
-        if callee is None or not (callee in new_ids or graph.has_node(callee)):
+        if callee is None or not (callee in new_by_id or graph.has_node(callee)):
+            # Keep the dangling reference so a later update can wire it.
+            new_by_id[caller].unresolved.setdefault(relation, set()).add(
+                rel.callee
+            )
             continue
-        relation = getattr(rel, "relation_type", REL_CALLS)
         field_name = _FIELD_BY_RELATION.get(relation, "depends_on")
         resolved[field_name][caller].add(callee)
     return resolved
@@ -254,6 +258,10 @@ def _detach_references(graph: HeterogeneousGraph, node_id: str) -> List[str]:
         for s, t, rt, _w in graph.edges()
         if t == node_id and s != node_id and rt in CODE_DEPENDENCY_RELATIONS
     }
+    removed = graph.get_node(node_id)
+    aliases = {node_id, node_id.split(".")[-1]}
+    if isinstance(removed, CodeNode) and removed.name:
+        aliases.add(removed.name)
     fields = [field for field, _relation in _RELATION_FIELD_EDGES]
     for cid in sorted(referrers):
         node = graph.get_node(cid)
@@ -267,9 +275,78 @@ def _detach_references(graph: HeterogeneousGraph, node_id: str) -> List[str]:
             if len(kept) != len(values):
                 data[field] = kept
                 changed = True
+        unresolved = data.get("unresolved") or {}
+        if unresolved:
+            cleaned: Dict[str, List[str]] = {}
+            for relation, refs in unresolved.items():
+                kept_refs = [ref for ref in refs if ref not in aliases]
+                if len(kept_refs) != len(refs):
+                    changed = True
+                if kept_refs:
+                    cleaned[relation] = kept_refs
+            if cleaned != unresolved:
+                data["unresolved"] = cleaned
         if changed:
             graph.add_code_node(CodeNode.model_validate(data))
     return sorted(referrers)
+
+
+def reconcile_unresolved_references(graph: HeterogeneousGraph) -> int:
+    """Wire stored unresolved references to components that now exist.
+
+    Called after graph mutations: a definition added by one changed file can
+    make references in unchanged files resolvable, and removing a duplicate
+    can make an ambiguous name unique. References that match exactly one
+    component become edges and leave the unresolved list; ambiguous ones stay.
+    Returns the number of edges added."""
+    by_key: Dict[str, Set[str]] = {}
+    for nid, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "code":
+            continue
+        data = attrs.get("data", {})
+        cid = data.get("id", nid)
+        for key in {cid, cid.split(".")[-1], data.get("name") or ""}:
+            if key:
+                by_key.setdefault(key, set()).add(cid)
+
+    added = 0
+    for nid, attrs in list(graph.nodes(data=True)):
+        if attrs.get("node_type") != "code":
+            continue
+        data = dict(attrs.get("data", {}))
+        unresolved = data.get("unresolved") or {}
+        if not unresolved:
+            continue
+        changed = False
+        remaining: Dict[str, List[str]] = {}
+        for relation, refs in unresolved.items():
+            field = _FIELD_BY_RELATION.get(relation, "depends_on")
+            resolved_values = set(data.get(field) or [])
+            kept: List[str] = []
+            for ref in refs:
+                candidates = by_key.get(ref)
+                if not candidates:
+                    candidates = by_key.get(str(ref).split(".")[-1])
+                candidates = candidates or set()
+                if len(candidates) == 1:
+                    target = next(iter(candidates))
+                    changed = True
+                    if target != nid:
+                        resolved_values.add(target)
+                        if graph.has_node(target) and not graph.has_edge(
+                            nid, target
+                        ):
+                            graph.add_edge(nid, target, relation, 1.0)
+                            added += 1
+                else:
+                    kept.append(ref)
+            if kept:
+                remaining[relation] = kept
+            data[field] = sorted(resolved_values)
+        if changed:
+            data["unresolved"] = remaining
+            graph.add_code_node(CodeNode.model_validate(data))
+    return added
 
 
 def _remove_component_from_modules(graph: HeterogeneousGraph, node_id: str) -> None:
@@ -357,7 +434,9 @@ def apply_file_changes_to_graph(
             is NOT analyzed — the graph holds the previous state.
 
     Returns a GraphMutationResult summarizing added/updated/removed nodes
-    and edges. Callers must persist the graph afterwards."""
+    and edges. Callers must persist the graph afterwards; when processing a
+    batch of files, run reconcile_unresolved_references(graph) once after the
+    batch so references that the new definitions resolved become edges."""
     result = GraphMutationResult()
 
     # Analyzers derive module paths from (file_path, repo_path); pass the
@@ -474,6 +553,10 @@ def apply_file_changes_to_graph(
         if module_id and module_id not in result.modules_added:
             result.modules_added.append(module_id)
 
+    # NOTE: callers processing a batch of files should call
+    # reconcile_unresolved_references(graph) once after the batch (new
+    # definitions from other files can wire unresolved references), then
+    # rebuild_cross_module_edges(graph).
     rebuild_cross_module_edges(graph)
     return result
 
@@ -497,6 +580,11 @@ def _add_component_node(graph: HeterogeneousGraph, node: Node) -> None:
             uses=sorted(node.uses),
             instantiates=sorted(node.instantiates),
             imports=sorted(node.imports),
+            unresolved={
+                relation: sorted(refs)
+                for relation, refs in (node.unresolved or {}).items()
+                if refs
+            },
             parameters=node.parameters,
             receiver=node.receiver,
         )
@@ -521,4 +609,14 @@ def _same_component(existing: CodeNode, node: Node) -> bool:
             getattr(node, field, None) or set()
         ):
             return False
+    existing_unresolved = {
+        key: sorted(refs)
+        for key, refs in (existing.unresolved or {}).items()
+        if refs
+    }
+    node_unresolved = {
+        key: sorted(refs) for key, refs in (node.unresolved or {}).items() if refs
+    }
+    if existing_unresolved != node_unresolved:
+        return False
     return True

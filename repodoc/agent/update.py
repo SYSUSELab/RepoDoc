@@ -57,6 +57,7 @@ from repodoc.graph.mutation import (
     GraphMutationResult,
     apply_file_changes_to_graph,
     component_module_ids,
+    reconcile_unresolved_references,
 )
 from repodoc.utils import (
     file_manager,
@@ -1328,6 +1329,13 @@ async def run_update(
     mutation.added = sorted(set(mutation.added))
     mutation.updated = sorted(set(mutation.updated))
     mutation.removed = sorted(set(mutation.removed))
+
+    # Once for the whole batch: definitions added by one file can make
+    # references in unchanged files resolvable, but two same-named additions
+    # in the same run must stay ambiguous.
+    reconciled = reconcile_unresolved_references(graph)
+    if reconciled:
+        print(f"  Reconciled {reconciled} previously-unresolved reference(s)")
 
     if not dry_run:
         graph.save(_graph_save_path(config, project_name))

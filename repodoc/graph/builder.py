@@ -200,10 +200,15 @@ def _assemble_components(
         caller_id = id_mapping.get(rel.caller, rel.caller)
         if caller_id not in components:
             continue
+        relation = getattr(rel, "relation_type", REL_CALLS)
         callee_id = _resolve(rel.callee, caller_id)
         if not callee_id:
+            # Keep the reference on the node: a later update that introduces
+            # the missing definition reconciles it into an edge.
+            components[caller_id].unresolved.setdefault(relation, set()).add(
+                rel.callee
+            )
             continue
-        relation = getattr(rel, "relation_type", REL_CALLS)
         field = _RELATION_FIELDS.get(relation, "depends_on")
         getattr(components[caller_id], field).add(callee_id)
     return components
@@ -410,6 +415,11 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             uses=sorted(node.uses),
             instantiates=sorted(node.instantiates),
             imports=sorted(node.imports),
+            unresolved={
+                relation: sorted(refs)
+                for relation, refs in (node.unresolved or {}).items()
+                if refs
+            },
             parameters=node.parameters,
             receiver=node.receiver,
         )
@@ -451,6 +461,10 @@ def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
             uses=set(d.get("uses", [])),
             instantiates=set(d.get("instantiates", [])),
             imports=set(d.get("imports", [])),
+            unresolved={
+                key: set(refs)
+                for key, refs in (d.get("unresolved") or {}).items()
+            },
             source_code=d.get("source_code"),
             start_line=d.get("start_line", 0),
             end_line=d.get("end_line", 0),
@@ -622,6 +636,11 @@ class DependencyGraphBuilder:
             ):
                 if isinstance(d.get(field_name), set):
                     d[field_name] = sorted(d[field_name])
+            unresolved = d.get("unresolved")
+            if isinstance(unresolved, dict):
+                d["unresolved"] = {
+                    key: sorted(refs) for key, refs in unresolved.items()
+                }
             result[cid] = d
         os.makedirs(os.path.dirname(dependency_graph_path), exist_ok=True)
         with open(dependency_graph_path, "w", encoding="utf-8") as f:
