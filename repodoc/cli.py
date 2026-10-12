@@ -10,11 +10,49 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from repodoc.config import Config
+from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph import DependencyGraphBuilder
 from repodoc.graph.cluster import cluster_modules, module_tree_stats
 from repodoc.agent.generate import run_pipeline
 from repodoc.utils import FileLock, file_manager
+
+
+def _scope_options(f):
+    """Shared analysis/doc-scope options for analyze/docs/generate."""
+    f = click.option(
+        "-I",
+        "--include",
+        "include_patterns",
+        multiple=True,
+        help="Only analyze files matching this glob (repeatable, e.g. 'src/*')",
+    )(f)
+    f = click.option(
+        "-X",
+        "--exclude",
+        "exclude_patterns",
+        multiple=True,
+        help="Skip files/dirs matching this glob or name (repeatable)",
+    )(f)
+    f = click.option(
+        "--max-file-size",
+        type=int,
+        default=MAX_SOURCE_FILE_BYTES,
+        show_default=True,
+        help="Skip source files larger than this (bytes)",
+    )(f)
+    f = click.option(
+        "--doc-types",
+        default="",
+        help="Comma-separated component types to document (default: auto)",
+    )(f)
+    f = click.option(
+        "--max-docs",
+        type=int,
+        default=0,
+        show_default=True,
+        help="Cap the number of documented components (0 = no cap)",
+    )(f)
+    return f
 
 
 def make_config(
@@ -22,6 +60,11 @@ def make_config(
     output_dir: str = "output",
     cluster_strategy: str = "llm",
     doc_strategy: str = "agent",
+    include_patterns: tuple = (),
+    exclude_patterns: tuple = (),
+    max_file_size: int | None = None,
+    doc_types: str = "",
+    max_docs: int = 0,
 ) -> Config:
     extra_headers: dict[str, str] = {}
     headers_env = os.getenv("LLM_EXTRA_HEADERS", "").strip()
@@ -45,6 +88,11 @@ def make_config(
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
         llm_headers=extra_headers,
+        include_patterns=list(include_patterns),
+        exclude_patterns=list(exclude_patterns),
+        max_file_size=max_file_size or MAX_SOURCE_FILE_BYTES,
+        doc_types=[t.strip() for t in doc_types.split(",") if t.strip()],
+        max_docs=max_docs,
     )
 
 
@@ -133,18 +181,33 @@ def cli():
     default="llm",
     help="Clustering strategy (ablation): llm | heuristic (default: llm)",
 )
+@_scope_options
 def analyze(
     repo_path: str,
     output_dir: str,
     verbose: bool,
     no_cluster: bool,
     cluster_strategy: str,
+    include_patterns: tuple,
+    exclude_patterns: tuple,
+    max_file_size: int,
+    doc_types: str,
+    max_docs: int,
 ):
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
-    config = make_config(repo_path, output_dir, cluster_strategy=cluster_strategy)
+    config = make_config(
+        repo_path,
+        output_dir,
+        cluster_strategy=cluster_strategy,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        max_file_size=max_file_size,
+        doc_types=doc_types,
+        max_docs=max_docs,
+    )
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
     builder = DependencyGraphBuilder(config)
@@ -199,12 +262,18 @@ def analyze(
     default="agent",
     help="Doc generation strategy (ablation): agent | direct (default: agent)",
 )
+@_scope_options
 def docs(
     repo_path: str,
     output_dir: str,
     verbose: bool,
     cluster_strategy: str,
     doc_strategy: str,
+    include_patterns: tuple,
+    exclude_patterns: tuple,
+    max_file_size: int,
+    doc_types: str,
+    max_docs: int,
 ):
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -215,6 +284,11 @@ def docs(
         output_dir,
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        max_file_size=max_file_size,
+        doc_types=doc_types,
+        max_docs=max_docs,
     )
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
@@ -248,12 +322,18 @@ def docs(
     default="agent",
     help="Doc generation strategy (ablation): agent | direct (default: agent)",
 )
+@_scope_options
 def generate(
     repo_path: str,
     output_dir: str,
     verbose: bool,
     cluster_strategy: str,
     doc_strategy: str,
+    include_patterns: tuple,
+    exclude_patterns: tuple,
+    max_file_size: int,
+    doc_types: str,
+    max_docs: int,
 ):
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -264,6 +344,11 @@ def generate(
         output_dir,
         cluster_strategy=cluster_strategy,
         doc_strategy=doc_strategy,
+        include_patterns=include_patterns,
+        exclude_patterns=exclude_patterns,
+        max_file_size=max_file_size,
+        doc_types=doc_types,
+        max_docs=max_docs,
     )
     project_name = get_project_name(repo_path)
     data_dir = os.path.join(output_dir, "data")
@@ -437,8 +522,12 @@ def config_validate():
     is_flag=True,
     help="Overwrite docs that were manually edited since the last update",
 )
-
-
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Preview the update scope (files, docs, estimated LLM calls) "
+    "without changing the graph, docs or metadata",
+)
 def update(
     repo_path: str,
     changed_files: tuple,
@@ -451,6 +540,7 @@ def update(
     propagate: str,
     max_hops: int,
     force: bool,
+    dry_run: bool,
 ):
     """Update documentation incrementally for changed files.
 
@@ -485,6 +575,7 @@ def update(
             propagate=propagate,
             max_hops=max_hops,
             force=force,
+            dry_run=dry_run,
         )
 
     # Single-writer guard: concurrent updates would interleave graph mutation
@@ -498,6 +589,15 @@ def update(
     except TimeoutError as e:
         click.echo(f"Error: {e}", err=True)
         raise click.Abort()
+    if result.get("status") == "dry_run":
+        impact = result["impact"]
+        click.echo(
+            f"\nDry run: would update {len(impact['components_to_doc'])} "
+            f"component doc(s), {len(impact['modules_to_doc'])} module doc(s)"
+            + (", and the README" if impact["update_overview"] else "")
+        )
+        click.echo(f"Estimated LLM calls: {result['estimated_llm_calls']}")
+        click.echo("No changes were made.")
     if result.get("status") == "error":
         raise click.Abort()
 

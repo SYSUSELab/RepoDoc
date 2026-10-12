@@ -18,6 +18,9 @@ from repodoc.graph.models import (
     REL_CALLS,
     REL_DESCRIBES,
     REL_IMPLEMENTS,
+    REL_IMPORTS,
+    REL_INSTANTIATES,
+    REL_USES,
     RELATION_TYPES,
     CallRelationship,
     CodeNode,
@@ -36,5 +39,8 @@ __all__ = [
     "REL_CALLS",
     "REL_DESCRIBES",
     "REL_IMPLEMENTS",
+    "REL_IMPORTS",
+    "REL_INSTANTIATES",
+    "REL_USES",
     "RELATION_TYPES",
 ]

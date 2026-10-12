@@ -40,11 +40,14 @@ from repodoc.agent.generate import (
 )
 from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph.analyzers import get_analyzer
+from repodoc.graph.builder import component_dependencies
 from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import (
+    CODE_DEPENDENCY_RELATIONS,
     REL_CALLS,
     REL_DESCRIBES,
     REL_IMPLEMENTS,
+    RELATION_NODE_FIELDS,
     CodeNode,
     DocNode,
     ModuleNode,
@@ -661,9 +664,10 @@ class IncrementalUpdater:
                 if pred in visited:
                     continue
                 edge_data = self.graph.get_edge_data(pred, component)
-                if not edge_data or edge_data.get("relation_type") not in (
-                    REL_CALLS,
-                    REL_IMPLEMENTS,
+                if (
+                    not edge_data
+                    or edge_data.get("relation_type")
+                    not in CODE_DEPENDENCY_RELATIONS
                 ):
                     continue
                 visited.add(pred)
@@ -1147,6 +1151,7 @@ async def run_update(
     propagate: str = "sig",
     max_hops: int = 3,
     force: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Update documentation incrementally for changed files.
 
@@ -1164,6 +1169,8 @@ async def run_update(
             callers) or "all" (every changed component propagates).
         max_hops: Max caller-propagation depth (0 disables propagation).
         force: Overwrite docs that were manually edited since the last update.
+        dry_run: Compute and report the update scope without touching the
+            graph, docs, journal or metadata.
 
     Returns:
         Dict with status, impact analysis, and result counts.
@@ -1292,7 +1299,7 @@ async def run_update(
         callers = set()
         for pred in graph.predecessors(nid):
             ed = graph.get_edge_data(pred, nid)
-            if ed and ed.get("relation_type") in (REL_CALLS, REL_IMPLEMENTS):
+            if ed and ed.get("relation_type") in CODE_DEPENDENCY_RELATIONS:
                 callers.add(pred)
                 pre_ref_types[(nid, pred)] = ed["relation_type"]
         pre_callers[nid] = callers
@@ -1322,7 +1329,8 @@ async def run_update(
     mutation.updated = sorted(set(mutation.updated))
     mutation.removed = sorted(set(mutation.removed))
 
-    graph.save(_graph_save_path(config, project_name))
+    if not dry_run:
+        graph.save(_graph_save_path(config, project_name))
     print(
         f"  Added: {len(mutation.added)}, updated: {len(mutation.updated)}, "
         f"removed: {len(mutation.removed)} component(s); "
@@ -1366,7 +1374,7 @@ async def run_update(
                 continue
             pred_node = graph.get_node(pred)
             relation = pre_ref_types.get((old_id, pred), REL_CALLS)
-            field = "implements" if relation == REL_IMPLEMENTS else "depends_on"
+            field = RELATION_NODE_FIELDS.get(relation, "depends_on")
             values = set(getattr(pred_node, field, None) or [])
             # The removal pass already detached the old id; the new id must be
             # attached either way (that is the rename following through), so
@@ -1381,7 +1389,8 @@ async def run_update(
                 followed += 1
     if followed:
         print(f"  Re-pointed {followed} caller edge(s) to renamed component id(s)")
-        graph.save(_graph_save_path(config, project_name))
+        if not dry_run:
+            graph.save(_graph_save_path(config, project_name))
 
     if (
         not doc_diffs
@@ -1510,6 +1519,21 @@ async def run_update(
     ):
         print("\nNo documentation updates needed")
         return {"status": "no_updates_needed", "impact": impact}
+
+    if dry_run:
+        estimated_calls = (
+            len(impact["components_to_doc"])
+            + len(impact["modules_to_doc"])
+            + (1 if impact["update_overview"] else 0)
+        )
+        print("\n[dry-run] no graph, docs or metadata were modified")
+        return {
+            "status": "dry_run",
+            "impact": impact,
+            "estimated_llm_calls": estimated_calls,
+            "files_changed": len(diffs),
+            "components_removed": len(mutation.removed),
+        }
 
     docs_dir = config.docs_dir
     comp_modules = _collect_component_modules(module_tree)
@@ -1657,8 +1681,7 @@ async def run_update(
         predecessors = [
             cid
             for cid, n in pipeline.components.items()
-            if node_id in getattr(n, "depends_on", set())
-            or node_id in getattr(n, "implements", set())
+            if node_id in component_dependencies(n)
         ]
         component = {
             "name": node.name,
@@ -1667,7 +1690,7 @@ async def run_update(
             "relative_path": node.relative_path,
             "docstring": node.docstring,
             "source_code": node.source_code or "",
-            "depends_on": list(node.depends_on) if node.depends_on else [],
+            "depends_on": sorted(component_dependencies(node)),
         }
 
         if should_partial_update(existing_doc, code_diff):

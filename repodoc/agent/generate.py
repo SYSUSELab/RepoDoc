@@ -8,7 +8,7 @@ from typing import Any
 
 from repodoc.config import Config
 from repodoc.graph import DependencyGraphBuilder
-from repodoc.graph.builder import build_graph_from_analysis
+from repodoc.graph.builder import build_graph_from_analysis, component_dependencies
 from repodoc.agent.agent import DocAgent
 from repodoc.utils import (
     file_manager,
@@ -126,10 +126,7 @@ def _build_module_dependencies(
         m = module_of(cid)
         if m is None:
             continue
-        targets = set(getattr(node, "depends_on", []) or []) | set(
-            getattr(node, "implements", []) or []
-        )
-        for dep_id in targets:
+        for dep_id in component_dependencies(node):
             dm = module_of(dep_id)
             if dm and dm != m:
                 deps.setdefault(m, set()).add(dm)
@@ -616,13 +613,12 @@ class DocPipeline:
         if not node:
             return None
 
-        # Reverse dependencies: which components call this one or derive from
-        # it (its role in flows / type hierarchy), from the full component map.
+        # Reverse dependencies: which components call this one or derive from /
+        # reference it (its role in flows and the type hierarchy).
         predecessors = [
             cid
             for cid, n in self.components.items()
-            if node_id in getattr(n, "depends_on", set())
-            or node_id in getattr(n, "implements", set())
+            if node_id in component_dependencies(n)
         ]
 
         component = {
@@ -632,7 +628,7 @@ class DocPipeline:
             "relative_path": node.relative_path,
             "docstring": node.docstring,
             "source_code": node.source_code or "",
-            "depends_on": node.depends_on,
+            "depends_on": sorted(component_dependencies(node)),
         }
 
         result = await self.agent.execute(

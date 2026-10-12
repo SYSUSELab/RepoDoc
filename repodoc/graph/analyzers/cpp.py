@@ -7,7 +7,13 @@ from tree_sitter import Parser, Language
 import tree_sitter_cpp
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import (
+    REL_IMPLEMENTS,
+    REL_INSTANTIATES,
+    REL_USES,
+    CallRelationship,
+    Node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,6 +225,7 @@ class TreeSitterCppAnalyzer(BaseAnalyzer):
                                 caller=containing_function_id,
                                 callee=class_id,
                                 call_line=node.start_point[0] + 1,
+                                relation_type=REL_INSTANTIATES,
                             )
                         break
 
@@ -246,6 +253,7 @@ class TreeSitterCppAnalyzer(BaseAnalyzer):
                             caller=containing_function_id,
                             callee=var_name,
                             call_line=node.start_point[0] + 1,
+                            relation_type=REL_USES,
                         )
 
         for child in node.children:

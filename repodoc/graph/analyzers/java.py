@@ -7,7 +7,13 @@ from tree_sitter import Parser, Language
 import tree_sitter_java
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import (
+    REL_IMPLEMENTS,
+    REL_INSTANTIATES,
+    REL_USES,
+    CallRelationship,
+    Node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +180,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                         caller=containing_class,
                         callee=field_type_name,
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_USES,
                     )
 
         # 4. Method Calls: Method calls on objects
@@ -227,6 +234,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                         caller=containing_class,
                         callee=created_type,
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_INSTANTIATES,
                     )
 
         for child in node.children:

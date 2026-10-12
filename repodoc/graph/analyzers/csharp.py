@@ -7,7 +7,7 @@ from tree_sitter import Parser, Language
 import tree_sitter_c_sharp
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, REL_USES, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                             caller=containing_class_id,
                             callee=property_type,
                             call_line=node.start_point[0] + 1,
+                            relation_type=REL_USES,
                         )
 
         elif node.type == "field_declaration":
@@ -167,6 +168,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                             caller=containing_class_id,
                             callee=field_type,
                             call_line=node.start_point[0] + 1,
+                            relation_type=REL_USES,
                         )
 
         elif node.type == "method_declaration":
@@ -191,6 +193,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                                         caller=containing_class_id,
                                         callee=param_type,
                                         call_line=node.start_point[0] + 1,
+                                        relation_type=REL_USES,
                                     )
 
         for child in node.children:

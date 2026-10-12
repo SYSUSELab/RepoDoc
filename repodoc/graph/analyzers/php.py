@@ -13,7 +13,14 @@ from tree_sitter import Parser, Language
 import tree_sitter_php
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import (
+    REL_IMPLEMENTS,
+    REL_IMPORTS,
+    REL_INSTANTIATES,
+    REL_USES,
+    CallRelationship,
+    Node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -364,6 +371,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                         caller=self._get_component_id(containing_class),
                         callee=resolved_type.replace("\\", "."),
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_INSTANTIATES,
                     )
 
         # 5. Static method calls (::)
@@ -396,6 +404,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                         caller=self._get_component_id(containing_class),
                         callee=resolved_type.replace("\\", "."),
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_USES,
                     )
 
         for child in node.children:
@@ -416,6 +425,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                         caller=file_id,
                         callee=fqn,
                         call_line=node.start_point[0] + 1,
+                        relation_type=REL_IMPORTS,
                     )
             elif child.type == "namespace_use_group":
                 prefix_node = self._find_child_by_type(node, "namespace_name")
@@ -437,6 +447,7 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
                                 caller=file_id,
                                 callee=fqn.replace("\\", "."),
                                 call_line=node.start_point[0] + 1,
+                                relation_type=REL_IMPORTS,
                             )
 
     def _get_name_from_node(self, node) -> Optional[str]:

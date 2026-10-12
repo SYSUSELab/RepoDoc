@@ -9,7 +9,7 @@ from tree_sitter import Parser, Language
 import tree_sitter_javascript
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import REL_IMPLEMENTS, REL_USES, CallRelationship, Node
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +516,7 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
                                 caller=f"{self._get_module_path()}.{caller_name}",
                                 callee=f"{self._get_module_path()}.{base_type}",
                                 call_line=line_number,
+                                relation_type=REL_USES,
                             )
 
         except Exception as e:

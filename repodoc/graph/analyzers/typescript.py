@@ -8,7 +8,13 @@ from tree_sitter import Parser, Language
 import tree_sitter_typescript
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, CallRelationship, Node
+from repodoc.graph.models import (
+    REL_IMPLEMENTS,
+    REL_INSTANTIATES,
+    REL_USES,
+    CallRelationship,
+    Node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -662,6 +668,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                                         f"{self._get_module_path()}.{dependency_name}"
                                     ),
                                     call_line=child.start_point[0] + 1,
+                                    relation_type=REL_USES,
                                 )
         except Exception as e:
             logger.debug(f"Error extracting parameter dependencies: {e}")
@@ -899,6 +906,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                             caller=f"{self._get_module_path()}.{caller_name}",
                             callee=f"{self._get_module_path()}.{constructor_name}",
                             call_line=call_line,
+                            relation_type=REL_INSTANTIATES,
                         )
 
         except Exception as e:
@@ -917,6 +925,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                         caller=f"{self._get_module_path()}.{caller_name}",
                         callee=f"{self._get_module_path()}.{property_name}",
                         call_line=call_line,
+                        relation_type=REL_USES,
                     )
         except Exception as e:
             logger.debug(f"Error extracting member relationship: {e}")
@@ -943,12 +952,14 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                             caller=f"{self._get_module_path()}.{caller_name}",
                             callee=f"{self._get_module_path()}.{target_name}",
                             call_line=call_line,
+                            relation_type=REL_USES,
                         )
                 else:
                     self._add_relationship(
                         caller=f"{self._get_module_path()}.{caller_name}",
                         callee=f"{self._get_module_path()}.{type_name}",
                         call_line=call_line,
+                        relation_type=REL_USES,
                     )
 
         except Exception as e:
@@ -978,6 +989,7 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
                                 caller=f"{self._get_module_path()}.{caller_name}",
                                 callee=f"{self._get_module_path()}.{target_name}",
                                 call_line=call_line,
+                                relation_type=REL_USES,
                             )
         except Exception as e:
             logger.debug(f"Error extracting type arguments relationship: {e}")

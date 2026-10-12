@@ -19,6 +19,9 @@ from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import (
     REL_CALLS,
     REL_IMPLEMENTS,
+    REL_IMPORTS,
+    REL_INSTANTIATES,
+    REL_USES,
     CallRelationship,
     CodeNode,
     Node,
@@ -64,6 +67,7 @@ def _collect_code_files(
     repo_dir: str,
     include_patterns: List[str],
     exclude_patterns: Set[str],
+    max_file_size: int = MAX_SOURCE_FILE_BYTES,
 ) -> List[Dict[str, str]]:
     """Walk the repository and return code files as {path, language} dicts."""
     from repodoc.graph.analyzers import DEFAULT_IGNORE_PATTERNS, DEFAULT_INCLUDE_PATTERNS
@@ -102,7 +106,7 @@ def _collect_code_files(
             if ext not in EXTENSION_MAP:
                 continue
             try:
-                if (root_path / fname).stat().st_size > MAX_SOURCE_FILE_BYTES:
+                if (root_path / fname).stat().st_size > max_file_size:
                     logger.debug(
                         "Skipping oversized file (%d bytes): %s",
                         (root_path / fname).stat().st_size,
@@ -120,23 +124,30 @@ def _collect_code_files(
 # ---------------------------------------------------------------------------
 
 
+# Relationship type -> Node field. Everything not listed is a call.
+_RELATION_FIELDS = {
+    REL_IMPLEMENTS: "implements",
+    REL_USES: "uses",
+    REL_INSTANTIATES: "instantiates",
+    REL_IMPORTS: "imports",
+}
+
+
 def _assemble_components(
     nodes: List[Node], relationships: List[CallRelationship]
 ) -> Dict[str, Node]:
-    """Turn analyzer nodes + call relationships into an id-keyed component dict
-    with depends_on edges merged in (mirrors the former ast_parser pipeline)."""
-    # Canonicalize relationship callees against all known nodes (id/name/last segment)
-    func_lookup: Dict[str, str] = {}
-    for node in nodes:
-        fid = node.id or f"{node.file_path}:{node.name}"
-        func_lookup[fid] = fid
-        func_lookup[node.name] = fid
-        method_name = fid.split(".")[-1]
-        if method_name not in func_lookup:
-            func_lookup[method_name] = fid
+    """Turn analyzer nodes + relationships into an id-keyed component dict.
 
+    Reference resolution is scope-aware: the caller's own file wins, then a
+    globally unique name; ambiguous references are dropped instead of guessed
+    (the former bare-name lookup created wrong cross-file edges on every name
+    collision). Relations are stored in typed fields (calls / implements /
+    uses / instantiates / imports) so the graph keeps their semantics."""
     components: Dict[str, Node] = {}
     id_mapping: Dict[str, str] = {}
+    by_name: Dict[str, List[str]] = {}
+    by_file_name: Dict[tuple[str, str], List[str]] = {}
+
     for node in nodes:
         if not node.id:
             continue
@@ -145,35 +156,66 @@ def _assemble_components(
         legacy_id = f"{node.file_path}:{node.name}"
         if legacy_id and legacy_id != node.id:
             id_mapping[legacy_id] = node.id
+        rel = node.relative_path or node.file_path
+        for name in dict.fromkeys((node.name, node.id.split(".")[-1])):
+            if not name:
+                continue
+            by_name.setdefault(name, []).append(node.id)
+            by_file_name.setdefault((rel, name), []).append(node.id)
+
+    def _resolve(ref: str, caller_id: str) -> Optional[str]:
+        if not ref:
+            return None
+        if ref in components:
+            return ref
+        mapped = id_mapping.get(ref)
+        if mapped:
+            return mapped
+        last = ref.split(".")[-1]
+        caller = components.get(caller_id)
+        caller_file = (
+            (caller.relative_path or caller.file_path) if caller else ""
+        )
+        # 1. Same file wins: a bare name is most likely local.
+        for key in dict.fromkeys((ref, last)):
+            cands = by_file_name.get((caller_file, key), [])
+            if len(cands) == 1:
+                return cands[0]
+        # 2. Globally unique name.
+        for key in dict.fromkeys((ref, last)):
+            cands = by_name.get(key, [])
+            if len(cands) == 1:
+                return cands[0]
+        # 3. Unique dotted-suffix match (e.g. "mod.Class.method").
+        suffix = "." + ref
+        suffix_cands = [cid for cid in components if cid.endswith(suffix)]
+        if len(suffix_cands) == 1:
+            return suffix_cands[0]
+        logger.debug(
+            "Dropping ambiguous/unresolved reference %r from %s", ref, caller_id
+        )
+        return None
 
     for rel in relationships:
-        callee = rel.callee
-        if callee in func_lookup:
-            callee = func_lookup[callee]
-        elif "." in callee:
-            method_name = callee.split(".")[-1]
-            if method_name in func_lookup:
-                callee = func_lookup[method_name]
-        caller_id = id_mapping.get(rel.caller)
-        callee_id = id_mapping.get(callee)
+        caller_id = id_mapping.get(rel.caller, rel.caller)
+        if caller_id not in components:
+            continue
+        callee_id = _resolve(rel.callee, caller_id)
         if not callee_id:
-            for comp in components.values():
-                if comp.name == callee:
-                    callee_id = comp.id
-                    break
-        if caller_id and caller_id in components and callee_id:
-            if rel.relation_type == REL_IMPLEMENTS:
-                components[caller_id].implements.add(callee_id)
-            else:
-                components[caller_id].depends_on.add(callee_id)
+            continue
+        relation = getattr(rel, "relation_type", REL_CALLS)
+        field = _RELATION_FIELDS.get(relation, "depends_on")
+        getattr(components[caller_id], field).add(callee_id)
     return components
 
 
 def component_dependencies(node: Node) -> Set[str]:
-    """All components a node points at (calls + inheritance)."""
-    return set(getattr(node, "depends_on", set()) or set()) | set(
-        getattr(node, "implements", set()) or set()
-    )
+    """All components a node references: calls, inheritance, type use,
+    instantiation and imports."""
+    out: Set[str] = set()
+    for field in ("depends_on", "implements", "uses", "instantiates", "imports"):
+        out |= set(getattr(node, field, ()) or ())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -238,20 +280,26 @@ def _build_graph_from_components(components: Dict[str, Node]) -> Dict[str, Set[s
     graph: Dict[str, Set[str]] = {}
     for comp_id, component in components.items():
         graph.setdefault(comp_id, set())
-        for dep_id in getattr(component, "depends_on", []):
+        for dep_id in component_dependencies(component):
             if dep_id in components:
                 graph[comp_id].add(dep_id)
     return graph
 
 
-def _get_valid_component_types(components: Dict[str, Node]) -> Set[str]:
+def _get_valid_component_types(
+    components: Dict[str, Node], config: Optional[Config] = None
+) -> Set[str]:
     """Component types eligible as leaf nodes. Classes always qualify;
     functions only when the repo is function-heavy (a single class would
     otherwise hide all function docs — typical for JS/Go/Rust/C repos).
 
     struct is NOT counted as a class: in C it is a data declaration, not a
     type with behavior — libevent's 1439 functions vs 763 struct/class would
-    otherwise lose all function docs (1439 < 763*2)."""
+    otherwise lose all function docs (1439 < 763*2).
+
+    config.doc_types overrides the automatic selection entirely."""
+    if config is not None and config.doc_types:
+        return {t.strip().lower() for t in config.doc_types if t.strip()}
     type_counts = Counter(c.component_type for c in components.values())
     # enum/annotation are first-class doc targets in Java; "method" is
     # deliberately excluded (methods belong to their class's doc)
@@ -263,13 +311,48 @@ def _get_valid_component_types(components: Dict[str, Node]) -> Set[str]:
     return valid
 
 
+def _rank_by_importance(
+    node_ids: List[str],
+    graph: Dict[str, Set[str]],
+    components: Dict[str, Node],
+    limit: int,
+) -> List[str]:
+    """Keep the `limit` most important nodes: most depended upon first, then
+    by type (core types before helpers), then deterministically by id."""
+    if not limit or len(node_ids) <= limit:
+        return node_ids
+    dependents: Counter[str] = Counter()
+    for _src, deps in graph.items():
+        for dep in deps:
+            dependents[dep] += 1
+    type_rank = {
+        "class": 0,
+        "interface": 1,
+        "enum": 2,
+        "annotation": 3,
+        "struct": 4,
+        "function": 5,
+    }
+    ranked = sorted(
+        node_ids,
+        key=lambda cid: (
+            -dependents.get(cid, 0),
+            type_rank.get(components[cid].component_type, 9),
+            cid,
+        ),
+    )
+    return ranked[:limit]
+
+
 def _get_leaf_nodes(
-    graph: Dict[str, Set[str]], components: Dict[str, Node]
+    graph: Dict[str, Set[str]],
+    components: Dict[str, Node],
+    config: Optional[Config] = None,
 ) -> List[str]:
     """Leaf nodes: no other node depends on them. Filter by valid types."""
     acyclic = _resolve_cycles(graph)
     leaf_nodes = set(acyclic.keys())
-    valid_types = _get_valid_component_types(components)
+    valid_types = _get_valid_component_types(components, config)
 
     def concise_node(ln: Set[str]) -> List[str]:
         concise = set()
@@ -297,6 +380,8 @@ def _get_leaf_nodes(
         out = concise_node(leaf_nodes)
     if not leaf_nodes:
         return []
+    if config is not None and config.max_docs:
+        out = _rank_by_importance(out, acyclic, components, config.max_docs)
     return out
 
 
@@ -322,17 +407,25 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             docstring=node.docstring or "",
             depends_on=sorted(node.depends_on),
             implements=sorted(node.implements),
+            uses=sorted(node.uses),
+            instantiates=sorted(node.instantiates),
+            imports=sorted(node.imports),
             parameters=node.parameters,
             receiver=node.receiver,
         )
         graph.add_code_node(code_node)
+    relation_fields = (
+        (REL_CALLS, "depends_on"),
+        (REL_IMPLEMENTS, "implements"),
+        (REL_USES, "uses"),
+        (REL_INSTANTIATES, "instantiates"),
+        (REL_IMPORTS, "imports"),
+    )
     for nid, node in components.items():
-        for callee_id in node.depends_on:
-            if callee_id in components:
-                graph.add_edge(nid, callee_id, REL_CALLS, 1.0)
-        for base_id in node.implements:
-            if base_id in components:
-                graph.add_edge(nid, base_id, REL_IMPLEMENTS, 1.0)
+        for relation, field in relation_fields:
+            for target in getattr(node, field, ()) or ():
+                if target in components:
+                    graph.add_edge(nid, target, relation, 1.0)
     return graph
 
 
@@ -355,6 +448,9 @@ def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
             relative_path=d.get("relative_path", ""),
             depends_on=set(d.get("depends_on", [])),
             implements=set(d.get("implements", [])),
+            uses=set(d.get("uses", [])),
+            instantiates=set(d.get("instantiates", [])),
+            imports=set(d.get("imports", [])),
             source_code=d.get("source_code"),
             start_line=d.get("start_line", 0),
             end_line=d.get("end_line", 0),
@@ -485,7 +581,10 @@ class DependencyGraphBuilder:
         )
 
         code_files = _collect_code_files(
-            self.config.repo_path, include_patterns=None, exclude_patterns=None
+            self.config.repo_path,
+            include_patterns=self.config.include_patterns or None,
+            exclude_patterns=set(self.config.exclude_patterns) or None,
+            max_file_size=self.config.max_file_size,
         )
 
         all_nodes: List[Node] = []
@@ -514,10 +613,15 @@ class DependencyGraphBuilder:
         result = {}
         for cid, component in components.items():
             d = component.model_dump()
-            if isinstance(d.get("depends_on"), set):
-                d["depends_on"] = list(d["depends_on"])
-            if isinstance(d.get("implements"), set):
-                d["implements"] = list(d["implements"])
+            for field_name in (
+                "depends_on",
+                "implements",
+                "uses",
+                "instantiates",
+                "imports",
+            ):
+                if isinstance(d.get(field_name), set):
+                    d[field_name] = sorted(d[field_name])
             result[cid] = d
         os.makedirs(os.path.dirname(dependency_graph_path), exist_ok=True)
         with open(dependency_graph_path, "w", encoding="utf-8") as f:
@@ -544,9 +648,9 @@ class DependencyGraphBuilder:
             )
 
         graph = _build_graph_from_components(components)
-        leaf_nodes = _get_leaf_nodes(graph, components)
+        leaf_nodes = _get_leaf_nodes(graph, components, self.config)
 
-        valid_types = _get_valid_component_types(components)
+        valid_types = _get_valid_component_types(components, self.config)
 
         keep_leaf_nodes = []
         for ln in leaf_nodes:

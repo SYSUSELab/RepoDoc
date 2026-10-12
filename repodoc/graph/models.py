@@ -21,19 +21,45 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 REL_CALLS = "calls"
 REL_IMPLEMENTS = "implements"
+# Type/reference relations (kept apart from calls so impact propagation and
+# prompts can distinguish behavior from type usage).
+REL_USES = "uses"  # field/property/parameter/type-annotation references
+REL_INSTANTIATES = "instantiates"  # constructor invocation (new X())
+REL_IMPORTS = "imports"  # import/use statements
 REL_DESCRIBES = "describes"
 # Module clustering edges: contains (module -> component / child module),
 # depends_on (module -> module, cross-module call aggregation).
 REL_CONTAINS = "contains"
 REL_DEPENDS_ON = "depends_on"
 
+# Relations that make the target affected by / relevant to the source (used by
+# impact propagation and rename follow-through).
+CODE_DEPENDENCY_RELATIONS = (
+    REL_CALLS,
+    REL_IMPLEMENTS,
+    REL_USES,
+    REL_INSTANTIATES,
+)
+
 RELATION_TYPES = (
     REL_CALLS,
     REL_IMPLEMENTS,
+    REL_USES,
+    REL_INSTANTIATES,
+    REL_IMPORTS,
     REL_DESCRIBES,
     REL_CONTAINS,
     REL_DEPENDS_ON,
 )
+
+# Graph relation -> Node/CodeNode field that stores the resolved targets.
+RELATION_NODE_FIELDS = {
+    REL_CALLS: "depends_on",
+    REL_IMPLEMENTS: "implements",
+    REL_USES: "uses",
+    REL_INSTANTIATES: "instantiates",
+    REL_IMPORTS: "imports",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +79,10 @@ class Node(BaseModel):
     # Base classes / implemented interfaces (resolved component ids). Kept
     # separate from depends_on so the graph can carry REL_IMPLEMENTS edges.
     implements: Set[str] = set()
+    # Type references / instantiations / imports, resolved to component ids.
+    uses: Set[str] = set()
+    instantiates: Set[str] = set()
+    imports: Set[str] = set()
     source_code: Optional[str] = None
     start_line: int = 0
     end_line: int = 0
@@ -93,8 +123,11 @@ class CodeNode(BaseModel):
     start_line: int = 0
     end_line: int = 0
     docstring: str = ""
-    depends_on: List[str] = []  # full dependency list (incl. unresolved targets)
+    depends_on: List[str] = []  # call targets (resolved)
     implements: List[str] = []  # resolved base-class / interface component ids
+    uses: List[str] = []  # resolved type references
+    instantiates: List[str] = []  # resolved constructor targets
+    imports: List[str] = []  # resolved import targets
     parameters: Optional[List[str]] = None
     receiver: Optional[str] = None  # Go/Rust method receiver type
 

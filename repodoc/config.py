@@ -45,6 +45,16 @@ class Config:
     # Ablation switches: cluster_strategy / doc_strategy
     cluster_strategy: str = "llm"  # "llm" | "heuristic"
     doc_strategy: str = "agent"  # "agent" | "direct"
+    # Analysis scope: only files matching include_patterns are analyzed;
+    # exclude_patterns are added on top of the built-in ignore list.
+    include_patterns: list[str] = field(default_factory=list)
+    exclude_patterns: list[str] = field(default_factory=list)
+    max_file_size: int = MAX_SOURCE_FILE_BYTES
+    # Documentation scope: empty doc_types keeps the automatic leaf selection;
+    # otherwise only the listed component types are documented. max_docs caps
+    # the count (0 = unlimited), ranked by popularity/type.
+    doc_types: list[str] = field(default_factory=list)
+    max_docs: int = 0
 
     def __post_init__(self) -> None:
         self.llm_base_url = _strip_chat_completions_suffix(self.llm_base_url)
