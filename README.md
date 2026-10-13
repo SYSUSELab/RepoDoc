@@ -36,9 +36,12 @@ options:
    untracked files) is re-analyzed per file; changes are classified by severity
    and keyed by exact component id (methods included). Files outside the
    generation include/ignore rules are skipped, and an unreadable or empty file
-   is never mistaken for a deletion. Reference resolution is scope-aware: a
-   callee resolves in the caller's own file first, then by a globally unique
-   name; ambiguous bare names are dropped instead of guessed and kept on the
+   is never mistaken for a deletion. Reference resolution is scope- and
+   import-aware: a callee resolves in the caller's own file first, then
+   through the caller file's import map (aliases and wildcard namespaces
+   collected from Python/JS/TS/Go/Rust/Java/C#/PHP/C includes; same-named
+   components in different modules stay distinct), then by a globally unique
+   name; ambiguous references are dropped instead of guessed and kept on the
    node as unresolved references. After the batch, unresolved references that
    the new definitions made resolvable are wired into edges automatically, so
    the call graph can grow as well as shrink.
@@ -47,7 +50,11 @@ options:
    typed edge diffs), removed components deleted with all incident edges.
    Relations keep their semantics: `calls`, `implements` (extends/interface),
    `uses` (field/property/parameter/type references), `instantiates`
-   (constructor calls) and `imports`.
+   (constructor calls) and `imports`. Go struct→interface conformance (which
+   the language expresses implicitly) is recomputed structurally on every
+   run, and a brand-new module that collected 13+ members is clustered once
+   into semantic sub-modules — confined to the new components, so nothing
+   existing moves and no doc is migrated.
 3. **Layered impact** — changes propagate over calls/implements/uses/
    instantiates edges to affected callers, subclasses and type users (bounded
    by `--max-hops`, gated by severity), then to module docs and the README
@@ -65,8 +72,10 @@ the metadata only advances once nothing is pending, so the next
 
 Generation is also guarded: empty or truncated LLM outputs (unbalanced code
 fences) are rejected instead of written as zero-byte docs, all doc writes are
-confined to the docs directory, and generated stats land in
-`metadata.doc_generation`. Link validation resolves targets relative to the
+confined to the docs directory, the README's module diagram is generated from
+the knowledge graph and enforced verbatim, doc snapshots in the graph store a
+content hash instead of the full text (manual-edit detection works on the
+hash), and generated stats land in `metadata.doc_generation`. Link validation resolves targets relative to the
 linking file, never rewrites fenced code blocks, and never edits Mermaid
 diagrams (invalid ones are reported only). Dependency/build trees such as
 `node_modules`, `vendor`, `dist` and `target` are excluded, and oversized
