@@ -209,21 +209,23 @@ Modules: {module_count}
 ## Module docs (actual content, one section per module)
 {module_docs_summary}
 
+## Architecture diagram (include VERBATIM)
+{module_diagram}
+
 ## What to write
 
 1. **Project positioning**: one clear paragraph — what this system is and
    what problem it solves
-2. **Architecture overview**: describe the module layout (layers/domains),
-   then include a **mermaid flowchart** showing modules and their dependency
-   edges (use the dependency map above; every module must be a node)
+2. **Architecture overview**: describe the module layout (layers/domains) in
+   prose, then embed the mermaid diagram above EXACTLY as given (do not edit,
+   add or remove nodes/edges)
 3. **Theme map**: the top-level modules, one line of responsibility each,
    linking to each module doc (`module_name.md`)
 4. **Core flows**: 2-4 key flows through the system (entry point -> modules
    involved -> outcome), based on the dependency map
 5. **Module navigation**: a short list of all top-level module docs
 
-Return ONLY the Markdown document content. Mermaid diagrams must be valid
-(flowchart TD with `-->` edges)."""
+Return ONLY the Markdown document content."""
 
 
 def format_overview_prompt(
@@ -232,6 +234,7 @@ def format_overview_prompt(
     module_count: int,
     module_dependencies: dict[str, list[str]],
     module_docs_summary: str,
+    module_diagram: str = "",
 ) -> tuple[str, str]:
     deps_str = "\n".join(
         f"- {m} -> {', '.join(ds) if ds else '(none)'}"
@@ -243,6 +246,7 @@ def format_overview_prompt(
         module_count=module_count,
         module_dependencies=deps_str or "None",
         module_docs_summary=module_docs_summary or "No module docs available",
+        module_diagram=module_diagram or "(no module graph available)",
     )
     return _guarded(OVERVIEW_SYSTEM_PROMPT), user_prompt
 
@@ -338,6 +342,9 @@ Modules: {module_count}
 ## Module dependency map (module -> modules it depends on)
 {module_dependencies}
 
+## Architecture diagram (keep this EXACT block in the document)
+{module_diagram}
+
 ## Updated module docs (actual content, one section per module)
 {module_docs_summary}"""
 
@@ -409,6 +416,7 @@ def format_overview_update_prompt(
     module_dependencies: dict[str, list[str]],
     module_docs_summary: str,
     existing_doc: str,
+    module_diagram: str = "",
 ) -> tuple[str, str]:
     deps_str = "\n".join(
         f"- {m} -> {', '.join(ds) if ds else '(none)'}"
@@ -421,6 +429,7 @@ def format_overview_update_prompt(
         module_count=module_count,
         module_dependencies=deps_str or "None",
         module_docs_summary=module_docs_summary or "No module docs available",
+        module_diagram=module_diagram or "(no module graph available)",
     )
     return (
         _guarded(DOC_UPDATE_SYSTEM_PROMPT.format(update_rules=DOC_UPDATE_RULES)),

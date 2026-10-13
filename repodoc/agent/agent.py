@@ -114,18 +114,33 @@ class DocAgent:
 
     # -- generation helpers ------------------------------------------------
 
+    # Reasoning models (e.g. deepseek reasoning variants) can consume the
+    # whole max_tokens budget on hidden reasoning and return empty content;
+    # doubling the cap on an empty response recovers those calls.
+    _MAX_OUTPUT_TOKENS = 32768
+
     async def _call_llm(
         self, llm_tool, system_prompt: str, user_prompt: str, *, temperature=0.3, max_tokens=8192
     ) -> SkillResult:
-        result = await llm_tool.execute(
-            prompt=user_prompt,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            system_prompt=system_prompt or None,
-        )
-        if not result.success:
-            return SkillResult(success=False, error=result.error)
-        return SkillResult(success=True, output=result.output)
+        mt = max_tokens
+        while True:
+            result = await llm_tool.execute(
+                prompt=user_prompt,
+                temperature=temperature,
+                max_tokens=mt,
+                system_prompt=system_prompt or None,
+            )
+            if not result.success:
+                return SkillResult(success=False, error=result.error)
+            if (result.output or "").strip():
+                return SkillResult(success=True, output=result.output)
+            if mt >= self._MAX_OUTPUT_TOKENS:
+                return SkillResult(success=False, error="empty LLM output")
+            mt = min(mt * 2, self._MAX_OUTPUT_TOKENS)
+            print(
+                f"  Empty LLM output; retrying with max_tokens={mt} "
+                "(reasoning budget?)..."
+            )
 
     async def _write_result(self, output_path: str, content: str, doc_type: str, file_tool) -> SkillResult:
         validation_error = validate_llm_output(content)
@@ -155,6 +170,7 @@ class DocAgent:
             module_docs_summary="\n\n".join(
                 f"### {name}\n{content}" for name, content in module_docs_summary.items()
             ),
+            module_diagram=input_data.get("module_diagram", ""),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -277,6 +293,7 @@ class DocAgent:
                 f"### {name}\n{content}" for name, content in input_data.get("module_docs_summary", {}).items()
             ),
             existing_doc=input_data.get("existing_doc", ""),
+            module_diagram=input_data.get("module_diagram", ""),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
