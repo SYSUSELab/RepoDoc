@@ -19,11 +19,19 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from repodoc.graph.analyzers import analyze_file
 from repodoc.graph.graph import HeterogeneousGraph
+from repodoc.graph.imports import (
+    Candidate,
+    ImportIndex,
+    candidate_from_node,
+    module_path_from_relative,
+    resolve_with_imports,
+)
 from repodoc.graph.models import (
     CODE_DEPENDENCY_RELATIONS,
     REL_CALLS,
     REL_CONTAINS,
     REL_DEPENDS_ON,
+    REL_IMPLEMENTS,
     RELATION_NODE_FIELDS,
     CodeNode,
     ModuleNode,
@@ -87,17 +95,48 @@ def _build_lookup(
     return lookup
 
 
+def _collect_candidates(
+    graph: HeterogeneousGraph, new_nodes: List[Node]
+) -> List[Candidate]:
+    """Import-resolution candidates: the graph's code nodes + the new nodes."""
+    out = [candidate_from_node(n) for n in new_nodes if n.id]
+    for nid, attrs in graph.nodes(data=True):
+        if attrs.get("node_type") != "code":
+            continue
+        d = attrs.get("data", {})
+        rel = (d.get("relative_path") or d.get("file_path") or "").replace(
+            os.sep, "/"
+        )
+        out.append(
+            Candidate(
+                id=d.get("id", nid),
+                module=module_path_from_relative(rel),
+                name=d.get("name") or "",
+                file=rel,
+            )
+        )
+    return out
+
+
 def _resolve_dependencies(
-    graph: HeterogeneousGraph, new_nodes: List[Node], relationships: list
+    graph: HeterogeneousGraph,
+    new_nodes: List[Node],
+    relationships: list,
+    imports: Optional[Dict[str, str]] = None,
+    caller_file: str = "",
 ) -> Dict[str, Dict[str, Set[str]]]:
     """Resolve relationships into {node field: {node_id: targets}}.
 
     Only targets that exist in the graph (or among the new nodes) become
     edges — unresolved external references are dropped (there is no node to
-    point at). Each relation keeps its own field/edge type (calls,
-    implements, uses, instantiates, imports)."""
+    point at). Resolution order: exact id, the changed file's import map
+    (disambiguates names that collide across modules), then the name lookup.
+    Each relation keeps its own field/edge type (calls, implements, uses,
+    instantiates, imports)."""
     lookup = _build_lookup(graph, new_nodes)
     new_by_id = {n.id: n for n in new_nodes}
+    import_index = ImportIndex(_collect_candidates(graph, new_nodes))
+    imports_by_file = {caller_file: imports} if imports and caller_file else {}
     resolved: Dict[str, Dict[str, Set[str]]] = {
         field: {n.id: set() for n in new_nodes}
         for field, _relation in _RELATION_FIELD_EDGES
@@ -107,9 +146,17 @@ def _resolve_dependencies(
         if caller is None or caller not in new_by_id:
             continue
         relation = getattr(rel, "relation_type", REL_CALLS)
-        callee = lookup.get(rel.callee)
-        if callee is None and "." in rel.callee:
-            callee = lookup.get(rel.callee.split(".")[-1])
+        callee = None
+        if rel.callee in new_by_id or graph.has_node(rel.callee):
+            callee = rel.callee
+        if callee is None and imports_by_file:
+            callee = resolve_with_imports(
+                rel.callee, caller_file, imports_by_file, import_index
+            )
+        if callee is None:
+            callee = lookup.get(rel.callee)
+            if callee is None and "." in rel.callee:
+                callee = lookup.get(rel.callee.split(".")[-1])
         if callee is None or not (callee in new_by_id or graph.has_node(callee)):
             # Keep the dangling reference so a later update can wire it.
             new_by_id[caller].unresolved.setdefault(relation, set()).add(
@@ -154,24 +201,45 @@ def component_module_ids(graph: HeterogeneousGraph, node_id: str) -> List[str]:
 
 
 def _find_existing_module(graph: HeterogeneousGraph, node: Node) -> Optional[str]:
-    """Deepest existing module whose path matches the component's location.
+    """Best existing module home for a component.
 
-    Module paths are real locations — either the member directory
-    ('src/atcher/core') or a single-file module's path without extension
-    ('src/atcher/config' for config.py). A component matches when its file
-    path without extension equals the module path, or its directory equals
-    (or nests under) it. Returns None when nothing matches."""
-    rel = node.relative_path or ""
+    Preference order:
+    1. A module that already holds a component from the SAME FILE — several
+       modules can share one directory path (semantic clustering), so path
+       matching alone would place new classes arbitrarily.
+    2. The deepest module whose path matches the component's location:
+       either the member directory ('src/atcher/core') or a single-file
+       module's path without extension ('src/atcher/config' for config.py).
+    Returns None when nothing matches."""
+    rel = (node.relative_path or "").replace(os.sep, "/")
     rel_dir = os.path.dirname(rel)
     rel_noext = rel.rsplit(".", 1)[0] if "." in os.path.basename(rel) else rel
     if not rel_dir and not rel_noext:
         return None
+
+    rel_by_cid: Dict[str, str] = {}
+    module_nodes: List[Tuple[str, Dict]] = []
+    for nid, attrs in graph.nodes(data=True):
+        node_type = attrs.get("node_type")
+        d = attrs.get("data", {})
+        if node_type == "code":
+            rel_by_cid[d.get("id", nid)] = (
+                d.get("relative_path") or ""
+            ).replace(os.sep, "/")
+        elif node_type == "module":
+            module_nodes.append((d.get("id", nid), d))
+
+    same_file_modules = {
+        mid
+        for mid, d in module_nodes
+        if any(rel_by_cid.get(cid) == rel for cid in d.get("components", []))
+    }
+    if len(same_file_modules) == 1:
+        return next(iter(same_file_modules))
+
     best_id: Optional[str] = None
     best_len = -1
-    for nid, attrs in graph.nodes(data=True):
-        if attrs.get("node_type") != "module":
-            continue
-        d = attrs.get("data", {})
+    for mid, d in module_nodes:
         mpath = str(d.get("path") or "").strip().removeprefix("./").rstrip("/")
         if not mpath or mpath == ".":
             continue
@@ -180,7 +248,7 @@ def _find_existing_module(graph: HeterogeneousGraph, node: Node) -> Optional[str
             or (rel_dir and (rel_dir == mpath or rel_dir.startswith(mpath + "/")))
         )
         if matched and len(mpath) > best_len:
-            best_id = d.get("id", nid)
+            best_id = mid
             best_len = len(mpath)
     return best_id
 
@@ -371,6 +439,53 @@ def _remove_component_from_modules(graph: HeterogeneousGraph, node_id: str) -> N
         )
 
 
+def infer_go_implements_in_graph(graph: HeterogeneousGraph) -> int:
+    """Refresh Go struct -> interface implements edges on the live graph.
+
+    Recomputes structural conformance for the whole graph (cheap: structs x
+    interfaces) so method/interface additions and removals converge. Only
+    edges to Go interfaces are touched. Returns the number of edges added."""
+    from repodoc.graph.builder import graph_to_components, infer_go_implements
+
+    components = graph_to_components(graph)
+    desired = infer_go_implements(components)
+    go_interface_ids = {
+        cid
+        for cid, node in components.items()
+        if node.component_type == "interface"
+        and (node.relative_path or "").replace(os.sep, "/").endswith(".go")
+    }
+    added = 0
+    for cid, node in components.items():
+        rel = (node.relative_path or "").replace(os.sep, "/")
+        if node.component_type != "struct" or not rel.endswith(".go"):
+            continue
+        graph_node = graph.get_node(cid)
+        if not isinstance(graph_node, CodeNode):
+            continue
+        wanted = desired.get(cid, set())
+        existing = {
+            t
+            for t, rt, _w in graph.get_out_edges(cid)
+            if rt == REL_IMPLEMENTS
+        }
+        for target in sorted(existing & go_interface_ids):
+            if target not in wanted:
+                graph.remove_edge(cid, target)
+        for target in sorted(wanted):
+            if graph.has_node(target) and not graph.has_edge(cid, target):
+                graph.add_edge(cid, target, REL_IMPLEMENTS, 1.0)
+                added += 1
+        field = sorted(
+            (set(graph_node.implements or []) - go_interface_ids) | wanted
+        )
+        if field != sorted(graph_node.implements or []):
+            data = graph_node.model_dump()
+            data["implements"] = field
+            graph.add_code_node(CodeNode.model_validate(data))
+    return added
+
+
 def rebuild_cross_module_edges(graph: HeterogeneousGraph) -> int:
     """Rebuild all REL_DEPENDS_ON edges from component calls edges.
 
@@ -412,6 +527,7 @@ def apply_file_changes_to_graph(
     new_content: Optional[str],
     repo_path: str,
     old_file_path: Optional[str] = None,
+    rebuild_modules: bool = True,
 ) -> GraphMutationResult:
     """Reconcile the graph with the working-tree version of one file.
 
@@ -432,6 +548,9 @@ def apply_file_changes_to_graph(
         old_file_path: Pre-rename path of the file (renames): graph nodes of
             the old path are also in scope and get removed; the old content
             is NOT analyzed — the graph holds the previous state.
+        rebuild_modules: Rebuild cross-module depends_on edges at the end of
+            this call. Batch callers pass False and rebuild ONCE after the
+            whole batch (per-file rebuilds are O(files x graph)).
 
     Returns a GraphMutationResult summarizing added/updated/removed nodes
     and edges. Callers must persist the graph afterwards; when processing a
@@ -447,6 +566,7 @@ def apply_file_changes_to_graph(
 
     new_nodes: List[Node] = []
     new_rels: list = []
+    new_imports: Dict[str, str] = {}
     if new_content is not None:
         if not new_content.strip():
             # Empty/whitespace-only file: never a deletion. The analysis has
@@ -457,10 +577,12 @@ def apply_file_changes_to_graph(
             )
             return result
         try:
-            new_nodes, new_rels = analyze_file(analyze_path, new_content, repo_path)
+            new_nodes, new_rels, new_imports = analyze_file(
+                analyze_path, new_content, repo_path
+            )
         except Exception as e:
             logger.warning("Failed to analyze %s: %s", file_path, e)
-            new_nodes, new_rels = [], []
+            new_nodes, new_rels, new_imports = [], [], {}
         if not new_nodes:
             # A non-empty file that yields zero components is almost always a
             # parse failure — never nuke the graph over an unparseable file.
@@ -487,8 +609,16 @@ def apply_file_changes_to_graph(
 
     # Resolve dependencies ONCE against the whole graph: analyzer nodes carry
     # empty relation fields (builder fills them repo-wide), so the resolved
-    # maps are what gets persisted on the mutated CodeNodes.
-    resolved = _resolve_dependencies(graph, new_nodes, new_rels)
+    # maps are what gets persisted on the mutated CodeNodes. The changed
+    # file's import map disambiguates names that collide across modules.
+    caller_file = ""
+    if new_nodes:
+        caller_file = (
+            new_nodes[0].relative_path or new_nodes[0].file_path or ""
+        ).replace(os.sep, "/")
+    resolved = _resolve_dependencies(
+        graph, new_nodes, new_rels, new_imports, caller_file
+    )
 
     # --- Removed: in the graph for this file, not in the new analysis ---
     for nid in sorted(set(graph_nodes) - new_ids):
@@ -553,11 +683,10 @@ def apply_file_changes_to_graph(
         if module_id and module_id not in result.modules_added:
             result.modules_added.append(module_id)
 
-    # NOTE: callers processing a batch of files should call
-    # reconcile_unresolved_references(graph) once after the batch (new
-    # definitions from other files can wire unresolved references), then
-    # rebuild_cross_module_edges(graph).
-    rebuild_cross_module_edges(graph)
+    # Only rebuild module edges for single-file callers; batch callers pass
+    # rebuild_modules=False and rebuild once after the whole batch.
+    if rebuild_modules:
+        rebuild_cross_module_edges(graph)
     return result
 
 

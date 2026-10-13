@@ -121,6 +121,9 @@ class TreeSitterPHPAnalyzer(BaseAnalyzer):
 
             # First pass: extract namespace and use statements
             self._extract_namespace_info(root)
+            # Expose the use map for import-aware reference resolution.
+            for alias, fqn in self.namespace_resolver.use_map.items():
+                self.imports[alias] = fqn.replace("\\", ".").strip(".")
 
             # Second pass: extract nodes
             self._extract_nodes(root, lines, depth=0)

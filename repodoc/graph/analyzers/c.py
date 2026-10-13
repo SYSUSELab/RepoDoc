@@ -23,8 +23,34 @@ class TreeSitterCAnalyzer(BaseAnalyzer):
         root = tree.root_node
         lines = self.content.splitlines()
 
+        self._extract_includes(root)
         self._extract_nodes(root, lines)
         self._extract_relationships(root)
+
+    def _extract_includes(self, root) -> None:
+        """Record local `#include "..."` targets as wildcard namespaces.
+
+        Component ids are file-scoped, so the included header's module path
+        lets ambiguous bare function names resolve to the right file."""
+        from repodoc.graph.imports import (
+            register_namespace,
+            resolve_include_target,
+        )
+
+        rel = self._get_relative_path()
+        for node in root.children:
+            if node.type != "preproc_include":
+                continue
+            for child in node.children:
+                if child.type != "string_literal":
+                    continue
+                include = None
+                for c in child.children:
+                    if c.type == "string_content":
+                        include = self._get_node_text(c)
+                target = resolve_include_target(rel, include or "")
+                if target:
+                    register_namespace(self.imports, target)
 
     def _extract_nodes(self, node, lines):
         """Recursively extract top-level nodes (functions, structs, and global variables)."""

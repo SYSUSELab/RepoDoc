@@ -7,7 +7,13 @@ from tree_sitter import Parser, Language
 import tree_sitter_c_sharp
 
 from repodoc.graph.analyzers.base import BaseAnalyzer
-from repodoc.graph.models import REL_IMPLEMENTS, REL_USES, CallRelationship, Node
+from repodoc.graph.models import (
+    REL_IMPLEMENTS,
+    REL_INSTANTIATES,
+    REL_USES,
+    CallRelationship,
+    Node,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +29,59 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
         root = tree.root_node
         lines = self.content.splitlines()
 
+        self._extract_imports(root)
         self._extract_nodes(root, lines)
         self._extract_relationships(root)
+
+    def _extract_imports(self, root) -> None:
+        """Record `using` directives.
+
+        Plain/static usings contribute a wildcard namespace (C# exposes the
+        namespace's simple names directly); aliased usings (`using X = A.B;`)
+        bind the alias."""
+        from repodoc.graph.imports import register_namespace
+
+        for node in root.children:
+            if node.type != "using_directive":
+                continue
+            target_node = next(
+                (
+                    c
+                    for c in node.children
+                    if c.type in ("qualified_name", "identifier")
+                ),
+                None,
+            )
+            if target_node is None:
+                continue
+            target = self._get_node_text(target_node).replace(" ", "")
+            alias_node = None
+            seen_equals = False
+            for child in node.children:
+                if child.type == "=":
+                    seen_equals = True
+                elif seen_equals and child.type == "identifier":
+                    alias_node = child
+                    break
+            if alias_node is not None:
+                self.imports[self._get_node_text(alias_node)] = target
+            else:
+                register_namespace(self.imports, target)
 
     def _extract_nodes(self, node, lines):
         node_type = None
         node_name = None
+        parameters_for_node = None
+
+        if node.type == "method_declaration":
+            containing_class = self._find_containing_class(node)
+            method_name = self._method_name(node)
+            if containing_class and method_name:
+                node_type = "method"
+                # Qualified name mirrors the Java analyzer: methods belong to
+                # their class's component (and are excluded from leaf docs).
+                node_name = f"{containing_class}.{method_name}"
+                parameters_for_node = self._extract_method_parameters(node)
 
         if node.type == "class_declaration":
             is_abstract = any(
@@ -109,6 +162,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                 start_line=node.start_point[0] + 1,
                 end_line=node.end_point[0] + 1,
                 docstring="",
+                parameters=parameters_for_node,
             )
             self.nodes.append(node_obj)
             self.top_level_nodes[node_name] = node_obj
@@ -196,8 +250,73 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                                         relation_type=REL_USES,
                                     )
 
+        elif node.type == "object_creation_expression":
+            # `new User()` — the constructor target of the containing method.
+            caller_id = self._relation_caller(node, containing_class)
+            if caller_id:
+                type_name = self._creation_type_name(node)
+                if type_name and not self._is_primitive_type(type_name):
+                    self._add_relationship(
+                        caller=caller_id,
+                        callee=type_name,
+                        call_line=node.start_point[0] + 1,
+                        relation_type=REL_INSTANTIATES,
+                    )
+
+        elif node.type == "invocation_expression":
+            # `obj.Method()` / `Method()` — record the bare method name so
+            # import-aware resolution can place it.
+            caller_id = self._relation_caller(node, containing_class)
+            if caller_id:
+                method_name = self._invocation_name(node)
+                if method_name:
+                    self._add_relationship(
+                        caller=caller_id,
+                        callee=method_name,
+                        call_line=node.start_point[0] + 1,
+                    )
+
         for child in node.children:
             self._extract_relationships(child)
+
+    def _creation_type_name(self, node) -> str:
+        """Type name of an object_creation_expression (`new X<T>(...)` -> X)."""
+        for child in node.children:
+            if child.type == "identifier":
+                return self._get_node_text(child)
+            if child.type in ("qualified_name", "alias_qualified_name"):
+                return self._get_node_text(child).replace(" ", "")
+            if child.type == "generic_name":
+                name_node = next(
+                    (c for c in child.children if c.type == "identifier"), None
+                )
+                if name_node:
+                    return self._get_node_text(name_node)
+        return ""
+
+    def _invocation_name(self, node) -> str:
+        """Method name of an invocation_expression (`a.B.M()` -> M)."""
+        if not node.children:
+            return ""
+        target = node.children[0]
+        if target.type == "identifier":
+            return self._get_node_text(target)
+        if target.type in ("member_access_expression", "generic_name"):
+            names = [
+                c
+                for c in target.children
+                if c.type in ("identifier", "generic_name")
+            ]
+            if names:
+                last = names[-1]
+                if last.type == "generic_name":
+                    ident = next(
+                        (c for c in last.children if c.type == "identifier"),
+                        None,
+                    )
+                    return self._get_node_text(ident) if ident else ""
+                return self._get_node_text(last)
+        return ""
 
     def _is_primitive_type(self, type_name: str) -> bool:
         """Check if type is a C# primitive or common built-in type."""
@@ -253,6 +372,58 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                     return class_name
             current = current.parent
         return None
+
+    def _method_name(self, node) -> str:
+        """Method name: the last identifier before the parameter list (the
+        return type, when written as an identifier, comes first)."""
+        name = ""
+        for child in node.children:
+            if child.type == "parameter_list":
+                break
+            if child.type == "identifier":
+                name = self._get_node_text(child)
+        return name
+
+    def _extract_method_parameters(self, node) -> List[str]:
+        params: List[str] = []
+        param_list = next(
+            (c for c in node.children if c.type == "parameter_list"), None
+        )
+        if param_list:
+            for child in param_list.children:
+                if child.type == "parameter":
+                    params.append(self._get_node_text(child).replace("\n", " "))
+        return params
+
+    def _find_containing_method(self, node) -> str:
+        """Qualified name (`Class.Method`) of the enclosing method, if any."""
+        current = node.parent
+        while current:
+            if current.type == "method_declaration":
+                cls = self._find_containing_class(current)
+                method = self._method_name(current)
+                if cls and method:
+                    return f"{cls}.{method}"
+                return ""
+            if current.type in [
+                "class_declaration",
+                "interface_declaration",
+                "struct_declaration",
+                "enum_declaration",
+                "record_declaration",
+            ]:
+                return ""
+            current = current.parent
+        return ""
+
+    def _relation_caller(self, node, containing_class) -> str:
+        """Prefer the enclosing method component; fall back to the class."""
+        method = self._find_containing_method(node)
+        if method:
+            return self._get_component_id(method)
+        if containing_class:
+            return self._get_component_id(containing_class)
+        return ""
 
 
 def analyze_csharp_file(

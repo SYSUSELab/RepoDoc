@@ -16,6 +16,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph.analyzers import EXTENSION_MAP, analyze_file
 from repodoc.graph.graph import HeterogeneousGraph
+from repodoc.graph.imports import (
+    ImportIndex,
+    candidate_from_node,
+    resolve_with_imports,
+)
 from repodoc.graph.models import (
     REL_CALLS,
     REL_IMPLEMENTS,
@@ -134,15 +139,19 @@ _RELATION_FIELDS = {
 
 
 def _assemble_components(
-    nodes: List[Node], relationships: List[CallRelationship]
+    nodes: List[Node],
+    relationships: List[CallRelationship],
+    imports_by_file: Optional[Dict[str, Dict[str, str]]] = None,
 ) -> Dict[str, Node]:
     """Turn analyzer nodes + relationships into an id-keyed component dict.
 
-    Reference resolution is scope-aware: the caller's own file wins, then a
-    globally unique name; ambiguous references are dropped instead of guessed
-    (the former bare-name lookup created wrong cross-file edges on every name
-    collision). Relations are stored in typed fields (calls / implements /
-    uses / instantiates / imports) so the graph keeps their semantics."""
+    Reference resolution is scope-aware: the caller's own file wins, then the
+    caller file's import map (disambiguates same-named components across
+    modules), then a globally unique name; ambiguous references are dropped
+    instead of guessed (the former bare-name lookup created wrong cross-file
+    edges on every name collision). Relations are stored in typed fields
+    (calls / implements / uses / instantiates / imports) so the graph keeps
+    their semantics."""
     components: Dict[str, Node] = {}
     id_mapping: Dict[str, str] = {}
     by_name: Dict[str, List[str]] = {}
@@ -156,12 +165,17 @@ def _assemble_components(
         legacy_id = f"{node.file_path}:{node.name}"
         if legacy_id and legacy_id != node.id:
             id_mapping[legacy_id] = node.id
-        rel = node.relative_path or node.file_path
+        rel = (node.relative_path or node.file_path).replace(os.sep, "/")
         for name in dict.fromkeys((node.name, node.id.split(".")[-1])):
             if not name:
                 continue
             by_name.setdefault(name, []).append(node.id)
             by_file_name.setdefault((rel, name), []).append(node.id)
+
+    imports_by_file = imports_by_file or {}
+    import_index = ImportIndex(
+        [candidate_from_node(n) for n in components.values()]
+    )
 
     def _resolve(ref: str, caller_id: str) -> Optional[str]:
         if not ref:
@@ -174,19 +188,28 @@ def _assemble_components(
         last = ref.split(".")[-1]
         caller = components.get(caller_id)
         caller_file = (
-            (caller.relative_path or caller.file_path) if caller else ""
+            (caller.relative_path or caller.file_path).replace(os.sep, "/")
+            if caller
+            else ""
         )
         # 1. Same file wins: a bare name is most likely local.
         for key in dict.fromkeys((ref, last)):
             cands = by_file_name.get((caller_file, key), [])
             if len(cands) == 1:
                 return cands[0]
-        # 2. Globally unique name.
+        # 2. Import context: the caller file's import map resolves names that
+        #    collide across files (exact id, id suffix, module membership).
+        import_match = resolve_with_imports(
+            ref, caller_file, imports_by_file, import_index
+        )
+        if import_match:
+            return import_match
+        # 3. Globally unique name.
         for key in dict.fromkeys((ref, last)):
             cands = by_name.get(key, [])
             if len(cands) == 1:
                 return cands[0]
-        # 3. Unique dotted-suffix match (e.g. "mod.Class.method").
+        # 4. Unique dotted-suffix match (e.g. "mod.Class.method").
         suffix = "." + ref
         suffix_cands = [cid for cid in components if cid.endswith(suffix)]
         if len(suffix_cands) == 1:
@@ -212,6 +235,55 @@ def _assemble_components(
         field = _RELATION_FIELDS.get(relation, "depends_on")
         getattr(components[caller_id], field).add(callee_id)
     return components
+
+
+def infer_go_implements(components: Dict[str, Node]) -> Dict[str, Set[str]]:
+    """Go structural typing: map struct id -> interface ids it implements.
+
+    Go interfaces are satisfied implicitly — there is no declaration to
+    record. A struct implements an interface when its method set (Go methods
+    in the same directory whose receiver is the struct) covers every
+    interface method signature ("Name/arity"). Conservative: full-signature
+    matches only, and the struct must have at least one method."""
+    by_dir_methods: Dict[Tuple[str, str], Set[Tuple[str, int]]] = {}
+    structs: Dict[str, Tuple[str, str]] = {}
+    interfaces: Dict[str, Set[Tuple[str, int]]] = {}
+    for cid, node in components.items():
+        rel = (node.relative_path or "").replace(os.sep, "/")
+        if not rel.endswith(".go"):
+            continue
+        if node.component_type == "method" and node.receiver:
+            receiver = node.receiver.lstrip("*")
+            key = (os.path.dirname(rel), receiver)
+            by_dir_methods.setdefault(key, set()).add(
+                (node.name, len(node.parameters or []))
+            )
+        elif node.component_type == "struct":
+            structs[cid] = (rel, node.name)
+        elif node.component_type == "interface" and node.parameters:
+            sigs: Set[Tuple[str, int]] = set()
+            for sig in node.parameters:
+                name, _, arity = str(sig).partition("/")
+                if name:
+                    sigs.add((name, int(arity) if arity.isdigit() else -1))
+            if sigs:
+                interfaces[cid] = sigs
+
+    out: Dict[str, Set[str]] = {}
+    if not structs or not interfaces:
+        return out
+    for cid, (rel, name) in structs.items():
+        methods = by_dir_methods.get((os.path.dirname(rel), name))
+        if not methods:
+            continue
+        wanted = {
+            interface_id
+            for interface_id, sigs in interfaces.items()
+            if sigs <= methods
+        }
+        if wanted:
+            out[cid] = wanted
+    return out
 
 
 def component_dependencies(node: Node) -> Set[str]:
@@ -291,16 +363,40 @@ def _build_graph_from_components(components: Dict[str, Node]) -> Dict[str, Set[s
     return graph
 
 
+# Type-like components that always qualify as doc targets. The set mirrors
+# what the language analyzers actually emit: Java/C# produce "abstract class",
+# "static class" and "record"; Rust/PHP produce "trait".
+_CLASS_LIKE_TYPES = frozenset(
+    {"class", "abstract class", "static class", "interface", "record", "trait"}
+)
+_ALWAYS_VALID_TYPES = _CLASS_LIKE_TYPES | {"struct", "enum", "annotation"}
+
+# Importance ordering for _rank_by_importance (lower = more important).
+_TYPE_RANK = {
+    "class": 0,
+    "abstract class": 0,
+    "static class": 0,
+    "interface": 1,
+    "trait": 1,
+    "record": 2,
+    "enum": 2,
+    "annotation": 3,
+    "struct": 4,
+    "function": 5,
+}
+
+
 def _get_valid_component_types(
     components: Dict[str, Node], config: Optional[Config] = None
 ) -> Set[str]:
-    """Component types eligible as leaf nodes. Classes always qualify;
-    functions only when the repo is function-heavy (a single class would
+    """Component types eligible as leaf nodes. Type-like components always
+    qualify; functions only when the repo is function-heavy (types would
     otherwise hide all function docs — typical for JS/Go/Rust/C repos).
 
-    struct is NOT counted as a class: in C it is a data declaration, not a
-    type with behavior — libevent's 1439 functions vs 763 struct/class would
-    otherwise lose all function docs (1439 < 763*2).
+    struct is NOT counted as a type-like component for the heuristic: in C it
+    is a data declaration, not a type with behavior — libevent's 1439
+    functions vs 763 struct/class would otherwise lose all function docs
+    (1439 < 763*2). It still qualifies as a doc target.
 
     config.doc_types overrides the automatic selection entirely."""
     if config is not None and config.doc_types:
@@ -308,10 +404,10 @@ def _get_valid_component_types(
     type_counts = Counter(c.component_type for c in components.values())
     # enum/annotation are first-class doc targets in Java; "method" is
     # deliberately excluded (methods belong to their class's doc)
-    valid = {"class", "interface", "struct", "enum", "annotation"}
-    classes = type_counts.get("class", 0) + type_counts.get("interface", 0)
+    valid = set(_ALWAYS_VALID_TYPES)
+    types = sum(type_counts.get(t, 0) for t in _CLASS_LIKE_TYPES)
     funcs = type_counts.get("function", 0)
-    if not classes or funcs > classes * 2:
+    if not types or funcs > types * 2:
         valid.add("function")
     return valid
 
@@ -330,14 +426,7 @@ def _rank_by_importance(
     for _src, deps in graph.items():
         for dep in deps:
             dependents[dep] += 1
-    type_rank = {
-        "class": 0,
-        "interface": 1,
-        "enum": 2,
-        "annotation": 3,
-        "struct": 4,
-        "function": 5,
-    }
+    type_rank = _TYPE_RANK
     ranked = sorted(
         node_ids,
         key=lambda cid: (
@@ -603,6 +692,7 @@ class DependencyGraphBuilder:
 
         all_nodes: List[Node] = []
         all_relationships: List[CallRelationship] = []
+        imports_by_file: Dict[str, Dict[str, str]] = {}
         base = Path(self.config.repo_path)
         for file_info in code_files:
             file_path = base / file_info["path"]
@@ -615,13 +705,25 @@ class DependencyGraphBuilder:
             if "ANTLR GENERATED CODE" in content[:500]:
                 logger.debug("Skipping ANTLR generated file: %s", file_path)
                 continue
-            nodes, relationships = analyze_file(
+            nodes, relationships, imports = analyze_file(
                 str(file_path), content, str(base)
             )
             all_nodes.extend(nodes)
             all_relationships.extend(relationships)
+            if imports:
+                rel = os.path.relpath(str(file_path), str(base)).replace(
+                    os.sep, "/"
+                )
+                imports_by_file[rel] = imports
 
-        components = _assemble_components(all_nodes, all_relationships)
+        components = _assemble_components(
+            all_nodes, all_relationships, imports_by_file
+        )
+
+        # Go has no explicit `implements` clause: infer structural conformance
+        # so the graph carries the same implementor edges as other languages.
+        for struct_id, interface_ids in infer_go_implements(components).items():
+            components[struct_id].implements |= interface_ids
 
         # Save dependency graph (JSON, {component_id: node dump})
         result = {}

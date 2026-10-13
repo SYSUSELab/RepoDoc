@@ -40,12 +40,132 @@ class RustASTAnalyzer(BaseAnalyzer):
             tree = self.parser.parse(self._content_bytes)
             root_node = tree.root_node
 
+            self._extract_use_imports(root_node)
             self._extract_items(root_node)
             self._extract_calls(root_node)
         except Exception as e:
             logger.error(
                 f"Error analyzing Rust file {self.file_path}: {e}", exc_info=True
             )
+
+    def _extract_use_imports(self, root_node) -> None:
+        """Record `use` bindings for import-aware reference resolution.
+
+        `crate::` paths are stripped to repo-relative form (a component id
+        carries its file prefix, so suffix matching finds it); `self::` and
+        `super::` are resolved against the caller's module path."""
+        current_module = self._get_module_path()
+
+        def visit(node) -> None:
+            if node.type == "use_declaration":
+                for child in node.children:
+                    if child.type in (
+                        "scoped_identifier",
+                        "identifier",
+                        "use_as_clause",
+                        "scoped_use_list",
+                        "use_wildcard",
+                    ):
+                        self._register_use_tree(child, "", current_module)
+            for child in node.children:
+                visit(child)
+
+        visit(root_node)
+
+    def _resolve_rust_segments(self, segments, current_module: str) -> str:
+        """Turn `crate::/self::/super::` use segments into a dotted path."""
+        segments = [s for s in segments if s]
+        if not segments:
+            return ""
+        head = segments[0]
+        if head == "crate":
+            return ".".join(segments[1:])
+        if head == "self":
+            return ".".join(
+                current_module.split(".") + segments[1:]
+            )
+        if head == "super":
+            base = current_module.split(".")
+            rest = segments
+            while rest and rest[0] == "super":
+                base = base[:-1]
+                rest = rest[1:]
+            return ".".join(base + rest)
+        return ".".join(segments)
+
+    def _use_node_target(self, node, current_module: str) -> str:
+        text = self._get_node_text(node).replace(" ", "")
+        return self._resolve_rust_segments(text.split("::"), current_module)
+
+    def _register_use_tree(self, node, prefix: str, current_module: str) -> None:
+        from repodoc.graph.imports import register_namespace
+
+        if node.type == "identifier":
+            name = self._get_node_text(node)
+            self.imports[name] = f"{prefix}.{name}" if prefix else name
+        elif node.type == "scoped_identifier":
+            target = self._use_node_target(node, current_module)
+            if target:
+                self.imports[target.split(".")[-1]] = target
+        elif node.type == "use_as_clause":
+            inner = next(
+                (
+                    c
+                    for c in node.children
+                    if c.type in ("scoped_identifier", "identifier")
+                ),
+                None,
+            )
+            alias = next(
+                (
+                    self._get_node_text(c)
+                    for c in node.children
+                    if c.type == "identifier"
+                ),
+                None,
+            )
+            if inner is None or not alias:
+                return
+            if inner.type == "identifier":
+                name = self._get_node_text(inner)
+                target = f"{prefix}.{name}" if prefix else name
+            else:
+                target = self._use_node_target(inner, current_module)
+            if target:
+                self.imports[alias] = target
+        elif node.type == "use_wildcard":
+            text = self._get_node_text(node).replace(" ", "")
+            path = text.rstrip("*").rstrip(":")
+            target = self._resolve_rust_segments(path.split("::"), current_module)
+            if target:
+                register_namespace(self.imports, target)
+        elif node.type == "scoped_use_list":
+            prefix_node = next(
+                (c for c in node.children if c.type == "scoped_identifier"),
+                None,
+            )
+            base = (
+                self._use_node_target(prefix_node, current_module)
+                if prefix_node is not None
+                else prefix
+            )
+            for item in node.children:
+                if item.type != "use_list":
+                    continue
+                for entry in item.children:
+                    if entry.type == "identifier":
+                        name = self._get_node_text(entry)
+                        self.imports[name] = f"{base}.{name}" if base else name
+                    elif entry.type in (
+                        "use_as_clause",
+                        "scoped_identifier",
+                        "use_wildcard",
+                    ):
+                        self._register_use_tree(entry, base, current_module)
+                    elif entry.type == "self":
+                        # `use a::{self, b}` also imports module `a` itself.
+                        if base:
+                            self.imports[base.split(".")[-1]] = base
 
     def _extract_items(self, root_node) -> None:
         """Extract top-level items (functions, structs, impls, traits, etc.)."""

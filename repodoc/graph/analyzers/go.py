@@ -53,6 +53,7 @@ class GoASTAnalyzer(BaseAnalyzer):
             root_node = tree.root_node
 
             self._extract_package(root_node)
+            self._extract_imports(root_node)
             self._extract_functions_and_methods(root_node)
             self._extract_calls(root_node)
         except Exception as e:
@@ -70,47 +71,115 @@ class GoASTAnalyzer(BaseAnalyzer):
                         break
                 break
 
+    def _extract_imports(self, root_node) -> None:
+        """Record import bindings: `import "path"` binds the package name,
+        `import alias "path"` binds the alias, dot imports contribute a
+        wildcard namespace, blank imports contribute nothing."""
+        for child in root_node.children:
+            if child.type != "import_declaration":
+                continue
+            for spec in child.children:
+                if spec.type == "import_spec":
+                    self._register_import_spec(spec)
+                elif spec.type == "import_spec_list":
+                    for item in spec.children:
+                        if item.type == "import_spec":
+                            self._register_import_spec(item)
+
+    def _register_import_spec(self, spec) -> None:
+        alias = None
+        path = ""
+        dot_import = False
+        for child in spec.children:
+            if child.type == "package_identifier":
+                alias = self._get_node_text(child)
+            elif child.type == "blank_identifier":
+                return
+            elif child.type == "dot":
+                dot_import = True
+            elif child.type in (
+                "interpreted_string_literal",
+                "raw_string_literal",
+            ):
+                path = self._literal_content(child)
+        if not path:
+            return
+        target = path.replace("/", ".").strip(".")
+        if dot_import:
+            from repodoc.graph.imports import register_namespace
+
+            register_namespace(self.imports, target)
+            return
+        local = alias or path.rstrip("/").split("/")[-1]
+        if local:
+            self.imports[local] = target
+
+    def _literal_content(self, node) -> str:
+        """Unquoted content of a Go string literal node."""
+        for child in node.children:
+            if child.type.endswith("_content"):
+                return self._get_node_text(child)
+        return self._get_node_text(node).strip('"`')
+
     def _extract_functions_and_methods(self, root_node) -> None:
         """Extract function and method declarations."""
         self._visit_node(root_node)
 
     def _visit_node(self, node) -> None:
-        """Recursively visit nodes to find functions and methods."""
+        """Recursively visit nodes to find type declarations, functions and methods."""
         if node.type in ("function_declaration", "method_declaration"):
             self._extract_function_or_method(node)
-        elif node.type == "struct_type":
-            self._extract_struct(node)
+        elif node.type == "type_declaration":
+            self._extract_type_declaration(node)
 
         for child in node.children:
             self._visit_node(child)
 
     def _extract_function_or_method(self, node) -> None:
-        """Extract a function or method declaration."""
+        """Extract a function or method declaration.
+
+        The FIRST parameter_list after the name is always the parameter list;
+        parenthesized results (`(int, error)`) also parse as parameter_list
+        and must never be mistaken for parameters. For methods, the receiver
+        is the (only) parameter_list before the name."""
         name = None
+        name_index = None
         params = []
         is_method = False
         receiver = None
-        seen_param_list = False
 
-        for child in node.children:
+        for index, child in enumerate(node.children):
             # Method names are field_identifier in current tree-sitter-go grammar
             if child.type in ("identifier", "field_identifier"):
                 name = self._get_node_text(child)
-            elif child.type == "parameter_list":
-                if not seen_param_list:
-                    # First parameter_list of a method is the receiver
-                    seen_param_list = True
-                    receiver = self._extract_receiver(child)
-                    if receiver:
-                        is_method = True
-                else:
-                    params = self._extract_params(child)
-            elif child.type == "parameter_declaration":
-                params.append(self._get_node_text(child))
-            elif child.type == "receiver":
-                # Legacy grammar: dedicated receiver node
-                receiver = self._extract_receiver(child)
-                is_method = True
+                name_index = index
+                break
+
+        # Legacy grammar: a dedicated receiver node before the name.
+        receiver_node = next(
+            (c for c in node.children if c.type == "receiver"), None
+        )
+        if receiver_node is not None:
+            receiver = self._extract_receiver(receiver_node)
+            is_method = bool(receiver)
+        elif node.type == "method_declaration" and name_index is not None:
+            receiver_lists = [
+                c
+                for c in node.children[:name_index]
+                if c.type == "parameter_list"
+            ]
+            if receiver_lists:
+                receiver = self._extract_receiver(receiver_lists[0])
+                is_method = bool(receiver)
+
+        if name_index is not None:
+            after_name = [
+                c
+                for c in node.children[name_index + 1 :]
+                if c.type == "parameter_list"
+            ]
+            if after_name:
+                params = self._extract_params(after_name[0])
 
         if not name:
             return
@@ -166,38 +235,93 @@ class GoASTAnalyzer(BaseAnalyzer):
                 return self._get_node_text(child)
         return ""
 
-    def _extract_struct(self, node) -> None:
-        """Extract struct declaration."""
-        name = None
+    def _extract_type_declaration(self, node) -> None:
+        """Extract named type declarations: structs and interfaces.
 
-        for child in node.children:
-            if child.type == "type_identifier":
-                name = self._get_node_text(child)
-                break
-            elif child.type == "field_declaration":
-                for fc in child.children:
-                    if fc.type == "field_identifier":
-                        name = self._get_node_text(fc)
-                        break
+        The declaration wrapper is `type_declaration`; it holds one
+        `type_spec` per name (grouped declarations hold several). Only struct
+        and interface types become components — aliases and basic types are
+        not documentation targets."""
+        docstring = self._extract_docstring(node)
+        for spec in node.children:
+            if spec.type != "type_spec":
+                continue
+            name = ""
+            type_node = None
+            for child in spec.children:
+                if child.type == "type_identifier":
+                    name = self._get_node_text(child)
+                elif child.type in ("struct_type", "interface_type"):
+                    type_node = child
+            if not name or type_node is None:
+                continue
 
-        if not name:
-            return
+            is_interface = type_node.type == "interface_type"
+            self._add_type_node(
+                name=name,
+                component_type="interface" if is_interface else "struct",
+                docstring=docstring,
+                source_code=self._get_node_text(spec),
+                # Interface method signatures double as the method set: used
+                # by the doc prompts and by struct-implements inference.
+                parameters=(
+                    self._interface_method_signatures(type_node)
+                    if is_interface
+                    else None
+                ),
+            )
+            if not is_interface:
+                self.current_struct = name
 
+    def _add_type_node(
+        self,
+        name: str,
+        component_type: str,
+        docstring: str,
+        source_code: str,
+        parameters: Optional[List[str]] = None,
+    ) -> None:
+        """Append a named-type component (mirrors the struct/interface shape)."""
         component_id = self._get_component_id(name)
-
         node_obj = Node(
             id=component_id,
             name=name,
-            component_type="struct",
+            component_type=component_type,
             file_path=str(self.file_path),
             relative_path=self._get_relative_path(),
-            docstring=self._extract_docstring(node),
-            source_code=self._get_node_text(node),
+            docstring=docstring,
+            source_code=source_code,
+            parameters=parameters,
         )
-
         self.nodes.append(node_obj)
         self.top_level_nodes[component_id] = node_obj
-        self.current_struct = name
+
+    def _interface_method_signatures(self, interface_node) -> List[str]:
+        """Method signatures ("Name/arity") declared by an interface.
+
+        Arity is the parameter count of the first parameter list (the second,
+        optional one holds results). Embedded interfaces are skipped. Used by
+        the struct-implements inference, which needs more than bare names."""
+        signatures: List[str] = []
+        for child in interface_node.children:
+            if child.type != "method_elem":
+                continue
+            name = ""
+            arity = 0
+            first_params = True
+            for method_child in child.children:
+                if method_child.type == "field_identifier" and not name:
+                    name = self._get_node_text(method_child)
+                elif method_child.type == "parameter_list" and first_params:
+                    arity = sum(
+                        1
+                        for c in method_child.children
+                        if c.type == "parameter_declaration"
+                    )
+                    first_params = False
+            if name:
+                signatures.append(f"{name}/{arity}")
+        return signatures
 
     def _extract_params(self, node) -> List[str]:
         """Extract function parameters."""

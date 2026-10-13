@@ -72,6 +72,11 @@ DEFAULT_IGNORE_PATTERNS = {
     ".docusaurus", "*.min.js", "*.min.css", "*.map",
     ".terraform", "*.tfstate*", "digest.txt", "*.ini",
     "tests", "test", "Tests", "Test", "Examples",
+    # Test suite directory variants (C#/Java: UnitTests, IntegrationTest;
+    # JS: __tests__) — product code only, test trees were 10x-ing the graph.
+    "*Tests", "*Test", "__tests__", "specs",
+    # Build intermediates (C# obj/, etc.)
+    "obj",
     # Non-product code dirs: doc examples and dev tooling (fastapi-style
     # repos ship hundreds of tutorial files in docs_src/, scripts/)
     "docs_src", "docs", "scripts",
@@ -134,19 +139,22 @@ def get_analyzer(language: str) -> Optional[type]:
 
 def analyze_file(
     file_path: str, content: str, repo_path: Optional[str] = None
-) -> Tuple[List[Node], List[CallRelationship]]:
-    """Analyze a single file via the registry. Returns (nodes, relationships)."""
+) -> Tuple[List[Node], List[CallRelationship], dict[str, str]]:
+    """Analyze a single file via the registry.
+
+    Returns (nodes, relationships, imports): imports maps local aliases to
+    canonical dotted targets for import-aware reference resolution."""
     ext = Path(file_path).suffix.lower()
     language = EXTENSION_MAP.get(ext)
     if language is None:
-        return [], []
+        return [], [], {}
     analyzer_cls = get_analyzer(language)
     if analyzer_cls is None:
-        return [], []
+        return [], [], {}
     try:
         analyzer = analyzer_cls(file_path, content, repo_path)
         analyzer.analyze()
-        return analyzer.nodes, analyzer.call_relationships
+        return analyzer.nodes, analyzer.call_relationships, dict(analyzer.imports)
     except Exception as e:
         logger.error("Error analyzing %s (%s): %s", file_path, language, e)
-        return [], []
+        return [], [], {}

@@ -29,8 +29,36 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
         root = tree.root_node
         lines = self.content.splitlines()
 
+        self._extract_imports(root)
         self._extract_nodes(root, lines)
         self._extract_relationships(root)
+
+    def _extract_imports(self, root) -> None:
+        """Record `import` bindings: simple imports bind the simple name;
+        wildcard imports (`import a.b.*`) contribute a wildcard namespace;
+        static imports bind the member name."""
+        from repodoc.graph.imports import register_namespace
+
+        for node in root.children:
+            if node.type != "import_declaration":
+                continue
+            target_node = next(
+                (
+                    c
+                    for c in node.children
+                    if c.type in ("scoped_identifier", "identifier")
+                ),
+                None,
+            )
+            if target_node is None:
+                continue
+            fqn = self._get_node_text(target_node).replace(" ", "")
+            if any(c.type == "asterisk" for c in node.children):
+                register_namespace(self.imports, fqn)
+                continue
+            simple = fqn.split(".")[-1]
+            if simple:
+                self.imports[simple] = fqn
 
     def _extract_nodes(self, node, lines):
         node_type = None

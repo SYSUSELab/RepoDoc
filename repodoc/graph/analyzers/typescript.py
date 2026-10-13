@@ -78,6 +78,14 @@ class TreeSitterTSAnalyzer(BaseAnalyzer):
             tree = self.parser.parse(self._content_bytes)
             root_node = tree.root_node
 
+            from repodoc.graph.analyzers.js_imports import collect_js_imports
+
+            self.imports.update(
+                collect_js_imports(
+                    root_node, self._get_node_text, self._get_relative_path()
+                )
+            )
+
             all_entities = {}
             self._extract_all_entities(root_node, all_entities)
 

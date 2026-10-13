@@ -51,6 +51,13 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
             tree = self.parser.parse(self._content_bytes)
             root_node = tree.root_node
 
+            from repodoc.graph.analyzers.js_imports import collect_js_imports
+
+            self.imports.update(
+                collect_js_imports(
+                    root_node, self._get_node_text, self._get_relative_path()
+                )
+            )
             self._extract_functions(root_node)
             self._extract_call_relationships(root_node)
         except Exception as e:
@@ -418,9 +425,12 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
         elif node.type == "new_expression" and current_top_level:
             callee_name = self._extract_callee_name(node)
             if callee_name:
+                # Keep the reference bare: the constructor class may be
+                # imported from another module (import-aware resolution
+                # disambiguates; same-file names still win in the builder).
                 self._add_relationship(
                     caller=f"{self._get_module_path()}.{current_top_level}",
-                    callee=f"{self._get_module_path()}.{callee_name}",
+                    callee=callee_name,
                     call_line=node.start_point[0] + 1,
                 )
 
@@ -567,6 +577,14 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
             return None
 
         callee_node = call_node.children[0]
+        # new_expression starts with the `new` keyword: the constructor is the
+        # first named child.
+        if callee_node.type == "new":
+            callee_node = next(
+                (c for c in call_node.children if c.is_named), None
+            )
+            if callee_node is None:
+                return None
 
         if callee_node.type == "identifier":
             return self._get_node_text(callee_node)

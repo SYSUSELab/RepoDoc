@@ -12,7 +12,7 @@ Contract (unified across the 10 analyzers):
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from repodoc.graph.models import REL_CALLS, CallRelationship, Node
 
@@ -27,6 +27,10 @@ class BaseAnalyzer:
         self.repo_path = Path(repo_path) if repo_path else None
         self.nodes: List[Node] = []
         self.call_relationships: List[CallRelationship] = []
+        #: Local import alias -> canonical dotted target. Filled by analyzers
+        #: that parse import statements; used for import-aware reference
+        #: resolution (ambiguous bare names become correct edges).
+        self.imports: Dict[str, str] = {}
         self.top_level_nodes: dict[str, Node] = {}
         self._seen_relationships: set[tuple] = set()
         self._content_bytes = content.encode("utf8")

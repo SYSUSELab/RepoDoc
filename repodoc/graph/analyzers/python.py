@@ -124,6 +124,47 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         self._process_function_node(node)
 
+    def visit_Import(self, node: ast.Import):
+        """Record `import a.b.c` / `import a.b.c as x` bindings.
+
+        A plain `import a.b.c` binds only the ROOT package name ("a"), so
+        that is what gets registered; `as` binds the alias to the full path."""
+        for alias in node.names:
+            if alias.asname:
+                self.imports[alias.asname] = alias.name
+            else:
+                root = alias.name.split(".")[0]
+                self.imports[root] = root
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """Record `from pkg.mod import Name [as Alias]` bindings.
+
+        Relative imports are resolved against the caller's package first, so
+        the recorded target is a repo-relative dotted path."""
+        module = node.module or ""
+        base = self._resolve_relative_module(node.level, module)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            target = f"{base}.{alias.name}" if base else alias.name
+            self.imports[alias.asname or alias.name] = target
+        self.generic_visit(node)
+
+    def _resolve_relative_module(self, level: int, module: str) -> str:
+        """Resolve a Python relative import to a repo-relative dotted path.
+
+        level 1 = the current package (file's directory), level 2 = its
+        parent, and so on (PEP 328 semantics)."""
+        if not level:
+            return module
+        package = self._get_module_path().split(".")[:-1]
+        up = level - 1
+        if up:
+            package = package[: len(package) - up] if up <= len(package) else []
+        parts = package + ([module] if module else [])
+        return ".".join(parts)
+
     def visit_Call(self, node: ast.Call):
         if self.current_class_name or (
             self.current_function_name and not self.current_class_name
