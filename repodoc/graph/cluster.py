@@ -424,15 +424,28 @@ def _call_llm_with_retry_locked(
             # empty responses on large prompts/outputs
             temperature = 0.0 if attempt == 0 else 0.1
             response_format = "json_object" if attempt == 0 else None
+            # High output cap: reasoning models spend part of it on hidden
+            # reasoning before emitting the JSON (8192 produced empty
+            # responses on medium batches).
             last_response, _ = call_llm(
                 prompt,
                 config,
                 model=config.cluster_model,
                 temperature=temperature,
+                max_tokens=32768,
                 response_format=response_format,
             )
 
             module_tree = _parse_llm_response(last_response)
+            # Some gateways echo the response_format ("{"type":
+            # "json_object"}") as the entire content; that parses but carries
+            # no modules. Treat it as a failure so the next attempt runs in
+            # free-form mode and actually clusters.
+            if not any(isinstance(v, dict) for v in module_tree.values()):
+                raise ValueError(
+                    "LLM response is not a module tree: "
+                    f"{last_response[:120]!r}"
+                )
             _store_cluster_cache(config, cache_key, last_response)
             return last_response, module_tree
 
@@ -854,7 +867,7 @@ def _cluster_small_set(
     # Skip clustering for small content
     if token_count <= MAX_TOKEN_PER_MODULE and len(leaf_nodes) <= SKIP_CLUSTER_MAX_LEAVES:
         return _build_simple_module_tree(
-            leaf_nodes, components, current_module_tree, current_module_name
+            leaf_nodes, components, current_module_tree, current_module_name, config
         )
 
     # Call LLM for clustering
@@ -874,8 +887,12 @@ def _build_simple_module_tree(
     components: Dict[str, Node],
     current_module_tree: dict[str, Any],
     current_module_name: str | None,
+    config: Config,
 ) -> Dict[str, Any]:
-    """Build a simple module tree when clustering is skipped."""
+    """Build a simple module tree when clustering is skipped.
+
+    The single module is named after the repository (not a literal "root"):
+    its name becomes the docs directory for every component of a small repo."""
     logger.debug(
         "Skipping clustering for %s: token count and leaf count under threshold",
         current_module_name,
@@ -889,7 +906,12 @@ def _build_simple_module_tree(
                 dirs.append(os.path.dirname(node.relative_path))
         if dirs:
             module_path = _common_dir(dirs)
-        repo_name = current_module_name or "root"
+        repo_name = current_module_name or os.path.basename(
+            os.path.normpath(config.repo_path)
+        )
+        repo_name = "".join(
+            c if c.isalnum() else "_" for c in (repo_name or "root")
+        )
         return {
             repo_name: {
                 "path": module_path,
