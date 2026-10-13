@@ -1,5 +1,6 @@
 """Shared utilities for RepoDoc."""
 
+import hashlib
 import os
 import json
 import re
@@ -12,6 +13,14 @@ from urllib.parse import unquote
 
 # Lazy-loaded for count_tokens to avoid import cost when not clustering
 _tiktoken_enc = None
+
+
+def content_hash(text: str) -> str:
+    """SHA-256 hex digest of a document's content.
+
+    The knowledge graph snapshots docs by hash instead of storing the full
+    text (which duplicated every generated file inside the graph JSON)."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
 
 
 def count_tokens(text: str) -> int:
@@ -493,6 +502,7 @@ def safe_open_text(base_dir: Path, target: Path, encoding: str = "utf-8") -> str
 __all__ = [
     "FileManager",
     "file_manager",
+    "content_hash",
     "count_tokens",
     "extract_mermaid_diagrams",
     "validate_mermaid_syntax",

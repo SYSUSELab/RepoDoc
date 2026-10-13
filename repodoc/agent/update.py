@@ -33,10 +33,17 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from repodoc.agent.generate import (
+    CHILDREN_SUMMARY_TOTAL_BUDGET,
+    DOCS_SUMMARY_TOTAL_BUDGET,
     DocPipeline,
     _build_module_dependencies,
     _collect_component_modules,
+    _enforce_overview_diagram,
+    _subtree_module_dependencies,
+    _top_level_module_dependencies,
+    build_module_mermaid,
     refresh_doc_snapshots,
+    summarize_docs_for_prompt,
 )
 from repodoc.config import MAX_SOURCE_FILE_BYTES, Config
 from repodoc.graph.analyzers import get_analyzer
@@ -45,6 +52,7 @@ from repodoc.graph.graph import HeterogeneousGraph
 from repodoc.graph.models import (
     CODE_DEPENDENCY_RELATIONS,
     REL_CALLS,
+    REL_CONTAINS,
     REL_DESCRIBES,
     REL_IMPLEMENTS,
     RELATION_NODE_FIELDS,
@@ -57,9 +65,12 @@ from repodoc.graph.mutation import (
     GraphMutationResult,
     apply_file_changes_to_graph,
     component_module_ids,
+    infer_go_implements_in_graph,
+    rebuild_cross_module_edges,
     reconcile_unresolved_references,
 )
 from repodoc.utils import (
+    content_hash,
     file_manager,
     log_operation,
     summarize_markdown,
@@ -820,6 +831,20 @@ def _component_doc_path(docs_dir: str, chain: list[str], name: str) -> str:
     return os.path.join(docs_dir, *chain, f"{name}.md")
 
 
+def _doc_index(graph: HeterogeneousGraph) -> dict[str, str]:
+    """Map described target id -> doc file path, from describes edges.
+
+    The graph knows exactly which document belongs to which component/module;
+    path recomputation is only a fallback (legacy graphs without describes
+    edges, or brand-new docs)."""
+    out: dict[str, str] = {}
+    for source, target, _rt, _w in graph.edges(REL_DESCRIBES):
+        node = graph.get_node(source)
+        if isinstance(node, DocNode) and node.file_path:
+            out[target] = node.file_path
+    return out
+
+
 def _sync_doc_node(
     graph: HeterogeneousGraph,
     pipeline: DocPipeline,
@@ -833,7 +858,7 @@ def _sync_doc_node(
     graph.add_doc_node(
         DocNode(
             id=doc_id,
-            content=content,
+            content_hash=content_hash(content),
             format="markdown",
             file_path=fpath,
             stale=stale,
@@ -853,7 +878,11 @@ def _mark_doc_stale(
         graph.add_doc_node(
             DocNode(
                 id=node.id,
-                content=node.content,
+                # Legacy full-text snapshots are preserved as-is: dropping the
+                # text without a hash would make the doc look unrecorded and
+                # manual-edit detection would flag it forever.
+                content=node.content if not node.content_hash else "",
+                content_hash=node.content_hash,
                 format=node.format,
                 file_path=node.file_path,
                 version=node.version,
@@ -925,6 +954,9 @@ def _user_edited_doc(
     node = graph.get_node(doc_id)
     if not isinstance(node, DocNode):
         return False
+    if node.content_hash:
+        return node.content_hash != content_hash(file_content)
+    # Legacy node (pre-hash graph): compare the stored full text.
     return (node.content or "") != file_content
 
 
@@ -981,6 +1013,7 @@ def _remove_component_docs(
     pipeline: DocPipeline,
     removed: list[str],
     pre_mutation_modules: dict[str, list[str]],
+    doc_index: dict[str, str] | None = None,
 ) -> int:
     """Delete doc files + doc nodes for removed components. Returns count."""
     removed_count = 0
@@ -988,7 +1021,11 @@ def _remove_component_docs(
         chain = pre_mutation_modules.get(node_id, [])
         node = pipeline.components.get(node_id)
         name = node.name if node else node_id.split(".")[-1]
-        doc_path = _component_doc_path(pipeline.config.docs_dir, chain, name)
+        # Prefer the graph's describes edge (pre-mutation snapshot); the
+        # computed path is the fallback for legacy graphs.
+        doc_path = (doc_index or {}).get(node_id) or _component_doc_path(
+            pipeline.config.docs_dir, chain, name
+        )
         if os.path.exists(doc_path):
             try:
                 os.remove(doc_path)
@@ -1008,6 +1045,7 @@ def _migrate_renamed_docs(
     renamed_pairs: list[tuple[str, str]],
     pre_mutation_modules: dict[str, list[str]],
     post_mutation_modules: dict[str, list[str]],
+    doc_index: dict[str, str] | None = None,
 ) -> int:
     """Move docs + transfer doc nodes/describes edges for renamed components.
 
@@ -1025,7 +1063,9 @@ def _migrate_renamed_docs(
             old_chain = [old_chain]
         if isinstance(new_chain, str):
             new_chain = [new_chain]
-        old_doc_path = _component_doc_path(docs_dir, old_chain, name)
+        old_doc_path = (doc_index or {}).get(old_id) or _component_doc_path(
+            docs_dir, old_chain, name
+        )
         new_doc_path = _component_doc_path(docs_dir, new_chain, name)
 
         moved = False
@@ -1045,7 +1085,17 @@ def _migrate_renamed_docs(
             graph.add_doc_node(
                 DocNode(
                     id=new_doc_id,
-                    content=old_doc.content if old_doc else "",
+                    content_hash=(
+                        old_doc.content_hash
+                        if isinstance(old_doc, DocNode)
+                        else ""
+                    ),
+                    content=(
+                        old_doc.content
+                        if isinstance(old_doc, DocNode)
+                        and not old_doc.content_hash
+                        else ""
+                    ),
                     format="markdown",
                     file_path=new_doc_path,
                 )
@@ -1075,6 +1125,98 @@ def _cleanup_empty_dirs(docs_dir: str) -> int:
         except OSError:
             pass
     return removed
+
+
+# A brand-new top-level module needs at least this many members before it is
+# worth one LLM clustering call (below it, directory grouping is as good).
+_RECLUSTER_MIN_MEMBERS = 13
+
+
+def _attach_submodules(
+    graph: HeterogeneousGraph,
+    parent_id: str,
+    nodes: dict,
+    created: list[str],
+) -> None:
+    """Attach a clustering result as sub-modules under an existing module.
+
+    Only membership/containment is written — no component moves out of the
+    parent (parents keep the full member list by design), so no existing doc
+    is affected; the members here are brand-new components without docs."""
+    for name, info in nodes.items():
+        if not isinstance(info, dict):
+            continue
+        sub_id = f"{parent_id}/{name}"
+        member_ids = [
+            cid
+            for cid in info.get("components", [])
+            if graph.has_node(cid)
+        ]
+        existing = graph.get_node(sub_id)
+        if isinstance(existing, ModuleNode):
+            members = list(dict.fromkeys(existing.components + member_ids))
+        else:
+            members = member_ids
+            created.append(sub_id)
+        graph.add_module_node(
+            ModuleNode(
+                id=sub_id,
+                name=name,
+                path=info.get("path", ""),
+                parent=parent_id,
+                components=members,
+            )
+        )
+        if not graph.has_edge(parent_id, sub_id):
+            graph.add_edge(parent_id, sub_id, REL_CONTAINS, 1.0)
+        for cid in member_ids:
+            if not graph.has_edge(sub_id, cid):
+                graph.add_edge(sub_id, cid, REL_CONTAINS, 1.0)
+        children = info.get("children")
+        if isinstance(children, dict) and children:
+            _attach_submodules(graph, sub_id, children, created)
+
+
+def _recluster_created_modules(
+    graph: HeterogeneousGraph,
+    created_ids: set[str],
+    config: Config,
+) -> list[str]:
+    """Anti-drift: LLM-cluster big brand-new top-level modules.
+
+    New components are placed heuristically (directory match). When a whole
+    new area appears, one LLM clustering pass turns that module into semantic
+    sub-modules. Confined to modules created by THIS update whose members are
+    all new, so nothing existing moves and no doc migration is needed."""
+    if config.cluster_strategy != "llm" or not created_ids:
+        return []
+    from repodoc.graph.builder import graph_to_components
+    from repodoc.graph.cluster import cluster_modules
+
+    components = graph_to_components(graph)
+    created: list[str] = []
+    for module_id in sorted(created_ids):
+        node = graph.get_node(module_id)
+        if not isinstance(node, ModuleNode) or node.parent is not None:
+            continue
+        members = [cid for cid in node.components if graph.has_node(cid)]
+        if len(members) < _RECLUSTER_MIN_MEMBERS:
+            continue
+        try:
+            tree = cluster_modules(members, components, config)
+        except Exception as e:
+            logger.warning(
+                "Re-clustering of new module %s failed: %s", module_id, e
+            )
+            continue
+        if not isinstance(tree, dict) or len(tree) <= 1:
+            continue
+        print(
+            f"  Re-clustered new module '{module_id}' ({len(members)} members) "
+            f"into {len(tree)} sub-module(s)"
+        )
+        _attach_submodules(graph, module_id, tree, created)
+    return created
 
 
 # ---------------------------------------------------------------------------
@@ -1272,6 +1414,16 @@ async def run_update(
     from repodoc.graph.builder import graph_to_components, graph_to_module_tree
 
     pre_components = graph_to_components(graph)
+    # Doc placement as recorded by the graph (describes edges), snapshotted
+    # before mutation drops removed components' incident edges.
+    pre_doc_index = _doc_index(graph)
+    # Module nodes present before mutation: used to find modules CREATED by
+    # this update (anti-drift re-clustering is confined to those).
+    pre_module_ids = {
+        attrs.get("data", {}).get("id", nid)
+        for nid, attrs in graph.nodes(data=True)
+        if attrs.get("node_type") == "module"
+    }
 
     # Docs left unfinished by a previous (crashed/partial) run stay on the
     # schedule even when this run sees no new important changes.
@@ -1319,6 +1471,9 @@ async def run_update(
             fd.new_content,
             config.repo_path,
             old_file_path=renames.get(fd.file_path),
+            # Cross-module edges are rebuilt ONCE after the batch below;
+            # rebuilding per file would be O(files x graph).
+            rebuild_modules=False,
         )
         mutation.added.extend(r.added)
         mutation.updated.extend(r.updated)
@@ -1336,6 +1491,29 @@ async def run_update(
     reconciled = reconcile_unresolved_references(graph)
     if reconciled:
         print(f"  Reconciled {reconciled} previously-unresolved reference(s)")
+
+    # Anti-drift: give big brand-new modules semantic sub-modules (confined
+    # to components added by this update; skipped in dry runs — it costs one
+    # LLM call and must not touch anything on a preview).
+    created_module_ids: set[str] = set()
+    if not dry_run:
+        created_module_ids = {
+            attrs.get("data", {}).get("id", nid)
+            for nid, attrs in graph.nodes(data=True)
+            if attrs.get("node_type") == "module"
+        } - pre_module_ids
+        _recluster_created_modules(graph, created_module_ids, config)
+
+    # Go struct -> interface conformance (no explicit declaration exists):
+    # recompute so method/interface changes converge.
+    inferred = infer_go_implements_in_graph(graph)
+    if inferred:
+        print(f"  Inferred {inferred} Go implements edge(s)")
+
+    # Single rebuild for the whole batch (after reconciliation and any
+    # re-clustering, so freshly wired edges and the deepest module homes are
+    # reflected in the module-level dependency map).
+    rebuild_cross_module_edges(graph)
 
     if not dry_run:
         graph.save(_graph_save_path(config, project_name))
@@ -1576,6 +1754,7 @@ async def run_update(
             rehome_pairs,
             {c: [] for c, _new in rehome_pairs},
             {c: component_module_ids(graph, c)[0] for c, _new in rehome_pairs},
+            doc_index=pre_doc_index,
         )
     if newly_placed:
         # refresh tree/maps so the new homes are visible downstream
@@ -1605,13 +1784,18 @@ async def run_update(
             renamed_pairs,
             pre_mutation_modules,
             comp_modules,
+            doc_index=pre_doc_index,
         )
 
     removed_docs = 0
     if mutation.removed:
         print(f"\nCleaning up docs for {len(mutation.removed)} removed component(s)...")
         removed_docs = _remove_component_docs(
-            graph, pipeline, mutation.removed, pre_mutation_modules
+            graph,
+            pipeline,
+            mutation.removed,
+            pre_mutation_modules,
+            doc_index=pre_doc_index,
         )
 
     cleaned_dirs = _cleanup_empty_dirs(docs_dir)
@@ -1633,6 +1817,10 @@ async def run_update(
     module_deps, module_dependents = _build_module_dependencies(
         pipeline.components, module_tree
     )
+    # Module docs describe their whole subtree (parent inherits descendants'
+    # dependencies); the README folds the result onto top-level modules.
+    module_deps = _subtree_module_dependencies(module_deps)
+    module_dependents = _subtree_module_dependencies(module_dependents)
 
     # --- Stage 4: regenerate docs, bottom-up (components -> modules -> README) ---
     print(f"\nUpdating {len(impact['components_to_doc'])} component doc(s)...")
@@ -1645,7 +1833,13 @@ async def run_update(
             if not node:
                 continue
             chain = comp_modules.get(node_id, [])
-            doc_path = _component_doc_path(docs_dir, chain, node.name)
+            # The existing doc lives where the graph's describes edge says
+            # (robust against placement drift); computed path is the fallback.
+            recorded = pre_doc_index.get(node_id)
+            if recorded and os.path.exists(recorded):
+                doc_path = recorded
+            else:
+                doc_path = _component_doc_path(docs_dir, chain, node.name)
             existing_doc = _safe_read(doc_path)
             # Diff of the file this component lives in ('' when none)
             code_diff = per_file_diffs.get(node.relative_path, "")
@@ -1772,7 +1966,7 @@ async def run_update(
                 _mark_doc_stale(graph, pipeline, doc_path)
                 return None
 
-            component_docs_content = {}
+            raw_component_docs: dict[str, str] = {}
             for comp_id in module_info.get("components", []):
                 node = pipeline.components.get(comp_id)
                 if not (node and node.name):
@@ -1781,11 +1975,12 @@ async def run_update(
                 comp_doc_path = _component_doc_path(docs_dir, chain, node.name)
                 content = _safe_read(comp_doc_path)
                 if content:
-                    component_docs_content[node.name] = summarize_markdown(
-                        content, budget=2000
-                    )
+                    raw_component_docs[node.name] = content
+            component_docs_content = summarize_docs_for_prompt(
+                raw_component_docs, DOCS_SUMMARY_TOTAL_BUDGET, 2000
+            )
 
-            child_docs_content = {}
+            raw_child_docs: dict[str, str] = {}
             children = module_info.get("children", {})
             for child_name in children.keys():
                 child_doc_path = os.path.join(
@@ -1793,9 +1988,10 @@ async def run_update(
                 )
                 content = _safe_read(child_doc_path)
                 if content:
-                    child_docs_content[child_name] = summarize_markdown(
-                        content, budget=1500
-                    )
+                    raw_child_docs[child_name] = content
+            child_docs_content = summarize_docs_for_prompt(
+                raw_child_docs, CHILDREN_SUMMARY_TOTAL_BUDGET, 1500
+            )
 
             path_parts = module_id.split("/")
             parent_module = path_parts[-2] if len(path_parts) > 1 else ""
@@ -1869,22 +2065,32 @@ async def run_update(
             )
             _mark_doc_stale(graph, pipeline, readme_path)
         else:
-            module_docs_summary = {}
+            raw_module_docs: dict[str, str] = {}
             for name in module_tree.keys():
                 content = _safe_read(os.path.join(docs_dir, f"{name}.md"))
                 if content:
-                    module_docs_summary[name] = summarize_markdown(
-                        content, budget=2000
-                    )
+                    raw_module_docs[name] = content
+            module_docs_summary = summarize_docs_for_prompt(
+                raw_module_docs, DOCS_SUMMARY_TOTAL_BUDGET, 2000
+            )
 
+            # The README documents top-level modules: fold full module paths
+            # onto their top-level names (matches the theme map links). The
+            # architecture diagram is derived from the same map and enforced
+            # verbatim on the written README.
+            top_level_deps = _top_level_module_dependencies(module_deps)
+            module_diagram = build_module_mermaid(
+                top_level_deps, list(module_tree.keys())
+            )
             overview_input = {
                 "type": "update_overview",
                 "repo_name": os.path.basename(config.repo_path),
                 "component_count": len(pipeline.components),
                 "module_count": len(module_tree),
                 "module_dependencies": {
-                    m: sorted(ds) for m, ds in module_deps.items()
+                    m: sorted(ds) for m, ds in top_level_deps.items()
                 },
+                "module_diagram": module_diagram,
                 "module_docs_summary": module_docs_summary,
                 "existing_doc": existing_doc,
                 "output_path": readme_path,
@@ -1905,11 +2111,13 @@ async def run_update(
                                 "component_count": overview_input["component_count"],
                                 "module_count": overview_input["module_count"],
                                 "module_dependencies": overview_input["module_dependencies"],
+                                "module_diagram": module_diagram,
                                 "module_docs_summary": overview_input["module_docs_summary"],
                                 "output_path": readme_path,
                             },
                         }
                     )
+                _enforce_overview_diagram(overview_result, module_diagram)
             except Exception as e:
                 # Same failure contract as component/module docs: journal it,
                 # never abort the whole run over the README.
@@ -1971,9 +2179,13 @@ async def run_update(
     for job, r in zip(component_jobs, component_results):
         if _job_failed(r):
             _mark_doc_stale(graph, pipeline, job[1])
+            reason = r if isinstance(r, Exception) else getattr(r, "error", "unknown")
+            print(f"  FAILED component doc {job[0]}: {reason}")
     for job, r in zip(module_jobs, module_results):
         if _job_failed(r):
             _mark_doc_stale(graph, pipeline, job[3])
+            reason = r if isinstance(r, Exception) else getattr(r, "error", "unknown")
+            print(f"  FAILED module doc {job[0]}: {reason}")
     if overview_failed:
         _mark_doc_stale(graph, pipeline, readme_path)
 

@@ -141,10 +141,16 @@ class CodeNode(BaseModel):
 
 
 class DocNode(BaseModel):
-    """Document fragment: module doc, API doc, or architecture diagram."""
+    """Document fragment: module doc, API doc, or architecture diagram.
+
+    The graph keeps only a SHA-256 of the doc content (content_hash) instead
+    of the full text: the files on disk are the documents, the hash is all
+    that manual-edit detection needs. `content` is legacy (graphs written
+    before hashing); new/refreshed nodes leave it empty."""
 
     id: str
-    content: str
+    content: str = ""
+    content_hash: str = ""
     format: str  # e.g. "markdown", "mermaid"
     version: int = 1
     file_path: Optional[str] = None

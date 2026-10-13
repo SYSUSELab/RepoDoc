@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import subprocess
 import time
 import glob
@@ -11,6 +12,7 @@ from repodoc.graph import DependencyGraphBuilder
 from repodoc.graph.builder import build_graph_from_analysis, component_dependencies
 from repodoc.agent.agent import DocAgent
 from repodoc.utils import (
+    content_hash,
     file_manager,
     log_operation,
     summarize_markdown,
@@ -113,12 +115,15 @@ def _build_module_dependencies(
     """Aggregate cross-module call edges.
 
     Returns (module -> modules it depends on, module -> modules that depend
-    on it), using each component's deepest module home."""
+    on it), keyed by the FULL module path ("core/services"), using each
+    component's deepest module home. Callers documenting a specific module
+    look it up by its full path; the README/overview uses
+    _top_level_module_dependencies to fold everything onto top-level modules."""
     comp_modules = _collect_component_modules(module_tree)
 
     def module_of(cid: str) -> str | None:
         chain = comp_modules.get(cid)
-        return chain[0] if chain else None
+        return "/".join(chain) if chain else None
 
     deps: dict[str, set[str]] = {}
     dependents: dict[str, set[str]] = {}
@@ -132,6 +137,167 @@ def _build_module_dependencies(
                 deps.setdefault(m, set()).add(dm)
                 dependents.setdefault(dm, set()).add(m)
     return deps, dependents
+
+
+def _subtree_module_dependencies(
+    deps: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Aggregate full-path module dependencies over each module's subtree.
+
+    A parent module inherits the dependencies of every descendant module
+    ("core" inherits "core/services" -> "net"); edges inside the same subtree
+    are dropped (they are internal cooperation, not external dependency).
+    Every ancestor of a known module is included, so a parent whose members
+    all live in sub-modules still gets its subtree's dependencies.
+    Used by module docs, which describe the whole subtree."""
+
+    def _prefixes(module_id: str) -> list[str]:
+        parts = module_id.split("/")
+        return ["/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+    modules: set[str] = set()
+    for module, targets in deps.items():
+        modules.update(_prefixes(module))
+        for target in targets:
+            modules.update(_prefixes(target))
+    out: dict[str, set[str]] = {}
+    for module in modules:
+        prefix = module + "/"
+        merged: set[str] = set()
+        for owner, targets in deps.items():
+            if owner != module and not owner.startswith(prefix):
+                continue
+            for target in targets:
+                if target != module and not target.startswith(prefix):
+                    merged.add(target)
+        out[module] = merged
+    return out
+
+
+def _top_level_module_dependencies(
+    deps: dict[str, set[str]],
+) -> dict[str, set[str]]:
+    """Fold full-path module dependencies onto top-level modules.
+
+    Used by the README overview, which documents top-level modules: both
+    sides of every edge are reduced to their first path segment and
+    self-edges are dropped."""
+    out: dict[str, set[str]] = {}
+    for module, targets in deps.items():
+        top = module.split("/")[0]
+        merged = out.setdefault(top, set())
+        for target in targets:
+            target_top = target.split("/")[0]
+            if target_top != top:
+                merged.add(target_top)
+    return out
+
+
+_MERMAID_BLOCK_RE = re.compile(
+    r"```mermaid[ \t]*\r?\n.*?```", re.DOTALL
+)
+
+# Total character budget for all member/child doc summaries embedded in one
+# parent prompt. A fixed per-doc budget (2000 chars x N members) overflowed
+# the 60K prompt cap on real repos and the truncated tail made the module doc
+# fail on every retry (gson: 30+ member docs).
+DOCS_SUMMARY_TOTAL_BUDGET = 40_000
+CHILDREN_SUMMARY_TOTAL_BUDGET = 12_000
+
+
+def summarize_docs_for_prompt(
+    contents: dict[str, str],
+    total_budget: int = DOCS_SUMMARY_TOTAL_BUDGET,
+    per_doc_budget: int = 2000,
+) -> dict[str, str]:
+    """Summarize each doc so the TOTAL stays under budget.
+
+    The per-doc budget shrinks as more docs share the total, so a 60-member
+    module still fits the prompt instead of being truncated."""
+    if not contents:
+        return {}
+    per = min(per_doc_budget, max(200, total_budget // len(contents)))
+    return {
+        name: summarize_markdown(content, budget=per)
+        for name, content in contents.items()
+    }
+
+
+def build_module_mermaid(
+    module_deps: dict[str, set[str]],
+    module_names: list[str] | None = None,
+) -> str:
+    """Deterministic mermaid flowchart of the module dependency map.
+
+    The README diagram must reflect the actual knowledge graph; letting the
+    LLM draw it produced invented modules/edges. Nodes are the given module
+    names plus every endpoint of the dependency edges; labels keep the real
+    names, mermaid ids are sanitized."""
+    node_set: set[str] = set(module_names or [])
+    node_set.update(module_deps.keys())
+    for targets in module_deps.values():
+        node_set.update(targets)
+    if not node_set:
+        return ""
+
+    node_ids: dict[str, str] = {}
+
+    def nid(name: str) -> str:
+        if name not in node_ids:
+            safe = re.sub(r"[^0-9A-Za-z_]", "_", name)
+            node_ids[name] = f"m_{safe}" if safe else f"m_n{len(node_ids)}"
+        return node_ids[name]
+
+    lines = ["flowchart TD"]
+    for name in sorted(node_set):
+        label = name.replace('"', "'")
+        lines.append(f'    {nid(name)}["{label}"]')
+    edges = {
+        (source, target)
+        for source, targets in module_deps.items()
+        for target in targets
+        if target in node_set and target != source
+    }
+    for source, target in sorted(edges):
+        lines.append(f"    {nid(source)} --> {nid(target)}")
+    return "\n".join(lines)
+
+
+def _enforce_overview_diagram(result, diagram_code: str) -> None:
+    """Replace/insert the README's module diagram with the canonical one.
+
+    Prompt instructions alone cannot guarantee a verbatim diagram; the first
+    mermaid block is overwritten with the graph-derived one (or appended when
+    missing). Runs BEFORE the DocNode snapshot so manual-edit detection stays
+    accurate."""
+    if not (
+        result is not None
+        and getattr(result, "success", False)
+        and getattr(result, "output", None)
+    ):
+        return
+    if not diagram_code:
+        return
+    output = result.output
+    path = output.get("path")
+    content = output.get("content", "")
+    if not path or not content:
+        return
+    block = f"```mermaid\n{diagram_code}\n```"
+    if _MERMAID_BLOCK_RE.search(content):
+        updated = _MERMAID_BLOCK_RE.sub(
+            lambda _m: block, content, count=1
+        )
+    else:
+        updated = content.rstrip() + "\n\n## Architecture\n\n" + block + "\n"
+    if updated == content:
+        return
+    try:
+        file_manager.save_text(updated, path)
+    except OSError as e:
+        print(f"Warning: could not enforce the README diagram: {e}")
+        return
+    output["content"] = updated
 
 
 def refresh_doc_snapshots(graph, paths: list[str]) -> int:
@@ -163,12 +329,15 @@ def refresh_doc_snapshots(graph, paths: list[str]) -> int:
         except Exception as e:
             print(f"Warning: could not re-read {file_path}: {e}")
             continue
-        if content == (d.get("content") or ""):
+        recorded = d.get("content_hash") or ""
+        actual = content_hash(content)
+        # Legacy nodes (full content, no hash) are compacted to a hash here.
+        if recorded == actual and not d.get("content"):
             continue
         graph.add_doc_node(
             DocNode(
                 id=d.get("id", nid),
-                content=content,
+                content_hash=actual,
                 format=d.get("format", "markdown"),
                 version=d.get("version", 1),
                 file_path=file_path,
@@ -294,7 +463,7 @@ class DocPipeline:
         self.graph.add_doc_node(
             DocNode(
                 id=doc_id,
-                content=output.get("content", ""),
+                content_hash=content_hash(output.get("content", "")),
                 format="markdown",
                 file_path=fpath,
             )
@@ -379,23 +548,30 @@ class DocPipeline:
             self.initialize_agent()
 
         module_structure = self.load_module_tree()
+        # The overview documents top-level modules, so dependencies are
+        # folded from full paths onto their top-level names.
         module_deps, _ = _build_module_dependencies(
             self.components, module_structure
         )
+        module_deps = _top_level_module_dependencies(module_deps)
+        module_diagram = build_module_mermaid(
+            module_deps, list(module_structure.keys())
+        )
 
         # Module doc summaries (top-level module docs generated in layer 2)
-        module_docs_summary = {}
+        raw_module_docs: dict[str, str] = {}
         docs_dir = self.config.docs_dir
         for name in module_structure.keys():
             md_path = os.path.join(docs_dir, f"{name}.md")
             if os.path.exists(md_path):
                 try:
                     with open(md_path, "r") as f:
-                        module_docs_summary[name] = summarize_markdown(
-                            f.read(), budget=2000
-                        )
+                        raw_module_docs[name] = f.read()
                 except Exception:
                     pass
+        module_docs_summary = summarize_docs_for_prompt(
+            raw_module_docs, DOCS_SUMMARY_TOTAL_BUDGET, 2000
+        )
 
         module_count = len(module_structure)
         result = await self.agent.execute(
@@ -410,12 +586,15 @@ class DocPipeline:
                     "module_dependencies": {
                         m: sorted(ds) for m, ds in module_deps.items()
                     },
+                    "module_diagram": module_diagram,
                     "module_docs_summary": module_docs_summary,
                     "output_path": output_path
                     or os.path.join(self.config.docs_dir, "README.md"),
                 },
             }
         )
+        # The diagram is graph-derived: enforce it even if the LLM altered it.
+        _enforce_overview_diagram(result, module_diagram)
         return result
 
     async def generate_module_docs(
@@ -447,6 +626,8 @@ class DocPipeline:
         module_deps, module_dependents = _build_module_dependencies(
             self.components, module_tree
         )
+        module_deps = _subtree_module_dependencies(module_deps)
+        module_dependents = _subtree_module_dependencies(module_dependents)
 
         results = []
 
@@ -535,21 +716,22 @@ class DocPipeline:
             file_manager.ensure_directory(module_dir)
 
         # Child module docs (leaf modules generated first, so they exist)
-        child_docs_content = {}
+        raw_child_docs: dict[str, str] = {}
         for child_name in children.keys():
             child_doc_path = os.path.join(module_dir, f"{child_name}.md")
             if os.path.exists(child_doc_path):
                 try:
                     with open(child_doc_path, "r") as f:
-                        child_docs_content[child_name] = summarize_markdown(
-                            f.read(), budget=1500
-                        )
+                        raw_child_docs[child_name] = f.read()
                 except Exception:
                     pass
+        child_docs_content = summarize_docs_for_prompt(
+            raw_child_docs, CHILDREN_SUMMARY_TOTAL_BUDGET, 1500
+        )
 
         # Member component docs (layer 1, generated before module docs).
         # Each component's doc lives in its deepest module dir.
-        component_docs_content = {}
+        raw_component_docs: dict[str, str] = {}
         comp_modules = _collect_component_modules(module_tree)
         for comp_id in components:
             node = self.components.get(comp_id)
@@ -560,11 +742,12 @@ class DocPipeline:
             if os.path.exists(comp_doc_path):
                 try:
                     with open(comp_doc_path, "r") as f:
-                        component_docs_content[node.name] = summarize_markdown(
-                            f.read(), budget=2000
-                        )
+                        raw_component_docs[node.name] = f.read()
                 except Exception:
                     pass
+        component_docs_content = summarize_docs_for_prompt(
+            raw_component_docs, DOCS_SUMMARY_TOTAL_BUDGET, 2000
+        )
 
         # Sibling / parent context from the tree
         parent_module = ""
@@ -590,8 +773,12 @@ class DocPipeline:
                     "module_path": module_info.get("path", module_name),
                     "parent_module": parent_module,
                     "sibling_modules": sibling_modules,
-                    "module_dependencies": sorted(module_deps.get(module_name, set())),
-                    "dependent_modules": sorted(module_dependents.get(module_name, set())),
+                    "module_dependencies": sorted(
+                        module_deps.get(full_path, set())
+                    ),
+                    "dependent_modules": sorted(
+                        module_dependents.get(full_path, set())
+                    ),
                     "component_docs": component_docs_content,
                     "sub_modules": list(children.keys()),
                     "children_docs": child_docs_content,
