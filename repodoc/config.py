@@ -55,6 +55,10 @@ class Config:
     # the count (0 = unlimited), ranked by popularity/type.
     doc_types: list[str] = field(default_factory=list)
     max_docs: int = 0
+    # Caller-propagation budget for update: cap the number of caller docs a
+    # single change set can pull in (ranked by distance + fan-in). 0 = no cap.
+    # Overridable via REPODOC_MAX_IMPACT_DOCS.
+    max_impact_docs: int = 60
 
     def __post_init__(self) -> None:
         self.llm_base_url = _strip_chat_completions_suffix(self.llm_base_url)
@@ -73,4 +77,8 @@ class Config:
         if self.doc_strategy not in ("agent", "direct"):
             raise ValueError(
                 f"doc_strategy must be 'agent' or 'direct', got {self.doc_strategy!r}"
+            )
+        if self.max_impact_docs < 0:
+            raise ValueError(
+                f"max_impact_docs must be >= 0, got {self.max_impact_docs!r}"
             )

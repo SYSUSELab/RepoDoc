@@ -358,6 +358,10 @@ class DocPipeline:
         self.module_tree = {}
         self._start_time = None
         self._generated_files = []
+        # True only when this run parsed the repository. Restoring an existing
+        # graph must NOT snapshot the current tree: the tree may have changed
+        # since the graph was built, and a snapshot would hide that from update.
+        self._analyzed_working_tree = False
 
     def get_data_dir(self) -> str:
         return os.path.join(self.config.output_dir, "data")
@@ -379,6 +383,7 @@ class DocPipeline:
 
         builder = DependencyGraphBuilder(self.config)
         self.components, self.leaf_nodes = builder.build_dependency_graph()
+        self._analyzed_working_tree = True
         self.graph = build_graph_from_analysis(self.components)
         # Attach the clustering blueprint (module tree) when it already
         # exists, so the graph carries the full architecture from the start.
@@ -1117,10 +1122,27 @@ class DocPipeline:
             },
             "doc_generation": generation_quality or {},
         }
+        # Record the analyzed working tree (including uncommitted changes) so
+        # the next update does not re-process or misread this state. When the
+        # graph was restored, preserve the snapshot of the tree it was built
+        # from — the working tree may already differ from it.
+        from repodoc.worktree import record_worktree_snapshot
+
         project_name = self.get_project_name()
-        file_manager.save_json(
-            metadata, os.path.join(data_dir, f"{project_name}_metadata.json")
+        metadata_path = os.path.join(
+            data_dir, f"{project_name}_metadata.json"
         )
+        if self._analyzed_working_tree:
+            record_worktree_snapshot(metadata, self.config)
+        else:
+            previous = file_manager.load_json(metadata_path) or {}
+            if previous.get("working_tree"):
+                metadata["working_tree"] = previous["working_tree"]
+            if previous.get("generation_info", {}).get("git_commit"):
+                metadata.setdefault("generation_info", {})["git_commit"] = (
+                    previous["generation_info"]["git_commit"]
+                )
+        file_manager.save_json(metadata, metadata_path)
 
         log_operation(
             output_dir=self.config.output_dir,

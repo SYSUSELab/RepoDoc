@@ -498,6 +498,85 @@ def _read_working_tree(repo_path: str, file_path: str) -> Optional[str]:
     return full_path.read_text(encoding="utf-8", errors="replace")
 
 
+def _old_content_for(
+    config: Config,
+    rel_path: str,
+    base_commit: Optional[str],
+    snapshot: Optional[dict],
+) -> Optional[str]:
+    """Old content of a changed file: snapshot (dirty) first, then git."""
+    dirty = (snapshot or {}).get("dirty") or {}
+    if rel_path in dirty:
+        return dirty[rel_path]
+    return _git_show(config.repo_path, rel_path, base_commit)
+
+
+def _analyze_worktree_snapshot(
+    config: Config, snapshot: dict
+) -> tuple[dict[str, FileDiff], dict[str, str]]:
+    """Diff the current working tree against the last recorded snapshot.
+
+    This is what makes repeated updates idempotent and reverts converge: the
+    comparison is against the state that was actually analyzed, not against a
+    git commit. Renames are recovered from identical file hashes (deleted
+    path -> added path); the old text of dirty files comes from the snapshot,
+    clean files from the recorded commit."""
+    from repodoc.worktree import _managed_hashes
+
+    prev_files = (snapshot or {}).get("files") or {}
+    current = _managed_hashes(config)
+    changed = sorted(
+        path for path, digest in current.items() if prev_files.get(path) != digest
+    )
+    deleted = sorted(path for path in prev_files if path not in current)
+    added = [path for path in changed if path not in prev_files]
+
+    renames: dict[str, str] = {}
+    deleted_by_hash: dict[str, list[str]] = {}
+    for path in deleted:
+        deleted_by_hash.setdefault(prev_files[path], []).append(path)
+    consumed: set[str] = set()
+    for path in added:
+        candidates = [
+            old
+            for old in deleted_by_hash.get(current[path], [])
+            if old not in consumed
+        ]
+        if len(candidates) == 1:
+            renames[path] = candidates[0]
+            consumed.add(candidates[0])
+
+    diffs: dict[str, FileDiff] = {}
+    paths = [p for p in changed if p not in consumed] + [
+        p for p in deleted if p not in consumed
+    ]
+    for rel_path in paths:
+        spec = get_diff_spec(rel_path)
+        if spec is None:
+            continue
+        old_path = renames.get(rel_path, rel_path)
+        try:
+            old_content = _old_content_for(config, old_path, None, snapshot)
+            new_content = (
+                None
+                if rel_path in deleted
+                else _read_working_tree(config.repo_path, rel_path)
+            )
+        except (GitError, OSError) as e:
+            logger.warning("Skipping %s: %s", rel_path, e)
+            continue
+        if old_content == new_content and rel_path not in renames:
+            continue
+        diffs[rel_path] = FileDiff(
+            file_path=rel_path,
+            old_content=old_content,
+            new_content=new_content,
+            spec=spec,
+            analysis=analyze_diff(rel_path, old_content, new_content, spec),
+        )
+    return diffs, renames
+
+
 def analyze_git_diff(
     repo_path: str,
     base_commit: Optional[str] = None,
@@ -657,14 +736,14 @@ class IncrementalUpdater:
         self.graph = graph
         self.config = config
 
-    def _bounded_callers(self, seeds: set[str], max_hops: int) -> set[str]:
+    def _bounded_callers(self, seeds: set[str], max_hops: int) -> dict[str, int]:
         """Dependents reachable from seeds within max_hops via REL_CALLS or
         REL_IMPLEMENTS predecessors (excludes the seeds themselves).
 
-        Both edges mean "this component depends on the changed one": callers
-        must follow API changes, and subclasses/implementors must follow base
-        class / interface changes."""
-        affected: set[str] = set()
+        Returns node id -> BFS depth. Both edge kinds mean "this component
+        depends on the changed one": callers must follow API changes, and
+        subclasses/implementors must follow base class / interface changes."""
+        affected: dict[str, int] = {}
         frontier: list[tuple[str, int]] = [(s, 0) for s in seeds]
         visited: set[str] = set(seeds)
 
@@ -683,9 +762,34 @@ class IncrementalUpdater:
                 ):
                     continue
                 visited.add(pred)
-                affected.add(pred)
+                affected[pred] = depth + 1
                 frontier.append((pred, depth + 1))
         return affected
+
+    def _importance(self, component_id: str) -> int:
+        """Ranking proxy for propagation: how many components depend on it."""
+        try:
+            return len(self.graph.predecessors(component_id))
+        except Exception:
+            return 0
+
+    def _apply_propagation_budget(
+        self, propagated: dict[str, int]
+    ) -> tuple[dict[str, int], int]:
+        """Cap propagated callers by distance, then fan-in (centrality).
+
+        High fan-in repos (gson: one deleted class) used to pull in dozens of
+        caller docs; the budget keeps updates predictable and the skipped
+        count is reported instead of silently truncating."""
+        budget = int(getattr(self.config, "max_impact_docs", 0) or 0)
+        if not budget or len(propagated) <= budget:
+            return propagated, 0
+        ranked = sorted(
+            propagated.items(),
+            key=lambda item: (item[1], -self._importance(item[0]), item[0]),
+        )
+        kept = {cid: depth for cid, depth in ranked[:budget]}
+        return kept, len(propagated) - len(kept)
 
     def compute_layered_impact(
         self,
@@ -722,9 +826,13 @@ class IncrementalUpdater:
         # graph, so these arrive as explicit extra seeds.
         extra_seeds = set(caller_seeds or set())
         seeds = list(set(seeds) | extra_seeds)
-        layer1 = self._bounded_callers(set(seeds), max_hops) if seeds else set()
+        propagated = (
+            self._bounded_callers(set(seeds), max_hops) if seeds else {}
+        )
+        propagated, skipped = self._apply_propagation_budget(propagated)
+        layer1 = set(propagated)
         # ...and they are affected themselves: their docs describe a component
-        # that no longer exists.
+        # that no longer exists (not subject to the propagation budget).
         layer1 |= {c for c in extra_seeds if self.graph.has_node(c)}
         layer1 -= set(layer0)
 
@@ -746,6 +854,10 @@ class IncrementalUpdater:
             "modules_to_doc": modules_to_doc,
             "update_overview": update_overview,
             "total_components": len(components_to_doc),
+            "callers_skipped": skipped,
+            "max_impact_docs": int(
+                getattr(self.config, "max_impact_docs", 0) or 0
+            ),
         }
 
 
@@ -889,6 +1001,45 @@ def _mark_doc_stale(
                 stale=stale,
             )
         )
+
+
+def _edited_doc_targets(
+    graph: HeterogeneousGraph, docs_dir: str
+) -> tuple[set[str], set[str], bool]:
+    """Docs whose file no longer matches the graph snapshot.
+
+    Only used by `--force`: without a code change there is nothing to
+    schedule, but the user explicitly asked to overwrite manual edits."""
+    components: set[str] = set()
+    modules: set[str] = set()
+    overview = False
+    for source, target, _rt, _w in graph.edges(REL_DESCRIBES):
+        node = graph.get_node(source)
+        if not isinstance(node, DocNode) or not node.file_path:
+            continue
+        content = _safe_read(node.file_path)
+        if not content:
+            continue
+        if node.content_hash:
+            edited = node.content_hash != content_hash(content)
+        else:
+            edited = (node.content or "") != content
+        if not edited:
+            continue
+        described = graph.get_node(target)
+        if isinstance(described, ModuleNode):
+            modules.add(target)
+        else:
+            components.add(target)
+    ov = graph.get_node("overview")
+    if isinstance(ov, DocNode) and ov.file_path:
+        content = _safe_read(ov.file_path)
+        if content:
+            if ov.content_hash:
+                overview = ov.content_hash != content_hash(content)
+            else:
+                overview = (ov.content or "") != content
+    return components, modules, overview
 
 
 def _stale_doc_targets(
@@ -1328,17 +1479,19 @@ async def run_update(
     metadata_path = os.path.join(data_dir, f"{project_name}_metadata.json")
 
     # Auto-detect base_commit from metadata if not provided
+    explicit_base = base_commit is not None
     stored_commit = None
+    metadata: dict = {}
+    previous_snapshot: dict = {}
     if os.path.exists(metadata_path):
         try:
-            metadata = file_manager.load_json(metadata_path)
-            stored_commit = (metadata or {}).get("generation_info", {}).get(
-                "git_commit"
-            )
+            metadata = file_manager.load_json(metadata_path) or {}
+            stored_commit = metadata.get("generation_info", {}).get("git_commit")
+            previous_snapshot = metadata.get("working_tree") or {}
             if stored_commit:
                 print(f"Found previous commit from metadata: {stored_commit[:8]}")
         except Exception:
-            pass
+            metadata = {}
 
     if not base_commit and stored_commit:
         base_commit = stored_commit
@@ -1348,16 +1501,54 @@ async def run_update(
     if current_commit:
         print(f"Current commit: {current_commit[:8]}")
 
+    # Pending docs are retried even when the code did not change.
+    pending_updates = _load_pending_updates(config, project_name)
+    if not _pending_is_empty(pending_updates):
+        print(
+            f"Resuming {len(pending_updates['components'])} component + "
+            f"{len(pending_updates['modules'])} module pending doc update(s) "
+            "from a previous run"
+        )
+
+    def _no_changes() -> dict:
+        print("No changes detected")
+        return {"status": "no_changes", "impact": None}
+
     # --- Stage 1: change analysis ---
+    # Preferred path: diff the working tree against the snapshot recorded by
+    # the last successful run (idempotent for uncommitted work, reverts
+    # converge). Git diff remains the fallback (explicit --base-commit,
+    # explicit file list, legacy metadata) and for rename detection.
     diffs: dict[str, FileDiff] = {}
     renames: dict[str, str] = {}
     doc_diffs: dict[str, FileDiff] = {}
-    if analyze_changes and not changed_files:
+    use_snapshot = (
+        analyze_changes
+        and not changed_files
+        and not explicit_base
+        and bool(previous_snapshot.get("files"))
+    )
+    if use_snapshot:
+        print("\nComparing working tree with the last update snapshot...")
+        diffs, renames = _analyze_worktree_snapshot(config, previous_snapshot)
+        if (
+            not diffs
+            and _pending_is_empty(pending_updates)
+            and not force
+        ):
+            return _no_changes()
+        doc_diffs = filter_important_changes(diffs)
+        if doc_diffs:
+            print(f"\nFiles with important changes: {len(doc_diffs)}")
+    elif analyze_changes and not changed_files:
         print("\nAnalyzing git changes...")
         diffs, renames = analyze_git_diff(config.repo_path, base_commit, include_tests)
-        if not diffs:
-            print("No changes detected")
-            return {"status": "no_changes", "impact": None}
+        if (
+            not diffs
+            and _pending_is_empty(pending_updates)
+            and not force
+        ):
+            return _no_changes()
 
         doc_diffs = filter_important_changes(diffs)
         if doc_diffs:
@@ -1372,7 +1563,9 @@ async def run_update(
                 continue
             old_path = renames.get(f, f)
             try:
-                old_content = _git_show(config.repo_path, old_path, base_commit)
+                old_content = _old_content_for(
+                    config, old_path, base_commit, previous_snapshot
+                )
                 new_content = _read_working_tree(config.repo_path, f)
             except (GitError, OSError) as e:
                 logger.warning("Skipping %s: %s", f, e)
@@ -1386,18 +1579,24 @@ async def run_update(
                 spec=spec,
                 analysis=analyze_diff(f, old_content, new_content, spec),
             )
-        if not diffs:
-            print("No changed files to process")
-            return {"status": "no_changes", "impact": None}
+        if (
+            not diffs
+            and _pending_is_empty(pending_updates)
+            and not force
+        ):
+            return _no_changes()
         doc_diffs = diffs
     else:
         print("Detecting changed files via git...")
         diffs, renames = analyze_git_diff(
             config.repo_path, base_commit, include_tests
         )
-        if not diffs:
-            print("No changed files to process")
-            return {"status": "no_changes", "impact": None}
+        if (
+            not diffs
+            and _pending_is_empty(pending_updates)
+            and not force
+        ):
+            return _no_changes()
         doc_diffs = diffs
 
     # --- Stage 2: load graph + mutate it ---
@@ -1424,16 +1623,6 @@ async def run_update(
         for nid, attrs in graph.nodes(data=True)
         if attrs.get("node_type") == "module"
     }
-
-    # Docs left unfinished by a previous (crashed/partial) run stay on the
-    # schedule even when this run sees no new important changes.
-    pending_updates = _load_pending_updates(config, project_name)
-    if not _pending_is_empty(pending_updates):
-        print(
-            f"Resuming {len(pending_updates['components'])} component + "
-            f"{len(pending_updates['modules'])} module pending doc update(s) "
-            "from a previous run"
-        )
 
     pre_mutation_modules = _collect_component_modules(
         graph_to_module_tree(graph)
@@ -1582,6 +1771,7 @@ async def run_update(
         not doc_diffs
         and not renamed_pairs
         and _pending_is_empty(pending_updates)
+        and not force
     ):
         print(
             "\nNo important API changes detected — documentation update not "
@@ -1670,6 +1860,27 @@ async def run_update(
     if stale_overview or stale_modules or stale_component_modules:
         impact["update_overview"] = True
 
+    # --force: even without code changes, overwrite docs edited by hand.
+    if force:
+        edited_components, edited_modules, edited_overview = (
+            _edited_doc_targets(graph, config.docs_dir)
+        )
+        impact["components_to_doc"] = sorted(
+            set(impact["components_to_doc"]) | edited_components
+        )
+        edited_component_modules = {
+            m
+            for cid in edited_components
+            for m in component_module_ids(graph, cid)
+        }
+        impact["modules_to_doc"] = sorted(
+            set(impact["modules_to_doc"])
+            | edited_modules
+            | edited_component_modules
+        )
+        if edited_overview or edited_modules or edited_component_modules:
+            impact["update_overview"] = True
+
     # Unfinished docs from a previous run: resume them (skip ids whose
     # component no longer exists — its doc was already cleaned up).
     pending_components = [
@@ -1692,6 +1903,12 @@ async def run_update(
     print(f"  Changed components: {len(impact['changed_components'])}")
     if impact["caller_components"]:
         print(f"  Affected callers: {len(impact['caller_components'])}")
+    if impact.get("callers_skipped"):
+        print(
+            f"  Propagation budget reached: {impact['callers_skipped']} "
+            f"reachable caller doc(s) skipped "
+            f"(REPODOC_MAX_IMPACT_DOCS={impact['max_impact_docs']})"
+        )
     print(f"  Components to document: {len(impact['components_to_doc'])}")
     print(f"  Modules to update: {len(impact['modules_to_doc'])}")
     if impact["update_overview"]:
@@ -1866,9 +2083,13 @@ async def run_update(
         node = pipeline.components.get(node_id)
         if not node:
             return None
-        if existing_doc and not force and _user_edited_doc(
+        # A manual edit is usually left alone; --force discards it by doing a
+        # FULL regeneration (the old text is not used as a format anchor, so
+        # hand-written sections/comments do not survive).
+        edited = bool(existing_doc) and _user_edited_doc(
             graph, pipeline, doc_path, existing_doc
-        ):
+        )
+        if edited and not force:
             print(
                 f"  SKIP {os.path.relpath(doc_path, docs_dir)}: "
                 "manually edited since last update "
@@ -1895,7 +2116,7 @@ async def run_update(
             "depends_on": sorted(component_dependencies(node)),
         }
 
-        if should_partial_update(existing_doc, code_diff):
+        if not edited and should_partial_update(existing_doc, code_diff):
             return await pipeline.agent.execute(
                 {
                     "type": "write_doc",
@@ -1955,9 +2176,10 @@ async def run_update(
         async def _update_module(job):
             module_id, module_name, module_info, doc_path = job
             existing_doc = _safe_read(doc_path)
-            if existing_doc and not force and _user_edited_doc(
+            edited = bool(existing_doc) and _user_edited_doc(
                 graph, pipeline, doc_path, existing_doc
-            ):
+            )
+            if edited and not force:
                 print(
                     f"  SKIP {os.path.relpath(doc_path, docs_dir)}: "
                     "manually edited since last update "
@@ -1996,7 +2218,7 @@ async def run_update(
             path_parts = module_id.split("/")
             parent_module = path_parts[-2] if len(path_parts) > 1 else ""
 
-            if should_partial_update(existing_doc, ""):
+            if not edited and should_partial_update(existing_doc, ""):
                 return await pipeline.agent.execute(
                     {
                         "type": "write_doc",
@@ -2055,9 +2277,10 @@ async def run_update(
         print("\nUpdating README overview...")
         readme_path = os.path.join(docs_dir, "README.md")
         existing_doc = _safe_read(readme_path)
-        if existing_doc and not force and _user_edited_doc(
+        overview_edited = bool(existing_doc) and _user_edited_doc(
             graph, pipeline, readme_path, existing_doc
-        ):
+        )
+        if overview_edited and not force:
             print(
                 f"  SKIP {os.path.relpath(readme_path, docs_dir)}: "
                 "manually edited since last update "
@@ -2096,7 +2319,7 @@ async def run_update(
                 "output_path": readme_path,
             }
             try:
-                if should_partial_update(existing_doc, ""):
+                if not overview_edited and should_partial_update(existing_doc, ""):
                     overview_result = await pipeline.agent.execute(
                         {"type": "write_doc", "config": config, "input": overview_input}
                     )
@@ -2252,32 +2475,38 @@ async def run_update(
         },
     )
 
-    if os.path.exists(metadata_path):
-        try:
-            metadata = file_manager.load_json(metadata_path)
-            if metadata:
-                if "generation_info" not in metadata:
-                    metadata["generation_info"] = {}
-                if "update_info" not in metadata:
-                    metadata["update_info"] = {}
-                # The watermark advances ONLY when no doc is left pending:
-                # otherwise the next run must resync from the old base.
-                if current_commit and not pending_after:
-                    metadata["generation_info"]["git_commit"] = current_commit
-                    metadata["update_info"]["last_update_commit"] = current_commit
-                metadata["update_info"]["last_attempt_commit"] = current_commit
-                metadata["update_info"]["last_base_commit"] = base_commit
-                metadata["update_info"]["components_updated"] = success_count
-                metadata["update_info"]["affected_components"] = impact[
-                    "components_to_doc"
-                ]
-                metadata["update_info"]["pending_docs"] = (
-                    remaining_pending if pending_after else {}
-                )
-                metadata["generation_info"]["timestamp"] = datetime.now().isoformat()
-                file_manager.save_json(metadata, metadata_path)
-        except Exception as e:
-            print(f"Warning: Could not update metadata: {e}")
+    try:
+        metadata = file_manager.load_json(metadata_path) or {}
+        metadata.setdefault("generation_info", {})
+        metadata.setdefault("update_info", {})
+        # The watermark advances ONLY when no doc is left pending: otherwise
+        # the next run must resync from the old base.
+        if current_commit and not pending_after:
+            metadata["generation_info"]["git_commit"] = current_commit
+            metadata["update_info"]["last_update_commit"] = current_commit
+        metadata["update_info"]["last_attempt_commit"] = current_commit
+        metadata["update_info"]["last_base_commit"] = base_commit
+        metadata["update_info"]["components_updated"] = success_count
+        metadata["update_info"]["affected_components"] = impact[
+            "components_to_doc"
+        ]
+        metadata["update_info"]["pending_docs"] = (
+            remaining_pending if pending_after else {}
+        )
+        metadata["update_info"]["callers_skipped"] = impact.get(
+            "callers_skipped", 0
+        )
+        if not pending_after:
+            # Snapshot the exact working tree that was analyzed so the next
+            # update is a no-op until something really changes (and so
+            # reverts are detected instead of silently kept).
+            from repodoc.worktree import record_worktree_snapshot
+
+            record_worktree_snapshot(metadata, config)
+        metadata["generation_info"]["timestamp"] = datetime.now().isoformat()
+        file_manager.save_json(metadata, metadata_path)
+    except Exception as e:
+        print(f"Warning: Could not update metadata: {e}")
 
     print("\nDocumentation update complete!")
     return {

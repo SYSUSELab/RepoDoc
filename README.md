@@ -30,10 +30,19 @@ options:
                          dependents, then type; 0 = no cap)
 ```
 
+When the knowledge graph already exists, explicit `--max-docs`/`--doc-types`
+re-cluster it from the in-graph components (rebuilding the module tree)
+instead of being silently ignored.
+
 `repodoc update` works in four stages:
 
-1. **Change analysis** — git diff (old commit vs working tree, incl. deleted and
-   untracked files) is re-analyzed per file; changes are classified by severity
+1. **Change analysis** — the working tree is compared against a snapshot
+   recorded by the last successful analyze/generate/update (per-file hashes
+   plus the text of dirty files); git diff remains the fallback for explicit
+   `--base-commit`/file lists and for rename detection. Re-running on an
+   unchanged tree is a no-op even with uncommitted changes, and reverting a
+   change syncs the graph back. Changes are re-analyzed per file and
+   classified by severity
    and keyed by exact component id (methods included). Files outside the
    generation include/ignore rules are skipped, and an unreadable or empty file
    is never mistaken for a deletion. Reference resolution is scope- and
@@ -58,7 +67,9 @@ options:
 3. **Layered impact** — changes propagate over calls/implements/uses/
    instantiates edges to affected callers, subclasses and type users (bounded
    by `--max-hops`, gated by severity), then to module docs and the README
-   overview.
+   overview. Propagated caller docs are capped by a default budget of 60
+   (ranked by distance, then fan-in; `REPODOC_MAX_IMPACT_DOCS=0` disables the
+   cap); skipped callers are reported instead of being silently dropped.
 4. **Doc update** — existing docs are updated minimally (old doc embedded as
    the format anchor; only affected sections change). Docs you edited by hand
    are skipped with a warning (`--force` overwrites them); removed components
@@ -100,4 +111,6 @@ Create `.env`:
 LLM_BASE_URL=<endpoint>
 LLM_API_KEY=<key>
 MAIN_MODEL=<model>
+# optional: cap propagated caller docs per update (default 60, 0 = unlimited)
+REPODOC_MAX_IMPACT_DOCS=60
 ```

@@ -66,6 +66,10 @@ def make_config(
     doc_types: str = "",
     max_docs: int = 0,
 ) -> Config:
+    try:
+        max_impact_docs = int(os.getenv("REPODOC_MAX_IMPACT_DOCS", "60") or 60)
+    except ValueError:
+        max_impact_docs = 60
     extra_headers: dict[str, str] = {}
     headers_env = os.getenv("LLM_EXTRA_HEADERS", "").strip()
     if headers_env:
@@ -93,6 +97,7 @@ def make_config(
         max_file_size=max_file_size or MAX_SOURCE_FILE_BYTES,
         doc_types=[t.strip() for t in doc_types.split(",") if t.strip()],
         max_docs=max_docs,
+        max_impact_docs=max_impact_docs,
     )
 
 
@@ -121,15 +126,94 @@ def _build_and_save_graph(
     graph.save(kg_path)
 
 
-def _ensure_knowledge_graph(config: Config, data_dir: str, project_name: str) -> bool:
+def _rescope_graph(config: Config, kg_path: str, tree_path: str) -> bool:
+    """Re-cluster an existing graph under the current doc scope.
+
+    `--max-docs` / `--doc-types` are clustering-scope options; with an
+    existing graph they used to be silently ignored. Rebuilding the module
+    tree from the in-graph components makes them effective without re-parsing
+    the repository. Returns True when the scope actually changed."""
+    from repodoc.graph.builder import (
+        _build_graph_from_components,
+        _get_leaf_nodes,
+        attach_module_tree_to_graph,
+        graph_to_components,
+        graph_to_module_tree,
+    )
+    from repodoc.graph.graph import HeterogeneousGraph
+    from repodoc.agent.generate import _collect_component_modules
+
+    graph = HeterogeneousGraph.load(kg_path)
+    components = graph_to_components(graph)
+    dep_graph = _build_graph_from_components(components)
+    leaf_nodes = _get_leaf_nodes(dep_graph, components, config)
+    wanted = {
+        cid
+        for cid in leaf_nodes
+        if cid in components and not components[cid].name.startswith("_")
+    }
+    existing = set(_collect_component_modules(graph_to_module_tree(graph)))
+    if existing == wanted:
+        return False
+
+    # Drop the previous module layer (module nodes + their edges); code nodes
+    # and their edges stay untouched.
+    for nid, attrs in list(graph.nodes(data=True)):
+        if attrs.get("node_type") == "module":
+            graph.remove_node(nid)
+    module_tree = cluster_modules(leaf_nodes, components, config)
+    file_manager.save_json(module_tree, tree_path)
+    attach_module_tree_to_graph(graph, module_tree, components)
+    graph.save(kg_path)
+    stats = module_tree_stats(module_tree)
+    click.echo(
+        f"  Re-scoped documentation: {len(wanted)} components, "
+        f"{stats['modules']} modules (max-docs={config.max_docs or '∞'}, "
+        f"doc-types={','.join(config.doc_types) or 'auto'})"
+    )
+    return True
+
+
+def _record_analysis_snapshot(
+    config: Config, data_dir: str, project_name: str
+) -> None:
+    """Record the analyzed working tree so the next update is a no-op until
+    something actually changes (uncommitted changes included)."""
+    from repodoc.worktree import get_head_commit, record_worktree_snapshot
+
+    path = os.path.join(data_dir, f"{project_name}_metadata.json")
+    metadata = file_manager.load_json(path) or {}
+    metadata.setdefault("generation_info", {})
+    commit = get_head_commit(config.repo_path)
+    if commit:
+        metadata["generation_info"]["git_commit"] = commit
+    record_worktree_snapshot(metadata, config)
+    file_manager.save_json(metadata, path)
+
+
+def _ensure_knowledge_graph(
+    config: Config,
+    data_dir: str,
+    project_name: str,
+    rescope: bool = False,
+) -> bool:
     """Prepare the analysis inputs for doc generation.
 
     Returns True when the knowledge graph already exists (doc generation
     restores components + module tree from it, skipping analysis/clustering).
     Otherwise runs analysis + clustering, persists the module tree and the
-    knowledge graph, and returns False."""
+    knowledge graph, and returns False.
+
+    `rescope=True` (explicit --max-docs/--doc-types) rebuilds the module tree
+    of an existing graph so the options are not silently ignored."""
     kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
     if os.path.exists(kg_path):
+        if rescope:
+            _rescope_graph(
+                config,
+                kg_path,
+                os.path.join(data_dir, f"{project_name}_module_tree.json"),
+            )
         return True
 
     file_manager.ensure_directory(data_dir)
@@ -241,6 +325,9 @@ def analyze(
             _build_and_save_graph(components, module_tree, data_dir, project_name)
             kg_path = os.path.join(data_dir, f"{project_name}_knowledge_graph.json")
             click.echo(f"Knowledge graph updated with module structure: {kg_path}")
+        # Snapshot the analyzed tree (uncommitted changes included): the next
+        # `update` compares against it instead of re-processing git state.
+        _record_analysis_snapshot(config, data_dir, project_name)
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         raise click.Abort()
@@ -296,7 +383,14 @@ def docs(
         # The knowledge graph is the single required input: when it exists
         # (produced by `repodoc analyze`), doc generation restores everything
         # from the graph alone and skips re-analysis/clustering entirely.
-        _ensure_knowledge_graph(config, data_dir, project_name)
+        # Explicit doc-scope options re-cluster the graph (they would
+        # otherwise be silently ignored).
+        _ensure_knowledge_graph(
+            config,
+            data_dir,
+            project_name,
+            rescope=bool(doc_types or max_docs),
+        )
 
         results = run_pipeline(config, generate_docs=True)
         click.echo(f"Documentation generated: {results['docs_directory']}")
@@ -354,8 +448,14 @@ def generate(
     data_dir = os.path.join(output_dir, "data")
     try:
         # Identical to `analyze` + `docs`: when the knowledge graph already
-        # exists this skips analysis/clustering entirely (no wasted LLM calls).
-        graph_existed = _ensure_knowledge_graph(config, data_dir, project_name)
+        # exists this skips analysis/clustering entirely (no wasted LLM calls),
+        # unless explicit doc-scope options ask for a different scope.
+        graph_existed = _ensure_knowledge_graph(
+            config,
+            data_dir,
+            project_name,
+            rescope=bool(doc_types or max_docs),
+        )
         if graph_existed:
             click.echo("Knowledge graph found; skipping analysis/clustering.")
 
