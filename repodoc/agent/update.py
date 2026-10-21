@@ -354,6 +354,20 @@ def analyze_diff(
             )
             continue
 
+        if (old_node.entry_point or "") != (new_node.entry_point or ""):
+            analysis.changes.append(
+                ComponentChange(
+                    name=new_node.name,
+                    component_id=cid,
+                    change_type=ChangeType.API_SIGNATURE_CHANGED,
+                    file_path=file_path,
+                    old_signature=old_node.entry_point or "",
+                    new_signature=new_node.entry_point or "",
+                    details="Entry point (route/command) changed",
+                )
+            )
+            continue
+
         old_params = old_node.parameters or []
         new_params = new_node.parameters or []
 
@@ -2209,6 +2223,7 @@ async def run_update(
             "docstring": node.docstring,
             "source_code": node.source_code or "",
             "depends_on": sorted(component_dependencies(node)),
+            "entry_point": node.entry_point,
         }
 
         if not edited and should_partial_update(existing_doc, code_diff):
@@ -2421,6 +2436,13 @@ async def run_update(
                     m: sorted(ds) for m, ds in top_level_deps.items()
                 },
                 "module_diagram": module_diagram,
+                "entry_points": sorted(
+                    {
+                        c.entry_point
+                        for c in pipeline.components.values()
+                        if c.entry_point
+                    }
+                )[:20],
                 "module_docs_summary": module_docs_summary,
                 "existing_doc": existing_doc,
                 "output_path": readme_path,
@@ -2442,6 +2464,7 @@ async def run_update(
                                 "module_count": overview_input["module_count"],
                                 "module_dependencies": overview_input["module_dependencies"],
                                 "module_diagram": module_diagram,
+                                "entry_points": overview_input["entry_points"],
                                 "module_docs_summary": overview_input["module_docs_summary"],
                                 "output_path": readme_path,
                             },

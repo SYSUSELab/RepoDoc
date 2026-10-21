@@ -33,6 +33,7 @@ class GoASTAnalyzer(BaseAnalyzer):
         super().__init__(file_path, content, repo_path)
         self.current_package = "main"
         self.current_struct = None
+        self._entry_points: dict[str, str] = {}
 
         try:
             self.parser = _get_go_parser()
@@ -56,6 +57,10 @@ class GoASTAnalyzer(BaseAnalyzer):
             self._extract_imports(root_node)
             self._extract_functions_and_methods(root_node)
             self._extract_calls(root_node)
+            for node in self.nodes:
+                entry = self._entry_points.get(node.name)
+                if entry:
+                    node.entry_point = entry
         except Exception as e:
             logger.error(
                 f"Error analyzing Go file {self.file_path}: {e}", exc_info=True
@@ -385,10 +390,53 @@ class GoASTAnalyzer(BaseAnalyzer):
         if not func_name:
             return
 
+        self._register_entry_point(node, func_name)
         caller_id = self._find_current_function(node)
 
         if caller_id:
             self._add_relationship(caller=caller_id, callee=func_name, call_line=line)
+
+    _ENTRY_HANDLERS = {
+        "HandleFunc": "HTTP handler",
+        "Handle": "HTTP handler",
+        "GET": "HTTP GET",
+        "POST": "HTTP POST",
+        "PUT": "HTTP PUT",
+        "DELETE": "HTTP DELETE",
+        "PATCH": "HTTP PATCH",
+        "Any": "HTTP ANY",
+    }
+
+    def _register_entry_point(self, node, func_name: str) -> None:
+        """Register ServeMux/Gin-style handler registrations."""
+        simple = func_name.split(".")[-1]
+        label = self._ENTRY_HANDLERS.get(simple)
+        if label is None:
+            return
+        args = node.child_by_field_name("arguments")
+        if args is None:
+            return
+        values = [
+            c for c in args.children if c.type not in ("(", ")", ",")
+        ]
+        if len(values) < 2:
+            return
+        path_node, handler = values[0], values[1]
+        if path_node.type not in (
+            "interpreted_string_literal",
+            "raw_string_literal",
+        ):
+            return
+        path = self._literal_content(path_node)
+        if not path:
+            return
+        if handler.type == "identifier":
+            name = self._get_node_text(handler)
+        elif handler.type == "selector_expression":
+            name = self._get_node_text(handler).split(".")[-1]
+        else:
+            return
+        self._entry_points[name] = f"{label} {path}"
 
     def _extract_selector_call(self, node) -> None:
         """Extract a selector expression call (e.g., obj.Method())."""

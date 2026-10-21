@@ -662,6 +662,13 @@ class DocPipeline:
         )
 
         module_count = len(module_structure)
+        entry_points = sorted(
+            {
+                c.entry_point
+                for c in self.components.values()
+                if c.entry_point
+            }
+        )[:20]
         result = await self.agent.execute(
             {
                 "type": "write_doc",
@@ -675,6 +682,7 @@ class DocPipeline:
                         m: sorted(ds) for m, ds in module_deps.items()
                     },
                     "module_diagram": module_diagram,
+                    "entry_points": entry_points,
                     "module_docs_summary": module_docs_summary,
                     "output_path": output_path
                     or os.path.join(self.config.docs_dir, "README.md"),
@@ -926,6 +934,7 @@ class DocPipeline:
             "docstring": node.docstring,
             "source_code": node.source_code or "",
             "depends_on": sorted(component_dependencies(node)),
+            "entry_point": node.entry_point,
         }
 
         result = await self.agent.execute(

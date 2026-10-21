@@ -171,6 +171,7 @@ class DocAgent:
                 f"### {name}\n{content}" for name, content in module_docs_summary.items()
             ),
             module_diagram=input_data.get("module_diagram", ""),
+            entry_points=input_data.get("entry_points", []),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -193,6 +194,7 @@ class DocAgent:
             dependencies=list(component.get("depends_on", set())),
             predecessors=list(predecessors),
             module_name=module_name,
+            entry_point=component.get("entry_point") or "",
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -245,6 +247,7 @@ class DocAgent:
             module_name=module_name,
             existing_doc=input_data.get("existing_doc", ""),
             code_diff=input_data.get("code_diff", ""),
+            entry_point=component.get("entry_point") or "",
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)
@@ -294,6 +297,7 @@ class DocAgent:
             ),
             existing_doc=input_data.get("existing_doc", ""),
             module_diagram=input_data.get("module_diagram", ""),
+            entry_points=input_data.get("entry_points", []),
         )
 
         result = await self._call_llm(llm_tool, system_prompt, user_prompt)

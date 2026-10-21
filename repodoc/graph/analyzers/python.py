@@ -135,6 +135,7 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
                 end_line=node.end_lineno,
                 docstring=ast.get_docstring(node) or "",
                 parameters=[arg.arg for arg in node.args.args],
+                entry_point=self._entry_point(node),
             )
             if self._should_include_function(func_node):
                 self.nodes.append(func_node)
@@ -148,6 +149,43 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
         if func.name.startswith("test_") or func.name.endswith("_test"):
             return False
         return True
+
+    def _decorator_name(self, decorator) -> str:
+        node = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            parts: list[str] = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            return ".".join(reversed(parts))
+        return ""
+
+    def _entry_point(self, node: ast.AST) -> Optional[str]:
+        """Route/command decorators become first-class entry-point metadata."""
+        for decorator in getattr(node, "decorator_list", []):
+            name = self._decorator_name(decorator)
+            simple = name.split(".")[-1].lower()
+            if simple in ("command", "group") and "click" in name.lower():
+                return "CLI command"
+            if simple not in (
+                "route", "get", "post", "put", "delete", "patch", "websocket"
+            ):
+                continue
+            path = None
+            if isinstance(decorator, ast.Call):
+                for arg in decorator.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        path = arg.value
+                        break
+            if path:
+                method = "ROUTE" if simple == "route" else simple.upper()
+                return f"HTTP {method} {path}"
+        return None
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         self._process_function_node(node)

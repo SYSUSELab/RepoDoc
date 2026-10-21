@@ -42,6 +42,7 @@ Component: {component_name}
 Type: {component_type}
 File: {file_path}
 Belongs to module: {module_name}
+Entry point: {entry_point}
 
 {component_context}
 
@@ -88,6 +89,7 @@ def format_component_prompt(
     predecessors: list[str],
     module_name: str,
     component_context: str = "",
+    entry_point: str = "",
 ) -> tuple[str, str]:
     user_prompt = COMPONENT_USER_PROMPT.format(
         component_name=component_name,
@@ -99,6 +101,7 @@ def format_component_prompt(
         predecessors=", ".join(predecessors) if predecessors else "None",
         module_name=module_name,
         component_context=component_context,
+        entry_point=entry_point or "None",
     )
     return _guarded(COMPONENT_SYSTEM_PROMPT), user_prompt
 
@@ -206,6 +209,9 @@ Modules: {module_count}
 ## Module dependency map (module -> modules it depends on)
 {module_dependencies}
 
+## Entry points (routes / commands / handlers)
+{entry_points}
+
 ## Module docs (actual content, one section per module)
 {module_docs_summary}
 
@@ -235,6 +241,7 @@ def format_overview_prompt(
     module_dependencies: dict[str, list[str]],
     module_docs_summary: str,
     module_diagram: str = "",
+    entry_points: list[str] | None = None,
 ) -> tuple[str, str]:
     deps_str = "\n".join(
         f"- {m} -> {', '.join(ds) if ds else '(none)'}"
@@ -245,6 +252,7 @@ def format_overview_prompt(
         component_count=component_count,
         module_count=module_count,
         module_dependencies=deps_str or "None",
+        entry_points="\n".join(f"- {e}" for e in entry_points or []) or "None",
         module_docs_summary=module_docs_summary or "No module docs available",
         module_diagram=module_diagram or "(no module graph available)",
     )
@@ -296,6 +304,7 @@ Component: {component_name}
 Type: {component_type}
 File: {file_path}
 Belongs to module: {module_name}
+Entry point: {entry_point}
 
 Calls: {dependencies}
 Called by: {predecessors}
@@ -342,6 +351,9 @@ Modules: {module_count}
 ## Module dependency map (module -> modules it depends on)
 {module_dependencies}
 
+## Entry points (routes / commands / handlers)
+{entry_points}
+
 ## Architecture diagram (keep this EXACT block in the document)
 {module_diagram}
 
@@ -360,6 +372,7 @@ def format_component_update_prompt(
     module_name: str,
     existing_doc: str,
     code_diff: str,
+    entry_point: str = "",
 ) -> tuple[str, str]:
     user_prompt = COMPONENT_UPDATE_USER_PROMPT.format(
         component_name=component_name,
@@ -368,6 +381,7 @@ def format_component_update_prompt(
         component_type=component_type,
         file_path=file_path,
         module_name=module_name,
+        entry_point=entry_point or "None",
         dependencies=", ".join(dependencies) if dependencies else "None",
         predecessors=", ".join(predecessors) if predecessors else "None",
         source_code=source_code[:24000],
@@ -417,6 +431,7 @@ def format_overview_update_prompt(
     module_docs_summary: str,
     existing_doc: str,
     module_diagram: str = "",
+    entry_points: list[str] | None = None,
 ) -> tuple[str, str]:
     deps_str = "\n".join(
         f"- {m} -> {', '.join(ds) if ds else '(none)'}"
@@ -428,6 +443,7 @@ def format_overview_update_prompt(
         component_count=component_count,
         module_count=module_count,
         module_dependencies=deps_str or "None",
+        entry_points="\n".join(f"- {e}" for e in entry_points or []) or "None",
         module_docs_summary=module_docs_summary or "No module docs available",
         module_diagram=module_diagram or "(no module graph available)",
     )

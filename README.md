@@ -67,6 +67,9 @@ instead of being silently ignored.
    by source similarity so their docs migrate instead of being deleted; method
    changes update the owning class doc (Python method signatures are part of
    the class API), while methods stay out of the documentation targets.
+   Route/CLI/handler decorators (Flask/FastAPI/Spring/click, Go ServeMux/Gin,
+   Express) are captured as entry-point metadata; changing a route or command
+   is treated as a severe API change.
 3. **Layered impact** — changes propagate over calls/implements/uses/
    instantiates edges to affected callers, subclasses and type users (bounded
    by `--max-hops`, gated by severity), then to module docs and the README
@@ -87,8 +90,10 @@ the metadata only advances once nothing is pending, so the next
 Generation is also guarded: empty or truncated LLM outputs (unbalanced code
 fences) are rejected instead of written as zero-byte docs, all doc writes are
 confined to the docs directory, the README's module diagram is generated from
-the knowledge graph and enforced verbatim, module/README docs get deterministic
-navigation links to every child/member doc, doc snapshots in the graph store a
+the knowledge graph and enforced verbatim, entry points (routes/commands/
+handlers) are fed into component docs and the README's core flows,
+module/README docs get deterministic navigation links to every child/member
+doc, doc snapshots in the graph store a
 content hash instead of the full text (manual-edit detection works on the
 hash), and generated stats land in `metadata.doc_generation`. Graph JSON carries
 a schema version: legacy graphs load with defaults, newer versions are rejected. Link validation resolves targets relative to the

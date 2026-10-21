@@ -102,6 +102,9 @@ class Node(BaseModel):
     # Containing class component id for methods (e.g. "pkg.mod.User"): a
     # method change updates the class doc and propagates from the method.
     owner: Optional[str] = None
+    # External entry point served by this component, e.g. "HTTP GET /users"
+    # (web routes/handlers) or "CLI command" (click/framework commands).
+    entry_point: Optional[str] = None
 
 
 class CallRelationship(BaseModel):
@@ -147,6 +150,8 @@ class CodeNode(BaseModel):
     receiver: Optional[str] = None  # Go/Rust method receiver type
     # Containing class component id for method nodes (doc target mapping).
     owner: Optional[str] = None
+    # External entry point served by this component (route/command/handler).
+    entry_point: Optional[str] = None
 
 
 class DocNode(BaseModel):

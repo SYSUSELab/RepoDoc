@@ -1,7 +1,7 @@
 """Java analyzer using tree-sitter-java."""
 
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from tree_sitter import Parser, Language
 import tree_sitter_java
@@ -65,6 +65,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
         node_name = None
         parameters_for_node = None
         owner_for_node = None
+        entry_point_for_node = None
 
         if node.type == "class_declaration":
             is_abstract = any(
@@ -119,6 +120,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                         ):
                             method_params.append(child.text.decode())
                 parameters_for_node = method_params
+                entry_point_for_node = self._entry_point(node)
 
         if node_type and node_name:
             component_id = self._get_component_id(node_name)
@@ -138,12 +140,72 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                     parameters_for_node if node_type == "method" else None
                 ),
                 owner=owner_for_node,
+                entry_point=entry_point_for_node,
             )
             self.nodes.append(node_obj)
             self.top_level_nodes[node_name] = node_obj
 
         for child in node.children:
             self._extract_nodes(child, lines)
+
+    _HTTP_ANNOTATIONS = {
+        "GetMapping": "GET",
+        "PostMapping": "POST",
+        "PutMapping": "PUT",
+        "DeleteMapping": "DELETE",
+        "PatchMapping": "PATCH",
+        "RequestMapping": "",
+    }
+
+    def _entry_point(self, node) -> Optional[str]:
+        """Spring route annotations -> entry-point metadata."""
+        modifiers = next(
+            (c for c in node.children if c.type == "modifiers"), None
+        )
+        if modifiers is None:
+            return None
+        for annotation in modifiers.children:
+            if annotation.type not in ("annotation", "marker_annotation"):
+                continue
+            name_node = next(
+                (
+                    c
+                    for c in annotation.children
+                    if c.type in ("identifier", "scoped_identifier")
+                ),
+                None,
+            )
+            if name_node is None:
+                continue
+            simple = self._get_node_text(name_node).split(".")[-1]
+            if simple not in self._HTTP_ANNOTATIONS:
+                continue
+            method = self._HTTP_ANNOTATIONS[simple]
+            path = None
+            args = next(
+                (
+                    c
+                    for c in annotation.children
+                    if c.type == "annotation_argument_list"
+                ),
+                None,
+            )
+            if args:
+                for child in args.children:
+                    if child.type == "string_literal":
+                        path = child.text.decode().strip('"')
+                        break
+                    if child.type == "element_value_pair":
+                        for pair_child in child.children:
+                            if pair_child.type == "string_literal":
+                                path = pair_child.text.decode().strip('"')
+                                break
+                        if path:
+                            break
+            if path:
+                return f"HTTP {method or 'ROUTE'} {path}"
+            return f"HTTP {method}" if method else "HTTP endpoint"
+        return None
 
     def _extract_relationships(self, node):
         # 1. Inheritance: Class extends another class

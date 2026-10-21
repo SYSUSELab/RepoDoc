@@ -32,6 +32,7 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
 
     def __init__(self, file_path: str, content: str, repo_path: str = None):
         super().__init__(file_path, content, repo_path)
+        self._entry_points: dict[str, str] = {}
 
         try:
             self.parser = _get_js_parser()
@@ -60,6 +61,10 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
             )
             self._extract_functions(root_node)
             self._extract_call_relationships(root_node)
+            for node in self.nodes:
+                entry = self._entry_points.get(node.name)
+                if entry:
+                    node.entry_point = entry
         except Exception as e:
             logger.error(
                 f"Error analyzing JavaScript file {self.file_path}: {e}", exc_info=True
@@ -451,6 +456,7 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
 
             call_text = self._get_node_text(node)
             is_method_call = "this." in call_text or "super." in call_text
+            self._register_express_route(call_text)
 
             caller_id = f"{self._get_module_path()}.{caller_name}"
 
@@ -479,6 +485,21 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
         except Exception as e:
             logger.debug(f"Error extracting call relationship: {e}")
             return None
+
+    _ROUTE_RE = re.compile(
+        r"^\s*[A-Za-z_$][\w$]*\.(get|post|put|delete|patch|all)\(\s*"
+        r"['\"]([^'\"]+)['\"]\s*,\s*([A-Za-z_$][\w$]*)"
+    )
+
+    def _register_express_route(self, call_text: str) -> None:
+        """Express-style `app.get('/path', handler)` -> handler entry point."""
+        match = self._ROUTE_RE.match(call_text or "")
+        if not match:
+            return
+        method, path, handler = match.groups()
+        self._entry_points[handler] = (
+            f"HTTP {method.upper()} {path}"
+        )
 
     def _extract_jsdoc_type_dependencies(self, node, caller_name: str) -> None:
         """Extract type dependencies from JSDoc comments."""
