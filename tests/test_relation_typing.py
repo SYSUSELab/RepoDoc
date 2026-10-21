@@ -130,6 +130,82 @@ def test_none_content_is_a_deletion(tmp_path):
     assert not graph.has_node("src.a.alpha")
 
 
+def test_python_method_signature_is_a_severe_class_change():
+    from repodoc.agent.update import ChangeType, DiffSpec, analyze_diff
+
+    old = "class A:\n    def run(self, x):\n        return x\n"
+    new = "class A:\n    def run(self, x, y=1):\n        return x\n"
+    analysis = analyze_diff("m.py", old, new, DiffSpec("python"))
+    change = next(c for c in analysis.changes if c.name == "A")
+    assert change.change_type == ChangeType.API_SIGNATURE_CHANGED
+
+
+def test_java_method_node_points_at_owning_class():
+    from repodoc.graph.analyzers import analyze_file
+
+    nodes, _rels, _imports = analyze_file(
+        "demo/User.java",
+        "package demo;\npublic class User {\n  public void save() {}\n}\n",
+        ".",
+    )
+    method = next(n for n in nodes if n.component_type == "method")
+    assert method.id.endswith("User.save")
+    assert method.owner is not None
+    assert method.owner.endswith("User.User")
+
+
+def test_in_file_component_rename_is_paired():
+    from repodoc.agent.update import _detect_component_renames
+    from repodoc.graph.graph import HeterogeneousGraph
+    from repodoc.graph.models import CodeNode, Node
+    from repodoc.graph.mutation import GraphMutationResult
+
+    old_source = (
+        "class OldName:\n"
+        "    def run(self, value):\n"
+        "        result = value + 1\n"
+        "        return result\n"
+    )
+    new_source = old_source.replace("OldName", "NewName")
+    pre = {
+        "m.OldName": Node(
+            id="m.OldName", name="OldName", component_type="class",
+            file_path="m.py", relative_path="m.py", source_code=old_source,
+        )
+    }
+    graph = HeterogeneousGraph()
+    graph.add_code_node(
+        CodeNode(
+            id="m.NewName", type="class", component_type="class",
+            file_path="m.py", relative_path="m.py", name="NewName",
+            source_code=new_source,
+        )
+    )
+    mutation = GraphMutationResult(
+        added=["m.NewName"], removed=["m.OldName"]
+    )
+    assert _detect_component_renames(pre, graph, mutation) == [
+        ("m.OldName", "m.NewName")
+    ]
+
+
+def test_method_changes_map_to_owner_docs():
+    from repodoc.agent.update import _map_methods_to_owners
+    from repodoc.graph.models import Node
+
+    components = {
+        "m.User": Node(
+            id="m.User", name="User", component_type="class",
+            file_path="m.py", relative_path="m.py",
+        ),
+        "m.User.save": Node(
+            id="m.User.save", name="save", component_type="method",
+            file_path="m.py", relative_path="m.py", owner="m.User",
+        ),
+    }
+    assert _map_methods_to_owners(components, ["m.User.save", "m.User"]) == ["m.User"]
+
+
 def test_impact_propagation_follows_implements(tmp_path):
     from repodoc.agent.update import IncrementalUpdater
 

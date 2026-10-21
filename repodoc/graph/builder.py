@@ -511,6 +511,7 @@ def build_graph_from_analysis(components: Dict[str, Node]) -> HeterogeneousGraph
             },
             parameters=node.parameters,
             receiver=node.receiver,
+            owner=node.owner,
         )
         graph.add_code_node(code_node)
     relation_fields = (
@@ -560,6 +561,7 @@ def graph_to_components(graph: HeterogeneousGraph) -> Dict[str, Node]:
             docstring=d.get("docstring", ""),
             parameters=d.get("parameters"),
             receiver=d.get("receiver"),
+            owner=d.get("owner"),
         )
     return components
 

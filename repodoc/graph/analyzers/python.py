@@ -80,6 +80,30 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
         self.generic_visit(node)
         self.current_class_name = previous_class
         self.current_function_name = previous_function
+        # Method signatures participate in the class's change signature: a
+        # parameter change is an API change even though methods are not
+        # separate documentation targets.
+        class_node.parameters = self._method_signatures(node)
+
+    def _method_signatures(self, class_node: ast.ClassDef) -> List[str]:
+        signatures: List[str] = []
+        for child in class_node.body:
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if child.name.startswith("_") and child.name != "__init__":
+                continue
+            try:
+                args = ast.unparse(child.args)
+            except Exception:
+                args = ""
+            returns = ""
+            if child.returns is not None:
+                try:
+                    returns = f" -> {ast.unparse(child.returns)}"
+                except Exception:
+                    returns = ""
+            signatures.append(f"{child.name}({args}){returns}")
+        return sorted(signatures)
 
     def _extract_base_class_name(self, base):
         if isinstance(base, ast.Name):

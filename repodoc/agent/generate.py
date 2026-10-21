@@ -300,6 +300,89 @@ def _enforce_overview_diagram(result, diagram_code: str) -> None:
     output["content"] = updated
 
 
+def ensure_doc_links(
+    content: str, links: dict[str, str], heading: str = "## Navigation"
+) -> str:
+    """Append deterministic navigation links missing from a generated doc.
+
+    LLMs frequently omit child/member links; reachability is too important to
+    leave to chance. Existing links are never rewritten."""
+    existing = set(re.findall(r"\]\(([^)]+)\)", content or ""))
+    missing = [
+        (label, target)
+        for label, target in links.items()
+        if target and target not in existing
+    ]
+    if not missing:
+        return content
+    bullets = "\n".join(f"- [{label}]({target})" for label, target in missing)
+    lines = content.rstrip().splitlines()
+    heading_index = next(
+        (i for i, line in enumerate(lines) if line.strip() == heading), None
+    )
+    if heading_index is not None:
+        insert_at = heading_index + 1
+        if insert_at < len(lines) and not lines[insert_at].strip():
+            insert_at += 1
+        lines[insert_at:insert_at] = bullets.splitlines()
+        return "\n".join(lines) + ("\n" if content.endswith("\n") else "")
+    return f"{content.rstrip()}\n\n{heading}\n\n{bullets}\n"
+
+
+def _apply_doc_links(result, links: dict[str, str]) -> None:
+    """Add missing navigation links to a successful generation result."""
+    if not (
+        result is not None
+        and getattr(result, "success", False)
+        and getattr(result, "output", None)
+    ):
+        return
+    output = result.output
+    path = output.get("path")
+    content = output.get("content", "")
+    if not path or not content:
+        return
+    updated = ensure_doc_links(content, links)
+    if updated == content:
+        return
+    try:
+        file_manager.save_text(updated, path)
+    except OSError as e:
+        print(f"Warning: could not add navigation links to {path}: {e}")
+        return
+    output["content"] = updated
+
+
+def _module_doc_links(
+    module_id: str,
+    module_info: dict,
+    components: dict,
+    comp_modules: dict[str, list[str]],
+    docs_dir: str,
+    doc_path: str,
+) -> dict[str, str]:
+    """Links from one module doc to its child modules and member docs."""
+    base = os.path.dirname(doc_path)
+    links: dict[str, str] = {}
+    for child in (module_info.get("children") or {}):
+        child_path = os.path.join(
+            docs_dir, *module_id.split("/"), f"{child}.md"
+        )
+        if os.path.exists(child_path):
+            links[child] = os.path.relpath(child_path, base).replace(os.sep, "/")
+    for comp_id in module_info.get("components", []):
+        node = components.get(comp_id)
+        if not (node and node.name):
+            continue
+        chain = comp_modules.get(comp_id, module_id.split("/"))
+        comp_path = os.path.join(docs_dir, *chain, f"{node.name}.md")
+        if os.path.exists(comp_path):
+            links[node.name] = os.path.relpath(comp_path, base).replace(
+                os.sep, "/"
+            )
+    return links
+
+
 def refresh_doc_snapshots(graph, paths: list[str]) -> int:
     """Adopt on-disk content for the given doc files into their graph DocNodes.
 
@@ -600,6 +683,16 @@ class DocPipeline:
         )
         # The diagram is graph-derived: enforce it even if the LLM altered it.
         _enforce_overview_diagram(result, module_diagram)
+        # Deterministic module index: every generated top-level module doc is
+        # reachable from the README even if the LLM omitted a link.
+        _apply_doc_links(
+            result,
+            {
+                name: f"{name}.md"
+                for name in module_structure
+                if os.path.exists(os.path.join(docs_dir, f"{name}.md"))
+            },
+        )
         return result
 
     async def generate_module_docs(
@@ -794,6 +887,18 @@ class DocPipeline:
             }
         )
         if result is not None and getattr(result, "success", False):
+            doc_path = os.path.join(current_parent_dir, f"{module_name}.md")
+            _apply_doc_links(
+                result,
+                _module_doc_links(
+                    full_path,
+                    module_info,
+                    self.components,
+                    comp_modules,
+                    self.config.docs_dir,
+                    doc_path,
+                ),
+            )
             # Module docs describe the module node itself (when it exists).
             self._add_doc_to_graph(result, target_id=full_path)
         return result
@@ -871,6 +976,9 @@ class DocPipeline:
             (comp_id, chain)
             for comp_id, chain in sorted(comp_modules.items())
             if comp_id in self.components
+            # Methods are not documentation targets (they belong to the class
+            # doc); this also guards legacy module trees.
+            and self.components[comp_id].component_type != "method"
         ]
         results = await asyncio.gather(
             *(_run(*j) for j in jobs), return_exceptions=True

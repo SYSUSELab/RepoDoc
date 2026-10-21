@@ -13,6 +13,7 @@ from typing import Any, Literal
 import networkx as nx
 
 from repodoc.graph.models import (
+    GRAPH_SCHEMA_VERSION,
     RELATION_TYPES,
     CodeNode,
     DocNode,
@@ -30,8 +31,9 @@ class HeterogeneousGraph:
     Node id is a global string. Edges carry relation_type and weight for propagation.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, schema_version: int = GRAPH_SCHEMA_VERSION) -> None:
         self._g: nx.DiGraph = nx.DiGraph()
+        self.schema_version = schema_version
 
     def add_code_node(self, node: CodeNode) -> None:
         """Add or overwrite a CodeNode by id."""
@@ -212,7 +214,11 @@ class HeterogeneousGraph:
                     "weight": attrs.get("weight", 1.0),
                 }
             )
-        doc = {"nodes": nodes_payload, "edges": edges_payload}
+        doc = {
+            "schema_version": self.schema_version,
+            "nodes": nodes_payload,
+            "edges": edges_payload,
+        }
         # Atomic write: a crash mid-save leaves the previous graph intact
         # instead of a truncated JSON that the next run cannot load.
         fd, tmp_path = tempfile.mkstemp(
@@ -239,7 +245,13 @@ class HeterogeneousGraph:
         path = Path(path)
         with path.open(encoding="utf-8") as f:
             doc = json.load(f)
-        g = cls()
+        version = int(doc.get("schema_version", 1))
+        if version > GRAPH_SCHEMA_VERSION:
+            raise ValueError(
+                f"Knowledge graph schema v{version} is newer than this RepoDoc "
+                f"(v{GRAPH_SCHEMA_VERSION}); upgrade RepoDoc or regenerate the graph"
+            )
+        g = cls(schema_version=version)
         for item in doc.get("nodes", []):
             nid = item["id"]
             node_type = item.get("node_type", "code")

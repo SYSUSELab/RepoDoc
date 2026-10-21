@@ -72,6 +72,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
         node_type = None
         node_name = None
         parameters_for_node = None
+        owner_for_node = None
 
         if node.type == "method_declaration":
             containing_class = self._find_containing_class(node)
@@ -82,6 +83,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                 # their class's component (and are excluded from leaf docs).
                 node_name = f"{containing_class}.{method_name}"
                 parameters_for_node = self._extract_method_parameters(node)
+                owner_for_node = self._get_component_id(containing_class)
 
         if node.type == "class_declaration":
             is_abstract = any(
@@ -163,6 +165,7 @@ class TreeSitterCSharpAnalyzer(BaseAnalyzer):
                 end_line=node.end_point[0] + 1,
                 docstring="",
                 parameters=parameters_for_node,
+                owner=owner_for_node,
             )
             self.nodes.append(node_obj)
             self.top_level_nodes[node_name] = node_obj

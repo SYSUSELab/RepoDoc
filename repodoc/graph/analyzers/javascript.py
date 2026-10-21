@@ -211,6 +211,7 @@ class TreeSitterJSAnalyzer(BaseAnalyzer):
                 start_line=line_start,
                 end_line=line_end,
                 docstring="",
+                owner=self._get_component_id(class_name),
             )
         except Exception as e:
             logger.debug(f"Error creating method node for {method_name}: {e}")

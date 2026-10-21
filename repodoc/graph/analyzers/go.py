@@ -196,6 +196,11 @@ class GoASTAnalyzer(BaseAnalyzer):
             source_code=self._get_node_text(node),
             parameters=params,
             receiver=receiver or None,
+            owner=(
+                super()._get_component_id(receiver.lstrip("*"))
+                if is_method and receiver
+                else None
+            ),
         )
 
         self.nodes.append(node_obj)

@@ -298,6 +298,7 @@ class RustASTAnalyzer(BaseAnalyzer):
             source_code=self._get_node_text(node),
             parameters=params,
             receiver=impl_type,
+            owner=self._get_component_id(impl_type),
         )
 
         self.nodes.append(node_obj)

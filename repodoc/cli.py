@@ -156,11 +156,51 @@ def _rescope_graph(config: Config, kg_path: str, tree_path: str) -> bool:
     if existing == wanted:
         return False
 
+    # Module docs recorded via describes edges: they are regenerated under the
+    # new tree, so remove the managed files (only when unedited) to avoid
+    # orphan module docs from the old scope.
+    from repodoc.graph.models import REL_DESCRIBES, DocNode, ModuleNode
+    from repodoc.utils import content_hash
+
+    old_module_docs = {}
+    for source, target, relation, _w in graph.edges(REL_DESCRIBES):
+        if relation != REL_DESCRIBES:
+            continue
+        target_node = graph.get_node(target)
+        doc = graph.get_node(source)
+        if (
+            isinstance(target_node, ModuleNode)
+            and isinstance(doc, DocNode)
+            and doc.file_path
+        ):
+            old_module_docs[doc.file_path] = doc
+
     # Drop the previous module layer (module nodes + their edges); code nodes
     # and their edges stay untouched.
     for nid, attrs in list(graph.nodes(data=True)):
         if attrs.get("node_type") == "module":
             graph.remove_node(nid)
+
+    for path, doc in old_module_docs.items():
+        if not os.path.exists(path):
+            if graph.has_node(doc.id):
+                graph.remove_node(doc.id)
+            continue
+        try:
+            content = file_manager.load_text(path)
+        except OSError:
+            continue
+        if doc.content_hash:
+            if content_hash(content) != doc.content_hash:
+                continue  # user-edited: keep it
+        elif (doc.content or "") != content:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        if graph.has_node(doc.id):
+            graph.remove_node(doc.id)
     module_tree = cluster_modules(leaf_nodes, components, config)
     file_manager.save_json(module_tree, tree_path)
     attach_module_tree_to_graph(graph, module_tree, components)

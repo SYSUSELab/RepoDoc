@@ -64,6 +64,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
         node_type = None
         node_name = None
         parameters_for_node = None
+        owner_for_node = None
 
         if node.type == "class_declaration":
             is_abstract = any(
@@ -98,6 +99,8 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                 node_name = (
                     f"{containing_class}.{method_name}" if containing_class else method_name
                 )
+                if containing_class:
+                    owner_for_node = self._get_component_id(containing_class)
                 method_params = []
                 formal_params = next(
                     (
@@ -134,6 +137,7 @@ class TreeSitterJavaAnalyzer(BaseAnalyzer):
                 parameters=(
                     parameters_for_node if node_type == "method" else None
                 ),
+                owner=owner_for_node,
             )
             self.nodes.append(node_obj)
             self.top_level_nodes[node_name] = node_obj

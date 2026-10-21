@@ -38,7 +38,9 @@ from repodoc.agent.generate import (
     DocPipeline,
     _build_module_dependencies,
     _collect_component_modules,
+    _apply_doc_links,
     _enforce_overview_diagram,
+    _module_doc_links,
     _subtree_module_dependencies,
     _top_level_module_dependencies,
     build_module_mermaid,
@@ -866,6 +868,59 @@ class IncrementalUpdater:
 # ---------------------------------------------------------------------------
 
 
+def _detect_component_renames(
+    pre_components: dict[str, Node],
+    graph: HeterogeneousGraph,
+    mutation: GraphMutationResult,
+    min_similarity: float = 0.75,
+) -> list[tuple[str, str]]:
+    """Detect in-file component renames from removed/added pairs.
+
+    A renamed class/function is a remove+add at the component level, which
+    would delete its doc. Pairing old and new ids by source similarity lets
+    the existing rename migration move the doc and re-point caller edges.
+    Conservative: same file, same component type, different names, non-trivial
+    source, and a unique greedy best match above the similarity threshold."""
+    added_by_key: dict[tuple[str, str], list[str]] = {}
+    for new_id in mutation.added:
+        node = graph.get_node(new_id)
+        if not isinstance(node, CodeNode):
+            continue
+        rel = (node.relative_path or "").replace(os.sep, "/")
+        added_by_key.setdefault((rel, node.component_type), []).append(new_id)
+
+    candidates: list[tuple[float, str, str]] = []
+    for old_id in mutation.removed:
+        old = pre_components.get(old_id)
+        if old is None or old.component_type == "method":
+            continue
+        rel = (old.relative_path or "").replace(os.sep, "/")
+        for new_id in added_by_key.get((rel, old.component_type), []):
+            new = graph.get_node(new_id)
+            if not isinstance(new, CodeNode) or new.name == old.name:
+                continue
+            old_source = old.source_code or ""
+            new_source = new.source_code or ""
+            if min(len(old_source), len(new_source)) < 40:
+                continue
+            score = difflib.SequenceMatcher(
+                None, old_source, new_source
+            ).ratio()
+            if score >= min_similarity:
+                candidates.append((score, old_id, new_id))
+
+    pairs: list[tuple[str, str]] = []
+    used_old: set[str] = set()
+    used_new: set[str] = set()
+    for _score, old_id, new_id in sorted(candidates, reverse=True):
+        if old_id in used_old or new_id in used_new:
+            continue
+        used_old.add(old_id)
+        used_new.add(new_id)
+        pairs.append((old_id, new_id))
+    return pairs
+
+
 def _get_git_commit(repo_path: str) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -941,6 +996,22 @@ def _module_doc_path(config: Config, module_id: str) -> str:
 
 def _component_doc_path(docs_dir: str, chain: list[str], name: str) -> str:
     return os.path.join(docs_dir, *chain, f"{name}.md")
+
+
+def _map_methods_to_owners(components, ids) -> list[str]:
+    """Map changed method ids to their owning class; drop non-doc methods."""
+    out: set[str] = set()
+    for cid in ids:
+        node = components.get(cid)
+        if node is None:
+            continue
+        if node.component_type == "method":
+            owner = getattr(node, "owner", None)
+            if owner and owner in components:
+                out.add(owner)
+        else:
+            out.add(cid)
+    return sorted(out)
 
 
 def _doc_index(graph: HeterogeneousGraph) -> dict[str, str]:
@@ -1674,6 +1745,14 @@ async def run_update(
     mutation.updated = sorted(set(mutation.updated))
     mutation.removed = sorted(set(mutation.removed))
 
+    # In-file component renames look like remove+add: pair them by source
+    # similarity so their docs are migrated instead of deleted/recreated.
+    component_renames = _detect_component_renames(
+        pre_components, graph, mutation
+    )
+    if component_renames:
+        print(f"  Detected {len(component_renames)} component rename(s)")
+
     # Once for the whole batch: definitions added by one file can make
     # references in unchanged files resolvable, but two same-named additions
     # in the same run must stay ambiguous.
@@ -1717,7 +1796,7 @@ async def run_update(
     # a renamed component keeps its identity under a new id, so its callers
     # (whose files were not re-analyzed) must follow it, and its old id must
     # not count as a removal — that would delete the doc we want to migrate.
-    renamed_pairs: list[tuple[str, str]] = []
+    renamed_pairs: list[tuple[str, str]] = list(component_renames)
     for new_path, old_path in renames.items():
         old_ids = {
             cid
@@ -1897,6 +1976,22 @@ async def run_update(
     )
     if pending_updates["overview"]:
         impact["update_overview"] = True
+
+    # Methods are not documentation targets: their changes update the owning
+    # class doc (the method ids still drive caller propagation above).
+    impact["components_to_doc"] = _map_methods_to_owners(
+        pipeline.components, impact["components_to_doc"]
+    )
+    owner_modules = {
+        m
+        for cid in impact["components_to_doc"]
+        for m in component_module_ids(graph, cid)
+    }
+    impact["modules_to_doc"] = sorted(
+        set(impact["modules_to_doc"]) | owner_modules
+    )
+    if owner_modules:
+        impact["update_overview"] = True
     impact["total_components"] = len(impact["components_to_doc"])
 
     print(f"\nImpact analysis (propagate={propagate}, max_hops={max_hops}):")
@@ -2047,7 +2142,7 @@ async def run_update(
         jobs = []
         for node_id in impact["components_to_doc"]:
             node = pipeline.components.get(node_id)
-            if not node:
+            if not node or node.component_type == "method":
                 continue
             chain = comp_modules.get(node_id, [])
             # The existing doc lives where the graph's describes edge says
@@ -2081,7 +2176,7 @@ async def run_update(
     async def _update_component(job):
         node_id, doc_path, existing_doc = job
         node = pipeline.components.get(node_id)
-        if not node:
+        if not node or node.component_type == "method":
             return None
         # A manual edit is usually left alone; --force discards it by doing a
         # FULL regeneration (the old text is not used as a format anchor, so
@@ -2217,9 +2312,17 @@ async def run_update(
 
             path_parts = module_id.split("/")
             parent_module = path_parts[-2] if len(path_parts) > 1 else ""
+            links = _module_doc_links(
+                module_id,
+                module_info,
+                pipeline.components,
+                comp_modules,
+                docs_dir,
+                doc_path,
+            )
 
             if not edited and should_partial_update(existing_doc, ""):
-                return await pipeline.agent.execute(
+                result = await pipeline.agent.execute(
                     {
                         "type": "write_doc",
                         "config": config,
@@ -2243,7 +2346,9 @@ async def run_update(
                         },
                     }
                 )
-            return await pipeline.agent.execute(
+                _apply_doc_links(result, links)
+                return result
+            result = await pipeline.agent.execute(
                 {
                     "type": "write_doc",
                     "config": config,
@@ -2266,6 +2371,8 @@ async def run_update(
                     },
                 }
             )
+            _apply_doc_links(result, links)
+            return result
 
         module_results = await _run_jobs_with_retry(
             module_jobs, _update_module, "module docs"
@@ -2341,6 +2448,14 @@ async def run_update(
                         }
                     )
                 _enforce_overview_diagram(overview_result, module_diagram)
+                _apply_doc_links(
+                    overview_result,
+                    {
+                        name: f"{name}.md"
+                        for name in module_tree
+                        if os.path.exists(os.path.join(docs_dir, f"{name}.md"))
+                    },
+                )
             except Exception as e:
                 # Same failure contract as component/module docs: journal it,
                 # never abort the whole run over the README.

@@ -15,6 +15,10 @@ from typing import Dict, List, Optional, Set
 
 from pydantic import BaseModel
 
+# Bump when the persisted graph schema changes incompatibly. `HeterogeneousGraph.load`
+# refuses graphs from a newer version and tolerates older ones (fields have defaults).
+GRAPH_SCHEMA_VERSION = 2
+
 # ---------------------------------------------------------------------------
 # Relation type constants for graph edges
 # (design: calls, implements, describes + module structure).
@@ -95,6 +99,9 @@ class Node(BaseModel):
     parameters: Optional[List[str]] = None
     # Go/Rust method receiver type (e.g. "User" in func (u *User) Name()); None for others
     receiver: Optional[str] = None
+    # Containing class component id for methods (e.g. "pkg.mod.User"): a
+    # method change updates the class doc and propagates from the method.
+    owner: Optional[str] = None
 
 
 class CallRelationship(BaseModel):
@@ -138,6 +145,8 @@ class CodeNode(BaseModel):
     unresolved: Dict[str, List[str]] = {}
     parameters: Optional[List[str]] = None
     receiver: Optional[str] = None  # Go/Rust method receiver type
+    # Containing class component id for method nodes (doc target mapping).
+    owner: Optional[str] = None
 
 
 class DocNode(BaseModel):

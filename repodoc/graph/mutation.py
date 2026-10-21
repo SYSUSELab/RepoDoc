@@ -769,6 +769,7 @@ def _add_component_node(graph: HeterogeneousGraph, node: Node) -> None:
             },
             parameters=node.parameters,
             receiver=node.receiver,
+            owner=node.owner,
         )
     )
 
@@ -783,6 +784,7 @@ def _same_component(existing: CodeNode, node: Node) -> bool:
         or existing.docstring != (node.docstring or "")
         or existing.parameters != node.parameters
         or existing.receiver != node.receiver
+        or existing.owner != node.owner
         or existing.relative_path != node.relative_path
     ):
         return False
