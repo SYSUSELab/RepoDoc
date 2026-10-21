@@ -70,29 +70,50 @@ class GraphMutationResult:
 # ---------------------------------------------------------------------------
 
 
-def _build_lookup(
+def _build_resolution_index(
     graph: HeterogeneousGraph, new_nodes: List[Node]
-) -> Dict[str, str]:
-    """Inverted index: component id/name/last-segment -> canonical graph id.
+) -> tuple[
+    Dict[str, Set[str]], Dict[tuple[str, str], Set[str]], Set[str]
+]:
+    """Ambiguity-aware name indexes for update-time reference resolution.
 
-    New-file nodes win over graph nodes on name collisions (they are the
-    freshest analysis of the changed code)."""
-    lookup: Dict[str, str] = {}
+    Unlike a first-wins mapping, colliding names keep all candidates so an
+    ambiguous reference is left unresolved instead of pointing at an arbitrary
+    component (the full builder drops those too). New-file nodes replace the
+    graph's old version of the same id."""
+    by_name: Dict[str, Set[str]] = {}
+    by_file_name: Dict[tuple[str, str], Set[str]] = {}
+    all_ids: Set[str] = set()
+    new_ids = {n.id for n in new_nodes}
+
+    def add(cid: str, name: str, rel_path: str) -> None:
+        keys = {name, cid.split(".")[-1]}
+        for key in keys:
+            if not key:
+                continue
+            by_name.setdefault(key, set()).add(cid)
+            if rel_path:
+                by_file_name.setdefault((rel_path, key), set()).add(cid)
+
     for node in new_nodes:
-        lookup.setdefault(node.id, node.id)
-        lookup.setdefault(node.name, node.id)
-        lookup.setdefault(node.id.split(".")[-1], node.id)
+        rel = (node.relative_path or node.file_path or "").replace(os.sep, "/")
+        all_ids.add(node.id)
+        add(node.id, node.name, rel)
+
     for nid, attrs in graph.nodes(data=True):
         if attrs.get("node_type") != "code":
             continue
         d = attrs.get("data", {})
         cid = d.get("id", nid)
-        lookup.setdefault(cid, cid)
-        name = d.get("name")
-        if name:
-            lookup.setdefault(name, cid)
-            lookup.setdefault(cid.split(".")[-1], cid)
-    return lookup
+        if cid in new_ids:
+            continue
+        rel = (d.get("relative_path") or d.get("file_path") or "").replace(
+            os.sep, "/"
+        )
+        all_ids.add(cid)
+        add(cid, d.get("name") or "", rel)
+
+    return by_name, by_file_name, all_ids
 
 
 def _collect_candidates(
@@ -133,31 +154,63 @@ def _resolve_dependencies(
     (disambiguates names that collide across modules), then the name lookup.
     Each relation keeps its own field/edge type (calls, implements, uses,
     instantiates, imports)."""
-    lookup = _build_lookup(graph, new_nodes)
     new_by_id = {n.id: n for n in new_nodes}
+    by_name, by_file_name, all_ids = _build_resolution_index(graph, new_nodes)
     import_index = ImportIndex(_collect_candidates(graph, new_nodes))
     imports_by_file = {caller_file: imports} if imports and caller_file else {}
     resolved: Dict[str, Dict[str, Set[str]]] = {
         field: {n.id: set() for n in new_nodes}
         for field, _relation in _RELATION_FIELD_EDGES
     }
-    for rel in relationships:
-        caller = lookup.get(rel.caller)
-        if caller is None or caller not in new_by_id:
-            continue
-        relation = getattr(rel, "relation_type", REL_CALLS)
-        callee = None
-        if rel.callee in new_by_id or graph.has_node(rel.callee):
-            callee = rel.callee
-        if callee is None and imports_by_file:
-            callee = resolve_with_imports(
-                rel.callee, caller_file, imports_by_file, import_index
+
+    def resolve(ref: str, caller: str) -> Optional[str]:
+        if not ref:
+            return None
+        if ref in new_by_id or ref in all_ids:
+            return ref
+        last = ref.split(".")[-1]
+        caller_node = new_by_id[caller]
+        file_of_caller = (
+            caller_node.relative_path or caller_node.file_path or ""
+        ).replace(os.sep, "/")
+        # 1. Same file wins (a bare name is most likely local).
+        for key in dict.fromkeys((ref, last)):
+            candidates = by_file_name.get((file_of_caller, key), set())
+            if len(candidates) == 1:
+                return next(iter(candidates))
+        # 2. Import-aware resolution.
+        if imports_by_file:
+            matched = resolve_with_imports(
+                ref, file_of_caller, imports_by_file, import_index
             )
+            if matched:
+                return matched
+        # 3. Globally unique name, then unique dotted suffix.
+        for key in dict.fromkeys((ref, last)):
+            candidates = by_name.get(key, set())
+            if len(candidates) == 1:
+                return next(iter(candidates))
+        suffix = "." + ref
+        suffix_matches = {cid for cid in all_ids if cid.endswith(suffix)}
+        if len(suffix_matches) == 1:
+            return next(iter(suffix_matches))
+        return None
+
+    for rel in relationships:
+        if rel.caller in new_by_id:
+            caller = rel.caller
+        else:
+            candidates = by_name.get(rel.caller, set()) | by_name.get(
+                rel.caller.split(".")[-1], set()
+            )
+            if len(candidates) != 1:
+                continue
+            caller = next(iter(candidates))
+            if caller not in new_by_id:
+                continue
+        relation = getattr(rel, "relation_type", REL_CALLS)
+        callee = resolve(rel.callee, caller)
         if callee is None:
-            callee = lookup.get(rel.callee)
-            if callee is None and "." in rel.callee:
-                callee = lookup.get(rel.callee.split(".")[-1])
-        if callee is None or not (callee in new_by_id or graph.has_node(callee)):
             # Keep the dangling reference so a later update can wire it.
             new_by_id[caller].unresolved.setdefault(relation, set()).add(
                 rel.callee

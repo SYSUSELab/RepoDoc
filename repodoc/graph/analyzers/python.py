@@ -71,9 +71,15 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
                     is_resolved=True,
                     relation_type=REL_IMPLEMENTS,
                 )
+        # Save/restore: a nested class must not clear the enclosing class
+        # context (otherwise methods after it are misread as module functions).
+        previous_class = self.current_class_name
+        previous_function = self.current_function_name
         self.current_class_name = node.name
+        self.current_function_name = None
         self.generic_visit(node)
-        self.current_class_name = None
+        self.current_class_name = previous_class
+        self.current_function_name = previous_function
 
     def _extract_base_class_name(self, base):
         if isinstance(base, ast.Name):
@@ -109,9 +115,10 @@ class PythonASTAnalyzer(BaseAnalyzer, ast.NodeVisitor):
             if self._should_include_function(func_node):
                 self.nodes.append(func_node)
                 self.top_level_nodes[node.name] = func_node
+        previous_function = self.current_function_name
         self.current_function_name = node.name
         self.generic_visit(node)
-        self.current_function_name = None
+        self.current_function_name = previous_function
 
     def _should_include_function(self, func: Node) -> bool:
         if func.name.startswith("test_") or func.name.endswith("_test"):

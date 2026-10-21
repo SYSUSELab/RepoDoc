@@ -54,6 +54,26 @@ def test_directory_exclude_matches_segment_not_prefix():
     assert _should_exclude_path("out/x.py", "x.py", patterns)
 
 
+def test_nested_class_keeps_outer_methods_in_the_class(tmp_path):
+    components = _analyze(
+        tmp_path,
+        {
+            "pkg/urls.py": (
+                "class URL:\n"
+                "    class Memoizer:\n"
+                "        pass\n"
+                "\n"
+                "    def __init__(self):\n"
+                "        self.value = 1\n"
+            )
+        },
+    )
+    assert "pkg.urls.URL" in components
+    assert "pkg.urls.Memoizer" in components
+    # Methods after a nested class must not leak out as module functions.
+    assert not [cid for cid in components if cid.endswith(".__init__")]
+
+
 def test_hxx_strips_extension_from_module_id(tmp_path):
     components = _analyze(
         tmp_path,
