@@ -84,6 +84,7 @@ def make_config(
     return Config(
         repo_path=repo_path,
         output_dir=output_dir,
+        doc_language=os.getenv("REPODOC_DOC_LANGUAGE", "English"),
         llm_base_url=os.getenv("LLM_BASE_URL", "https://api.deepseek.com"),
         llm_api_key=os.getenv("LLM_API_KEY", "sk-1234"),
         main_model=os.getenv("MAIN_MODEL", "deepseek-chat"),

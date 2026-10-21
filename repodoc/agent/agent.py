@@ -122,6 +122,13 @@ class DocAgent:
     async def _call_llm(
         self, llm_tool, system_prompt: str, user_prompt: str, *, temperature=0.3, max_tokens=8192
     ) -> SkillResult:
+        language = (getattr(self.config, "doc_language", "") or "").strip()
+        if language:
+            instruction = f"Write the document in {language}."
+            if system_prompt:
+                system_prompt = system_prompt.rstrip() + "\n\n" + instruction
+            else:
+                user_prompt = user_prompt.rstrip() + "\n\n" + instruction
         mt = max_tokens
         while True:
             result = await llm_tool.execute(

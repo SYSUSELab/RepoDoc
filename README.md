@@ -123,4 +123,6 @@ LLM_API_KEY=<key>
 MAIN_MODEL=<model>
 # optional: cap propagated caller docs per update (default 60, 0 = unlimited)
 REPODOC_MAX_IMPACT_DOCS=60
+# optional: generated documentation language (default English)
+REPODOC_DOC_LANGUAGE=English
 ```

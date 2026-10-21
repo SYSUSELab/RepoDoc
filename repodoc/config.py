@@ -55,6 +55,8 @@ class Config:
     # the count (0 = unlimited), ranked by popularity/type.
     doc_types: list[str] = field(default_factory=list)
     max_docs: int = 0
+    # Language of generated documentation (prompt-level instruction).
+    doc_language: str = "English"
     # Caller-propagation budget for update: cap the number of caller docs a
     # single change set can pull in (ranked by distance + fan-in). 0 = no cap.
     # Overridable via REPODOC_MAX_IMPACT_DOCS.
