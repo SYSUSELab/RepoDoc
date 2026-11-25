@@ -1,0 +1,87 @@
+# Evaluation protocol. Rubrics are generated once per repository from the
+# benchmark's reference documentation and then frozen. Every system is judged
+# against the same frozen rubric file with the same judge model(s).
+
+benchmark:
+  # Path to the CodeWikiBench checkout.
+  source: benchmarks/codewikibench
+  # Python used to run the CodeWikiBench CLI. null means "same interpreter as
+  # the harness"; `make` runs the harness with .venv/bin/python.
+  python: null
+  # Optional extra PYTHONPATH entries; the checkout's src/ is added automatically.
+  pythonpath: []
+
+rubrics:
+  # Frozen combined rubrics live at <dir>/<repo>/combined_rubrics.json.
+  dir: data/rubrics
+  generation:
+    # Models used to generate independent rubric sets before semantic merging.
+    # Replace with models available through BASE_URL/API_KEY or caw:* strings.
+    models:
+      - claude-sonnet-4
+      - kimi-k2-instruct
+    use_tools: true
+    language_agnostic: true
+    # Optional model for semantic merging; default is the first model above.
+    combine_model: null
+    temperature: 0.1
+    max_retries: 3
+
+judge:
+  # Use at least one model that is not the documentation-generation model.
+  # Multiple judges are combined with `combination_method`.
+  # These are the two low-cost OpenCode Go models validated for tool use.
+  models:
+    - qwen3.8-flash
+    - glm-5.3-flash
+  batch_size: 4
+  use_tools: true
+  enable_retry: true
+  max_retries: 2
+  combination_method: average
+  weights: null
+
+architecture:
+  # Architecture-focused view over the frozen rubric tree. A leaf is selected
+  # when its requirement text matches one of these terms; the architecture
+  # score is then recomputed over those leaves only. This is intentionally
+  # transparent and separate from the official benchmark score.
+  # Topics listed here are treated as architecture topics: all their leaves
+  # are included regardless of the keyword filter.
+  include_topics:
+    - GraphRAG Knowledge Graph Construction System
+  keywords:
+    - architecture
+    - architectural
+    - component
+    - module
+    - interface
+    - pipeline
+    - workflow
+    - flow
+    - lifecycle
+    - layer
+    - boundary
+    - depend
+    - event
+    - protocol
+    - orchestrat
+    - system
+    - framework
+    - runtime
+    - integration
+    - sandbox
+    - backend
+    - frontend
+    - service
+    - design
+
+report:
+  max_score: 0.99
+
+run:
+  experiments_dir: runs
+  # CodeWikiBench's parser only indexes .md files at the docs root. If a
+  # generator omits module_tree.json, synthesize a flat one from filenames
+  # (DeepWiki-style `N-Title` first lines are detected and left alone).
+  normalize_missing_module_tree: true

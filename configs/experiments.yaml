@@ -1,0 +1,29 @@
+# Experiment suites for `python -m harness batch --suite <name>`.
+#
+# A suite is a Cartesian product of systems x repos. Results go to
+# runs/<experiment>/systems/<system>/<repo>/. Prefer experiment names of the form
+# <language>-<repo>-<scope>-v<N> for single-repo comparisons, e.g.
+# python-rasa-full-v1; suite names such as core-v1 are fine for multi-repo runs.
+
+suites:
+  pilot:
+    description: "One repository, smoke-test the full generation + judging path"
+    systems: [codewiki]
+    repos: [OpenHands]
+
+  core:
+    description: "Seven repositories used in the CodeWiki paper tables"
+    systems: [codewiki]
+    repos:
+      - OpenHands
+      - svelte
+      - puppeteer
+      - ml-agents
+      - logstash
+      - wazuh
+      - electron
+
+  full:
+    description: "All 22 CodeWikiBench repositories"
+    systems: [codewiki]
+    repos: all

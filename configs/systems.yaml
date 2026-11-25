@@ -1,0 +1,40 @@
+# Documentation-generation systems under comparison.
+#
+# Every system is a directory plus an adapter script. The harness only knows the
+# adapter contract, so a new baseline does not require changes to harness code.
+#
+# Adapter contract:
+#   bash <adapter> --repo <repo-checkout> --out <docs-dir> --workdir <scratch> \
+#                  --mode full|update [-- <system-specific args>]
+#
+# The adapter must write flat markdown files (no nested subdirectories) to
+# <docs-dir>. `overview.md` is conventional but not required.
+#
+# `{root}` in env values is replaced with this repository's root directory.
+
+systems:
+  codewiki:
+    kind: baseline
+    description: "CodeWiki 2.0: dependency graph + hierarchical LLM agents"
+    upstream: "https://github.com/FSoft-AI4Code/CodeWiki"
+    source: baselines/codewiki
+    adapter: adapters/codewiki.sh
+    supports_update: true
+    env:
+      # Default binary; an exported CODEWIKI_BIN overrides this value.
+      # Installed by `make setup` in a separate venv so its dependency set does
+      # not collide with CodeWikiBench's optional `caw` dependency.
+      CODEWIKI_BIN: "{root}/.venv-codewiki/bin/codewiki"
+    # Extra CLI flags appended to `codewiki generate`, as a YAML list or a
+    # shell-style string. Example: ["--no-artifacts", "--focus", "src/core"].
+    extra_args: []
+
+  ours:
+    kind: proposed
+    description: "RepoDoc: graph + LLM clustering + hierarchical architecture docs"
+    source: methods/ours
+    adapter: adapters/ours.sh
+    supports_update: false
+    enabled: true
+    env: {}
+    extra_args: []

@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repodoc.local/schemas/doc_tree.schema.json",
+  "title": "RepoDoc document tree",
+  "type": "object",
+  "required": ["schema_version", "repo", "repo_path", "commit", "source_graph_version", "graph_version", "doc_plan_version", "doc_version", "created_at", "root"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "repo": {"type": "string"},
+    "repo_path": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "source_graph_version": {"type": "string"},
+    "graph_version": {"type": "string"},
+    "doc_plan_version": {"type": "string"},
+    "doc_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "root": {"$ref": "#/$defs/page"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "page": {
+      "type": "object",
+      "required": ["id", "path", "title", "level", "doc_type", "component_id", "status", "content_hash", "generated_from", "children", "sections"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "level": {"type": "integer", "minimum": 0, "maximum": 3},
+        "doc_type": {"enum": ["architecture", "component", "module", "api", "implementation", "operations", "security", "testing", "flow", "overview"]},
+        "component_id": {"type": "string", "minLength": 1},
+        "status": {"enum": ["planned", "generated", "stale", "failed", "deleted"]},
+        "content_hash": {"type": "string"},
+        "generated_from": {
+          "type": "object",
+          "required": ["graph_version", "child_doc_ids"],
+          "properties": {
+            "graph_version": {"type": "string"},
+            "child_doc_ids": {"type": "array", "items": {"type": "string"}}
+          },
+          "additionalProperties": true
+        },
+        "children": {"type": "array", "items": {"$ref": "#/$defs/page"}},
+        "sections": {"type": "array", "items": {"$ref": "#/$defs/section"}}
+      },
+      "additionalProperties": false
+    },
+    "section": {
+      "type": "object",
+      "required": ["id", "heading", "level", "order", "content_hash", "covers", "citations"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "heading": {"type": "string", "minLength": 1},
+        "level": {"type": "integer", "minimum": 1, "maximum": 4},
+        "order": {"type": "integer", "minimum": 0},
+        "content_hash": {"type": "string"},
+        "covers": {"type": "array", "items": {"type": "string"}},
+        "citations": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  }
+}

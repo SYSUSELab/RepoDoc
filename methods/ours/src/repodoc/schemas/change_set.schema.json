@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repodoc.local/schemas/change_set.schema.json",
+  "title": "RepoDoc change set",
+  "type": "object",
+  "required": ["schema_version", "repo", "base_commit", "target_commit", "status", "files", "graph_delta", "change_units", "impact", "created_at"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "repo": {"type": "string"},
+    "base_commit": {"type": "string"},
+    "target_commit": {"type": "string"},
+    "status": {"enum": ["planned", "applied", "failed", "noop"]},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "status"],
+        "properties": {
+          "path": {"type": "string"},
+          "old_path": {"type": ["string", "null"]},
+          "status": {"enum": ["added", "modified", "deleted", "renamed", "copied", "unknown"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "graph_delta": {
+      "type": "object",
+      "required": ["nodes_added", "nodes_removed", "nodes_modified", "edges_added", "edges_removed"],
+      "properties": {
+        "nodes_added": {"type": "array", "items": {"type": "string"}},
+        "nodes_removed": {"type": "array", "items": {"type": "string"}},
+        "nodes_modified": {"type": "array", "items": {"type": "string"}},
+        "edges_added": {"type": "array", "items": {"type": "string"}},
+        "edges_removed": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "change_units": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "op", "targets", "classification", "impacted_components", "impacted_docs", "recommended_actions"],
+        "properties": {
+          "id": {"type": "string"},
+          "op": {"enum": ["add", "modify", "delete", "rename", "move", "unknown"]},
+          "targets": {"type": "array", "items": {"type": "string"}},
+          "old_targets": {"type": "array", "items": {"type": "string"}},
+          "classification": {"type": "string"},
+          "impacted_components": {"type": "array", "items": {"type": "string"}},
+          "impacted_docs": {"type": "array", "items": {"type": "string"}},
+          "recommended_actions": {"type": "array", "items": {"type": "string"}}
+        },
+        "additionalProperties": true
+      }
+    },
+    "impact": {
+      "type": "object",
+      "required": ["requires_recluster", "scope", "reason"],
+      "properties": {
+        "requires_recluster": {"type": "boolean"},
+        "scope": {"enum": ["none", "local", "global"]},
+        "reason": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "created_at": {"type": "string"}
+  },
+  "additionalProperties": false
+}

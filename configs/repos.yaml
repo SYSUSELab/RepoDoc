@@ -1,0 +1,104 @@
+# Repositories used by CodeWikiBench.
+#
+# `commit` is the snapshot documented in the benchmark. `update_commit` is an
+# optional later snapshot for incremental-update experiments, for example:
+#   update_commit: <40-char sha of a later commit>
+# Both are kept as null here on purpose: CodeWikiBench metadata on HuggingFace
+# is the source of truth. Run `python -m harness prepare --from-hf` to download
+# the reference docs/rubrics and write resolved commits to
+# data/locks/repos.json. Set update_commit here (or in the lock file) before
+# running `harness update`.
+#
+# `split: core` marks the seven repositories used in the CodeWiki paper tables;
+# `split: full` is the complete 22-repository benchmark.
+
+defaults:
+  language: unknown
+  split: full
+  reference: official
+
+repos:
+  # JS / TS
+  Chart.js:
+    url: https://github.com/chartjs/Chart.js
+    language: JavaScript
+  marktext:
+    url: https://github.com/marktext/marktext
+    language: JavaScript
+  puppeteer:
+    url: https://github.com/puppeteer/puppeteer
+    language: TypeScript
+    split: core
+  storybook:
+    url: https://github.com/storybookjs/storybook
+    language: TypeScript
+  mermaid:
+    url: https://github.com/mermaid-js/mermaid
+    language: TypeScript
+  svelte:
+    url: https://github.com/sveltejs/svelte
+    language: JavaScript
+    split: core
+
+  # Python
+  graphrag:
+    url: https://github.com/microsoft/graphrag
+    language: Python
+  rasa:
+    url: https://github.com/RasaHQ/rasa
+    language: Python
+  OpenHands:
+    url: https://github.com/All-Hands-AI/OpenHands
+    language: Python
+    split: core
+
+  # C
+  qmk_firmware:
+    url: https://github.com/qmk/qmk_firmware
+    language: C
+  libsql:
+    url: https://github.com/tursodatabase/libsql
+    language: C
+  sumatrapdf:
+    url: https://github.com/sumatrapdfreader/sumatrapdf
+    language: C
+  wazuh:
+    url: https://github.com/wazuh/wazuh
+    language: C
+    split: core
+
+  # C++
+  electron:
+    url: https://github.com/electron/electron
+    language: C++
+    split: core
+  x64dbg:
+    url: https://github.com/x64dbg/x64dbg
+    language: C++
+  json:
+    url: https://github.com/nlohmann/json
+    language: C++
+
+  # C#
+  FluentValidation:
+    url: https://github.com/FluentValidation/FluentValidation
+    language: C#
+  git-credential-manager:
+    url: https://github.com/git-credential-manager/git-credential-manager
+    language: C#
+  ml-agents:
+    url: https://github.com/Unity-Technologies/ml-agents
+    language: C#
+    split: core
+
+  # Java
+  logstash:
+    url: https://github.com/elastic/logstash
+    language: Java
+    split: core
+  material-components-android:
+    url: https://github.com/material-components/material-components-android
+    language: Java
+  trino:
+    url: https://github.com/trinodb/trino
+    language: Java

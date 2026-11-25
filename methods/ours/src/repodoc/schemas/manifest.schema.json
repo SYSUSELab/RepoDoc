@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repodoc.local/schemas/manifest.schema.json",
+  "title": "RepoDoc state manifest",
+  "type": "object",
+  "required": ["schema_version", "repo", "repo_path", "last_commit", "source_hash", "code_graph_version", "graph_version", "component_version", "doc_version", "created_at", "updated_at", "artifacts", "last_run"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "repo": {"type": "string"},
+    "repo_path": {"type": "string"},
+    "last_commit": {"type": ["string", "null"]},
+    "source_hash": {"type": "string"},
+    "code_graph_version": {"type": "string"},
+    "graph_version": {"type": "string"},
+    "component_version": {"type": "string"},
+    "doc_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "artifacts": {
+      "type": "object",
+      "required": ["graph", "nodes", "edges", "component_tree", "doc_tree", "pages", "sections", "markdown"],
+      "properties": {
+        "graph": {"type": "string"},
+        "nodes": {"type": "string"},
+        "edges": {"type": "string"},
+        "component_tree": {"type": "string"},
+        "doc_tree": {"type": "string"},
+        "pages": {"type": "string"},
+        "sections": {"type": "string"},
+        "markdown": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "last_run": {
+      "type": "object",
+      "required": ["run_id", "status", "finished_at"],
+      "properties": {
+        "run_id": {"type": "string"},
+        "status": {"type": "string"},
+        "finished_at": {"type": "string"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

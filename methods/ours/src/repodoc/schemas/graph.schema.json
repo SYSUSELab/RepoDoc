@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repodoc.local/schemas/graph.schema.json",
+  "title": "RepoDoc repository knowledge graph snapshot",
+  "type": "object",
+  "required": ["schema_version", "repo", "repo_path", "commit", "graph_version", "created_at", "nodes", "edges"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "repo": {"type": "string"},
+    "repo_path": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "graph_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "nodes": {"type": "array", "items": {"$ref": "#/$defs/node"}},
+    "edges": {"type": "array", "items": {"$ref": "#/$defs/edge"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "node": {
+      "type": "object",
+      "required": ["id", "type", "layer", "attrs"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {
+          "enum": ["file", "symbol", "api", "artifact", "component", "flow", "doc_page", "doc_section", "change", "change_unit"]
+        },
+        "layer": {"enum": ["code", "semantic", "document", "change"]},
+        "attrs": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "edge": {
+      "type": "object",
+      "required": ["id", "type", "src", "dst", "attrs"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "type": {
+          "enum": ["contains", "declares", "belongs_to", "imports", "exports", "calls", "called_by", "references", "reads", "writes", "inherits", "implements", "overrides", "instantiates", "exposes_api", "handles", "configured_by", "tests", "has_child_component", "part_of_component", "depends_on_component", "participates_in_flow", "documents", "cites", "derived_from", "child_of", "related_to", "changes", "impacts", "renamed_from", "replaces"]
+        },
+        "src": {"type": "string", "minLength": 1},
+        "dst": {"type": "string", "minLength": 1},
+        "attrs": {"type": "object"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

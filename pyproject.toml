@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "repodoc-eval"
+version = "0.1.0"
+description = "Experiment harness for repository-level documentation generation and update"
+requires-python = ">=3.10"
+dependencies = [
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+data = [
+  "datasets>=2.18",
+  "huggingface_hub>=0.23",
+]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.6,<0.16",
+]
+
+[project.scripts]
+repodoc-eval = "harness.cli:main"
+
+[tool.setuptools]
+packages = ["harness"]

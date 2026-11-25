@@ -1,0 +1,46 @@
+# Python
+.repodoc/
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Environments and secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded inputs and generated results
+data/repos/
+data/checkouts/
+data/reference/
+data/rubrics/
+data/locks/
+data/logs/
+data/downloads/
+data/external/
+runs/*
+!runs/README.md
+
+# Tool caches and editor noise
+.ruff_cache/
+*.log
+.DS_Store
+.vscode/
+.idea/
+
+# Upstream checkouts are independent git repositories.
+baselines/codewiki/
+benchmarks/codewikibench/
+
+# Web UI
+node_modules/
+
+# Web UI data
+web-data/

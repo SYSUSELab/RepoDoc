@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://repodoc.local/schemas/component_tree.schema.json",
+  "title": "RepoDoc component tree",
+  "type": "object",
+  "required": ["schema_version", "repo", "repo_path", "commit", "source_graph_version", "cluster_version", "created_at", "root", "cluster_meta"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "repo": {"type": "string"},
+    "repo_path": {"type": "string"},
+    "commit": {"type": ["string", "null"]},
+    "source_graph_version": {"type": "string"},
+    "cluster_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "root": {"$ref": "#/$defs/component"},
+    "cluster_meta": {"type": "object"}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "component": {
+      "type": "object",
+      "required": ["id", "name", "kind", "path", "summary", "depth", "members", "children", "confidence", "evidence", "coverage"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["repository", "subsystem", "component", "module", "file_group"]},
+        "path": {"type": "string"},
+        "summary": {"type": "string"},
+        "depth": {"type": "integer", "minimum": 0},
+        "members": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "children": {"type": "array", "items": {"$ref": "#/$defs/component"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "evidence": {
+          "type": "object",
+          "required": ["signals", "rationale"],
+          "properties": {
+            "signals": {"type": "array", "items": {"type": "string"}},
+            "rationale": {"type": "string"}
+          },
+          "additionalProperties": true
+        },
+        "coverage": {
+          "type": "object",
+          "required": ["assigned_nodes", "unassigned_nodes", "unassigned"],
+          "properties": {
+            "assigned_nodes": {"type": "integer", "minimum": 0},
+            "unassigned_nodes": {"type": "integer", "minimum": 0},
+            "unassigned": {"type": "array", "items": {"type": "string"}}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
